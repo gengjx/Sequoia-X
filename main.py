@@ -27,6 +27,7 @@ from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
+from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 
 
 def _run_web(args: argparse.Namespace) -> None:
@@ -92,6 +93,7 @@ def main() -> None:
             LimitUpShakeoutStrategy(engine=engine, settings=settings),
             UptrendLimitDownStrategy(engine=engine, settings=settings),
             RpsBreakoutStrategy(engine=engine, settings=settings),
+            PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
 
         notifier = FeishuNotifier(settings)

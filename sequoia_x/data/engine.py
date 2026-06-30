@@ -46,20 +46,7 @@ def _bs_fetch_batch(tasks: list) -> list:
             adjustflag="1",  # 后复权
         )
         if rs.error_code != "0":
-            if "未登录" in rs.error_msg or "login" in rs.error_msg.lower():
-                bs.login()
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume,amount",
-                    start_date=start,
-                    end_date=end,
-                    frequency="d",
-                    adjustflag="1",
-                )
-                if rs.error_code != "0":
-                    continue
-            else:
-                continue
+            continue
         while rs.next():
             results.append([symbol] + rs.get_row_data())
     bs.logout()
@@ -162,32 +149,43 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             for d in df["date"].unique().tolist():
                 conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
+            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
         return count
 
     def backfill(self, symbols: list[str]) -> None:
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。已入库的自动 skip。"""
-        import baostock as bs
+        """通过 baostock 批量回填历史日 K 线数据（后复权）。
+
+        容错机制：
+        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
+        - 每 200 只股票自动重连 baostock（防止长连接超时）
+        - 已入库的自动 skip，中断后可重跑续传
+        """
+        import time
         from datetime import date, timedelta
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        import baostock as bs
 
-        def _bs_login() -> bool:
+        today_str = date.today().strftime("%Y-%m-%d")
+        max_retries = 3
+        reconnect_interval = 200  # 每处理 N 只股票重连一次
+
+        def _login():
             lg = bs.login()
             if lg.error_code != "0":
                 logger.error(f"baostock 登录失败: {lg.error_msg}")
                 return False
             return True
 
-        if not _bs_login():
+        if not _login():
             return
 
         success = 0
         skipped = 0
         failed = 0
+        since_reconnect = 0
 
         try:
             for i, symbol in enumerate(symbols):
@@ -195,53 +193,68 @@ class DataEngine:
                 if last_date and last_date >= today_str:
                     skipped += 1
                     if (i + 1) % 500 == 0:
-                        logger.info(f"已处理 {i + 1}/{len(symbols)}，成功 {success} 跳过 {skipped} 失败 {failed}")
+                        logger.info(
+                            f"已处理 {i + 1}/{len(symbols)}，"
+                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
+                        )
                     continue
+
+                # 定期重连，防止长连接超时
+                since_reconnect += 1
+                if since_reconnect >= reconnect_interval:
+                    bs.logout()
+                    time.sleep(1)
+                    if not _login():
+                        logger.error("重连失败，终止回填")
+                        return
+                    since_reconnect = 0
 
                 start = last_date or self.start_date
                 if last_date:
                     start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
 
                 bs_code = self._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume,amount",
-                    start_date=start,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="1",  # 后复权
-                )
 
-                if rs.error_code != "0":
-                    if "未登录" in rs.error_msg or "login" in rs.error_msg.lower():
-                        logger.warning(f"[{symbol}] session 过期，自动重连...")
-                        if _bs_login():
-                            rs = bs.query_history_k_data_plus(
-                                bs_code,
-                                "date,open,high,low,close,volume,amount",
-                                start_date=start,
-                                end_date=today_str,
-                                frequency="d",
-                                adjustflag="1",
-                            )
-                            if rs.error_code == "0":
-                                # 重连成功，继续下面的数据处理
-                                pass
-                            else:
-                                logger.warning(f"[{symbol}] 重连后仍失败: {rs.error_msg}")
-                                failed += 1
-                                continue
-                        else:
-                            logger.error("重连失败，终止回填")
-                            return
-                    else:
-                        logger.warning(f"[{symbol}] baostock 查询失败: {rs.error_msg}")
-                        failed += 1
-                        continue
-
+                # 带重试的查询
                 rows = []
-                while rs.next():
-                    rows.append(rs.get_row_data())
+                query_ok = False
+                for attempt in range(max_retries):
+                    try:
+                        rs = bs.query_history_k_data_plus(
+                            bs_code,
+                            "date,open,high,low,close,volume,amount",
+                            start_date=start,
+                            end_date=today_str,
+                            frequency="d",
+                            adjustflag="1",  # 后复权
+                        )
+
+                        if rs.error_code != "0":
+                            raise RuntimeError(rs.error_msg)
+
+                        rows = []
+                        while rs.next():
+                            rows.append(rs.get_row_data())
+                        query_ok = True
+                        break
+
+                    except Exception as exc:
+                        if attempt < max_retries - 1:
+                            wait = 2 ** (attempt + 1)
+                            logger.warning(
+                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
+                            )
+                            time.sleep(wait)
+                            # 重连 baostock
+                            bs.logout()
+                            time.sleep(1)
+                            _login()
+                        else:
+                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
+
+                if not query_ok:
+                    failed += 1
+                    continue
 
                 if not rows:
                     skipped += 1
@@ -263,14 +276,20 @@ class DataEngine:
 
                 try:
                     with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
+                        df.to_sql(
+                            "stock_daily", conn, if_exists="append",
+                            index=False, method="multi", chunksize=500,
+                        )
                 except sqlite3.IntegrityError:
                     pass
 
                 success += 1
 
                 if (i + 1) % 500 == 0:
-                    logger.info(f"已处理 {i + 1}/{len(symbols)}，成功 {success} 跳过 {skipped} 失败 {failed}")
+                    logger.info(
+                        f"已处理 {i + 1}/{len(symbols)}，"
+                        f"成功 {success} 跳过 {skipped} 失败 {failed}"
+                    )
 
         finally:
             bs.logout()
