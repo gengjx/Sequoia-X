@@ -178,3 +178,30 @@ async def test_webhook(body: WebhookTest):
 
     result = await asyncio.to_thread(_do_test)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Market analysis endpoints (大盘分析)
+# ---------------------------------------------------------------------------
+
+@router.post("/market/analyze")
+async def analyze_market(request: Request, date: str | None = None):
+    services = request.app.state.services
+    task_id = services.analyze_market_async(date)
+    return {"task_id": task_id, "status": TaskStatus.PENDING}
+
+
+@router.get("/market/report")
+async def get_market_report(request: Request, date: str | None = None):
+    services = request.app.state.services
+    report = services.get_market_report(date)
+    if report is None:
+        raise HTTPException(404, "暂无大盘分析报告，请先生成")
+    return report
+
+
+@router.post("/market/refresh-industry")
+async def refresh_industry(request: Request):
+    services = request.app.state.services
+    task_id = services.refresh_industry_cache_async()
+    return {"task_id": task_id, "status": TaskStatus.PENDING}

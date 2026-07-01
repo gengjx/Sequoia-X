@@ -66,3 +66,14 @@ async def system_page(request: Request):
         request=request, name="system.html",
         context={"info": info, "logs": logs},
     )
+
+
+@router.get("/market")
+async def market_page(request: Request):
+    templates = request.app.state.templates
+    services = request.app.state.services
+    report = services.get_market_report()
+    return templates.TemplateResponse(
+        request=request, name="market.html",
+        context={"report": report},
+    )

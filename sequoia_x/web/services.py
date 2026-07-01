@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from sequoia_x.core.config import Settings
+from sequoia_x.analysis.market import MarketAnalyzer
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -140,6 +141,8 @@ class WebServices:
         self.engine = engine
         self._task_store: dict[str, TaskRecord] = {}
         self._result_cache: dict[str, list[str]] = {}
+        self._market_report_cache: dict[str, dict] = {}
+        self._market_analyzer: MarketAnalyzer | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     # -- Strategy methods --
@@ -231,6 +234,71 @@ class WebServices:
         try:
             all_symbols = self.engine.get_all_symbols()
             self.engine.backfill(all_symbols)
+            record.status = TaskStatus.DONE
+        except Exception as e:
+            record.status = TaskStatus.ERROR
+            record.error = str(e)
+        finally:
+            record.finished_at = datetime.now()
+
+    # -- Market analysis methods --
+
+    def _get_analyzer(self) -> MarketAnalyzer:
+        if self._market_analyzer is None:
+            self._market_analyzer = MarketAnalyzer(self.settings)
+        return self._market_analyzer
+
+    def analyze_market_async(self, target_date: str | None = None) -> str:
+        """异步生成大盘分析报告，结果缓存到内存。"""
+        task_id = uuid.uuid4().hex[:8]
+        record = TaskRecord(task_id=task_id, strategy_key="__market__")
+        self._task_store[task_id] = record
+        self._executor.submit(self._analyze_market_task, task_id, target_date)
+        return task_id
+
+    def _analyze_market_task(self, task_id: str, target_date: str | None) -> None:
+        record = self._task_store[task_id]
+        record.status = TaskStatus.RUNNING
+        record.started_at = datetime.now()
+        try:
+            analyzer = self._get_analyzer()
+            report = analyzer.analyze(target_date)
+            self._market_report_cache[report["date"]] = report
+            record.results = [report["date"]]
+            record.status = TaskStatus.DONE
+        except Exception as e:
+            record.status = TaskStatus.ERROR
+            record.error = str(e)
+        finally:
+            record.finished_at = datetime.now()
+
+    def get_market_report(self, target_date: str | None = None) -> dict | None:
+        """返回缓存的报告；target_date 为空时返回最新缓存的报告。"""
+        if not self._market_report_cache:
+            return None
+        if target_date and target_date in self._market_report_cache:
+            return self._market_report_cache[target_date]
+        return list(self._market_report_cache.values())[-1]
+
+    def refresh_industry_cache_async(self) -> str:
+        """异步刷新行业/板块分类缓存：东财细分板块映射 + 证监会行业分类。"""
+        task_id = uuid.uuid4().hex[:8]
+        record = TaskRecord(task_id=task_id, strategy_key="__industry__")
+        self._task_store[task_id] = record
+        self._executor.submit(self._refresh_industry_task, task_id)
+        return task_id
+
+    def _refresh_industry_task(self, task_id: str) -> None:
+        record = self._task_store[task_id]
+        record.status = TaskStatus.RUNNING
+        record.started_at = datetime.now()
+        try:
+            analyzer = self._get_analyzer()
+            # 1. 东财细分板块映射（首选数据源，约 3~5 分钟）
+            board_count = analyzer.refresh_board_cache()
+            # 2. 证监会行业分类（回退数据源，约 30~45 秒）
+            ind_count = analyzer.refresh_industry_cache()
+            record.results = [f"board_stocks:{board_count}", f"industries:{ind_count}"]
             record.status = TaskStatus.DONE
         except Exception as e:
             record.status = TaskStatus.ERROR

@@ -1,0 +1,496 @@
+{% extends "base.html" %}
+{% block title %}大盘分析 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div>
+        <h2 class="mb-1"><i class="bi bi-clipboard-data"></i> 大盘分析</h2>
+        <p class="text-muted mb-0" id="report-meta">
+            {% if report %}交易日 {{ report.date }} · 生成于 {{ report.generated_at }}{% else %}尚未生成分析报告{% endif %}
+        </p>
+    </div>
+    <div class="d-flex gap-2">
+        <button class="btn btn-primary btn-sm" id="btn-analyze" onclick="generateReport()">
+            <i class="bi bi-stars"></i> 生成报告
+        </button>
+        <button class="btn btn-outline-secondary btn-sm" id="btn-refresh-industry" onclick="refreshIndustry()">
+            <i class="bi bi-arrow-repeat"></i> 刷新行业
+        </button>
+    </div>
+</div>
+
+<div id="analyze-status" class="alert alert-info py-2 mb-3" style="display:none;">
+    <div class="d-flex align-items-center gap-2">
+        <div class="spinner-border spinner-border-sm" role="status"></div>
+        <span id="analyze-status-text">正在生成大盘分析报告，预计 5~10 秒...</span>
+    </div>
+</div>
+
+<div id="report-empty" class="text-center text-muted py-5" {% if report %}style="display:none;"{% endif %}>
+    <i class="bi bi-bar-chart-line" style="font-size: 3rem;"></i>
+    <p class="mt-3">点击「生成报告」获取今日盘面分析</p>
+</div>
+
+<div id="report-body" {% if not report %}style="display:none;"{% endif %}></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const INITIAL_REPORT = {{ report | tojson }};
+
+function fmtPct(v) {
+    const n = Number(v);
+    const cls = n > 0 ? 'text-danger' : (n < 0 ? 'text-success' : 'text-muted');
+    const s = (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+    return `<span class="${cls} fw-semibold">${s}</span>`;
+}
+
+function renderReport(r) {
+    const m = r.overview.metrics;
+    const score = r.overview.signal_score;
+    const scoreColor = score >= 70 ? '#dc3545' : score >= 55 ? '#fd7e14' : score >= 45 ? '#6c757d' : '#198754';
+    const idxRows = r.indices.map(i => `
+        <tr>
+            <td><strong>${i.name}</strong></td>
+            <td>${i.latest.toFixed(2)}</td>
+            <td>${fmtPct(i.change_pct)}</td>
+            <td>${i.open.toFixed(2)}</td>
+            <td>${i.high.toFixed(2)}</td>
+            <td>${i.low.toFixed(2)}</td>
+            <td>${i.amplitude.toFixed(2)}%</td>
+            <td>${i.turnover_yi.toFixed(0)}</td>
+            <td><small class="text-muted">${i.support} / ${i.resistance}</small></td>
+        </tr>`).join('');
+
+    const sectorRow = (s, i) => `<tr><td>${i}</td><td>${s.name}</td><td>${fmtPct(s.change_pct)}</td><td><small class="text-muted">${s.count} 只</small></td></tr>`;
+    const topRows = r.sectors.top.slice(0, 5).map(sectorRow).join('');
+    const bottomRows = r.sectors.bottom.slice(0, 5).map(sectorRow).join('');
+
+    const actionBadge = {
+        '进攻': 'bg-danger', '均衡': 'bg-warning text-dark', '防守': 'bg-success'
+    }[r.plan.action] || 'bg-secondary';
+
+    const focusTags = r.plan.focus.map(t => `<span class="badge bg-danger-subtle text-danger-emphasis">${t}</span>`).join(' ');
+    const avoidTags = r.plan.avoid.map(t => `<span class="badge bg-success-subtle text-success-emphasis">${t}</span>`).join(' ');
+    const riskItems = r.risks.map(x => `<li class="mb-1">${x}</li>`).join('');
+
+    // 资金流向
+    const ff = r.fund_flow || {};
+    const fmtFlow = (v) => {
+        const cls = v > 0 ? 'text-danger' : (v < 0 ? 'text-success' : 'text-muted');
+        return `<span class="${cls} fw-semibold">${v >= 0 ? '+' : ''}${v.toFixed(1)} 亿</span>`;
+    };
+    const sectorFlowRow = (s) => `<tr><td><strong>${s.name}</strong></td><td>${fmtFlow(s.net_flow_yi)}</td><td>${fmtPct(s.change_pct)}</td><td><small class="text-muted">${s.net_flow_pct >= 0 ? '+' : ''}${s.net_flow_pct.toFixed(1)}%</small></td></tr>`;
+    const stockFlowRow = (s) => `<tr><td><small class="text-muted">${s.code}</small> <strong>${s.name}</strong></td><td>${fmtFlow(s.net_flow_yi)}</td><td>${fmtPct(s.change_pct)}</td><td><small class="text-muted">${s.net_flow_pct >= 0 ? '+' : ''}${s.net_flow_pct.toFixed(1)}%</small></td></tr>`;
+    const sectorInflowRows = (ff.sector_inflow || []).slice(0, 5).map(sectorFlowRow).join('') || '<tr><td colspan="4" class="text-muted">暂无数据</td></tr>';
+    const sectorOutflowRows = (ff.sector_outflow || []).slice(0, 5).map(sectorFlowRow).join('') || '<tr><td colspan="4" class="text-muted">暂无数据</td></tr>';
+    const stockInflowRows = (ff.stock_inflow || []).slice(0, 10).map(stockFlowRow).join('') || '<tr><td colspan="4" class="text-muted">暂无数据</td></tr>';
+    const mg = ff.margin || {};
+    const marginHtml = mg.rq_balance ? `<div class="col-md-4 text-center"><div class="border rounded p-2 h-100"><div class="text-muted small">融资余额</div><div class="fw-bold fs-5 text-danger">${mg.rq_balance.toFixed(0)} 亿</div><div class="small ${mg.rq_change >= 0 ? 'text-danger' : 'text-success'}">${mg.rq_change >= 0 ? '+' : ''}${mg.rq_change} 亿（${mg.trend}）</div></div></div>` : '';
+
+    // 历史趋势 + 估值 + 涨跌停 + 龙虎榜
+    const hist = r.history || {};
+    const trends = hist.trends || {};
+    const trendSignal = (trends.signal || []).map(p => p.value);
+    const trendDates = (trends.signal || []).map(p => p.date.slice(5));
+    const trendTurnover = (trends.turnover || []).map(p => p.value / 10000); // 亿→万亿
+    const trendSummary = hist.trend_summary || {};
+    const similarDays = (hist.similar_days || {}).days || [];
+    const seasonality = ((hist.seasonality || {}).monthly || []);
+
+    const val = r.valuation || {};
+    const valIdx = val.indices || [];
+    const erp = val.erp || {};
+    const macro = r.macro || {};
+
+    const ls = r.limit_structure || {};
+    const echelon = (ls.echelon || []).map(e => `${e.height}板`).join('/');
+    const lhb = r.dragon_tiger || {};
+    const lhbStocks = (lhb.top_stocks || []).slice(0, 8);
+    const lhbInst = (lhb.top_institutions || []).slice(0, 5);
+    const valRow = (v) => `<div class="mb-2"><div class="d-flex justify-content-between"><span class="small">${v.name}</span><span class="small text-muted">PE ${v.pe} · ${v.pe_percentile}%分位</span></div><div class="progress" style="height:8px;"><div class="progress-bar ${v.pe_percentile < 30 ? 'bg-success' : v.pe_percentile > 70 ? 'bg-danger' : 'bg-warning'}" style="width:${v.pe_percentile}%"></div></div></div>`;
+    const valHtml = valIdx.map(valRow).join('');
+    const lhbStockRows = lhbStocks.length ? lhbStocks.map(s => `<tr><td><small class="text-muted">${s.code}</small> <strong>${s.name}</strong></td><td class="text-danger fw-semibold">${(s.net_buy||0).toFixed(2)} 亿</td><td>${fmtPct(s.change_pct||0)}</td></tr>`).join('') : '<tr><td colspan="3" class="text-muted">暂无数据</td></tr>';
+    const lhbInstRows = lhbInst.length ? lhbInst.map(s => `<tr><td>${s.name||''}</td><td class="text-danger">${(s.net_buy||0).toFixed(2)} 亿</td></tr>`).join('') : '';
+    const similarRows = similarDays.length ? similarDays.map(d => `<tr><td>${d.date}</td><td>${d.distance.toFixed(3)}</td><td>${d.next_day_avg_chg != null ? fmtPct(d.next_day_avg_chg) : 'N/A'}</td></tr>`).join('') : '<tr><td colspan="3" class="text-muted">暂无</td></tr>';
+
+    // 消息催化
+    const nw = r.news || {};
+    const nwSector = (nw.sector_news || []);
+    const nwGeneral = (nw.general_news || []);
+    const nwThemeCounts = nw.theme_counts || {};
+    const themeBadges = Object.entries(nwThemeCounts).sort((a,b)=>b[1]-a[1]).slice(0,5)
+        .map(([t,c]) => `<span class="badge bg-primary-subtle text-primary-emphasis">${t} ${c}条</span>`).join(' ');
+    const newsRow = (n) => `<tr><td><small class="text-muted">${(n.time||'').slice(5,16)}</small></td><td>${n.url ? `<a href="${n.url}" target="_blank" class="text-decoration-none">${n.title}</a>` : n.title}${n.theme ? ` <span class="badge bg-secondary-subtle text-secondary">${n.theme}</span>` : ''}</td></tr>`;
+    const sectorNewsRows = nwSector.length ? nwSector.map(newsRow).join('') : '<tr><td colspan="2" class="text-muted">暂无与领涨主线直接相关的新闻</td></tr>';
+    const generalNewsRows = nwGeneral.length ? nwGeneral.map(newsRow).join('') : '<tr><td colspan="2" class="text-muted">暂无</td></tr>';
+
+    // 恐贪指数 + 市场宽度
+    const fg = r.sentiment.fear_greed_score || 50;
+    const fgLabel = r.sentiment.fear_greed_label || '中性';
+    const fgColor = fg >= 75 ? '#dc3545' : fg >= 60 ? '#fd7e14' : fg >= 40 ? '#6c757d' : fg >= 25 ? '#0dcaf0' : '#198754';
+    const bi = r.sentiment.breadth_indicators || {};
+    const ma20Bar = bi.ma20_pct != null ? `<div class="progress" style="height:8px;"><div class="progress-bar bg-danger" style="width:${bi.ma20_pct}%"></div></div>` : '';
+    const ma60Bar = bi.ma60_pct != null ? `<div class="progress" style="height:8px;"><div class="progress-bar bg-warning" style="width:${bi.ma60_pct}%"></div></div>` : '';
+
+    const decided = m.up + m.down;
+    const upRatioPct = decided ? (m.up / decided * 100).toFixed(1) : '0.0';
+
+    document.getElementById('report-body').innerHTML = `
+    <!-- 一、盘面总览 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-eye"></i> 一、盘面总览</div>
+        <div class="card-body">
+            <div class="row g-4 align-items-center">
+                <div class="col-md-3 text-center">
+                    <div class="signal-ring" style="--score-color:${scoreColor}; --ring:${score}">
+                        <div class="signal-value">${score}<small>/100</small></div>
+                    </div>
+                    <div class="fw-bold mt-2" style="color:${scoreColor}">${r.overview.signal_label}</div>
+                </div>
+                <div class="col-md-9">
+                    <p class="mb-2">${r.overview.text}</p>
+                    <div class="alert alert-light border py-2 mb-2 small">
+                        <strong>信号依据：</strong>${r.overview.signal_basis}
+                    </div>
+                    <div class="text-muted small"><i class="bi bi-lightbulb"></i> ${r.overview.signal_advice}</div>
+                </div>
+            </div>
+            <table class="table table-sm table-borderless mb-0 mt-2">
+                <thead><tr><th>上涨 / 下跌 / 平盘</th><th>涨停 / 跌停</th><th>两市成交额</th><th>平均涨跌幅</th></tr></thead>
+                <tbody><tr>
+                    <td><span class="text-danger fw-semibold">${m.up}</span> / <span class="text-success fw-semibold">${m.down}</span> / ${m.flat} <small class="text-muted">(上涨占比 ${upRatioPct}%)</small></td>
+                    <td><span class="text-danger fw-semibold">${m.limit_up}</span> / <span class="text-success fw-semibold">${m.limit_down}</span> <small class="text-muted">(差 ${m.limit_diff > 0 ? '+' : ''}${m.limit_diff})</small></td>
+                    <td><strong>${m.turnover_yi.toFixed(0)} 亿</strong> <small class="text-muted">${m.turnover_label}</small></td>
+                    <td>${fmtPct(m.avg_change)}</td>
+                </tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 二、指数结构 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-graph-up"></i> 二、指数结构</div>
+        <div class="card-body">
+            <p class="mb-3">${indexText(r)}</p>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover table-stock mb-0">
+                    <thead><tr><th>指数</th><th>最新</th><th>涨跌幅</th><th>开盘</th><th>最高</th><th>最低</th><th>振幅</th><th>成交额(亿)</th><th>支撑/压力</th></tr></thead>
+                    <tbody>${idxRows}</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- 三、板块主线 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-layers"></i> 三、板块主线</div>
+        <div class="card-body">
+            <p class="mb-3">${r.sectors.text}</p>
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <h6 class="text-danger"><i class="bi bi-arrow-up-circle"></i> 领涨板块</h6>
+                    <table class="table table-sm table-stock">
+                        <thead><tr><th>#</th><th>板块</th><th>涨跌幅</th><th>家数</th></tr></thead>
+                        <tbody>${topRows}</tbody>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <h6 class="text-success"><i class="bi bi-arrow-down-circle"></i> 领跌板块</h6>
+                    <table class="table table-sm table-stock">
+                        <thead><tr><th>#</th><th>板块</th><th>涨跌幅</th><th>家数</th></tr></thead>
+                        <tbody>${bottomRows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 四、资金与情绪 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-currency-exchange"></i> 四、资金与情绪</div>
+        <div class="card-body">
+            <div class="row g-3 mb-3 align-items-center">
+                <div class="col-md-3 text-center">
+                    <div class="signal-ring" style="--score-color:${fgColor}; --ring:${fg}">
+                        <div class="signal-value">${fg}<small>/100</small></div>
+                    </div>
+                    <div class="fw-bold mt-2" style="color:${fgColor}">恐贪指数 · ${fgLabel}</div>
+                </div>
+                <div class="col-md-9">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-borderless mb-0">
+                            <tbody>
+                                <tr><td class="text-muted" style="width:120px;">52周新高/新低</td><td>${bi.nh != null ? `<span class="text-danger fw-semibold">${bi.nh}</span> / <span class="text-success fw-semibold">${bi.nl}</span>（净值 ${bi.nh_nl >= 0 ? '+' : ''}${bi.nh_nl}）` : 'N/A'}</td></tr>
+                                <tr><td class="text-muted">站上MA20</td><td>${bi.ma20_pct != null ? `${bi.ma20_pct}%（${bi.ma20_above}/${bi.ma20_total}）${ma20Bar}` : 'N/A'}</td></tr>
+                                <tr><td class="text-muted">站上MA60</td><td>${bi.ma60_pct != null ? `${bi.ma60_pct}%（${bi.ma60_above}/${bi.ma60_total}）${ma60Bar}` : 'N/A'}</td></tr>
+                                <tr><td class="text-muted">ADL腾落指数</td><td>${bi.adl_cumul != null ? `20日累积 ${bi.adl_cumul >= 0 ? '+' : ''}${bi.adl_cumul}，近5日均值 ${bi.adl_recent5 >= 0 ? '+' : ''}${bi.adl_recent5}` : 'N/A'}</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <p class="mb-2 small">${r.sentiment.text}</p>
+            ${ff.text ? `<div class="alert alert-light border py-2 mb-3 small"><i class="bi bi-info-circle"></i> ${ff.text}</div>` : ''}
+
+            <h6 class="text-muted mb-2">主力资金 - 行业板块</h6>
+            <div class="row g-3 mb-3">
+                <div class="col-md-6">
+                    <div class="small fw-bold text-danger mb-1">资金流入 TOP5</div>
+                    <table class="table table-sm table-hover mb-0">
+                        <thead><tr><th>板块</th><th>净流入</th><th>涨跌幅</th><th>占比</th></tr></thead>
+                        <tbody>${sectorInflowRows}</tbody>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <div class="small fw-bold text-success mb-1">资金流出 TOP5</div>
+                    <table class="table table-sm table-hover mb-0">
+                        <thead><tr><th>板块</th><th>净流出</th><th>涨跌幅</th><th>占比</th></tr></thead>
+                        <tbody>${sectorOutflowRows}</tbody>
+                    </table>
+                </div>
+            </div>
+
+            <h6 class="text-muted mb-2">主力资金 - 个股净流入 TOP10</h6>
+            <div class="table-responsive mb-3">
+                <table class="table table-sm table-hover">
+                    <thead><tr><th>个股</th><th>主力净流入</th><th>涨跌幅</th><th>占比</th></tr></thead>
+                    <tbody>${stockInflowRows}</tbody>
+                </table>
+            </div>
+
+            <div class="row g-2">
+                ${marginHtml}
+                <div class="col-md-8 d-flex align-items-center">
+                    <div class="small text-muted">${ff.north_note ? `<i class="bi bi-exclamation-circle"></i> ${ff.north_note}` : ''}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 五、消息催化 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-newspaper"></i> 五、消息催化</div>
+        <div class="card-body">
+            ${themeBadges ? `<div class="mb-3">${themeBadges}</div>` : ''}
+            <p class="mb-3 small">${nw.text || ''}</p>
+            <div class="row g-3">
+                <div class="col-md-7">
+                    <div class="small fw-bold text-danger mb-1"><i class="bi bi-link-45deg"></i> 与领涨主线相关</div>
+                    <table class="table table-sm table-hover">
+                        <thead><tr><th style="width:90px;">时间</th><th>标题</th></tr></thead>
+                        <tbody>${sectorNewsRows}</tbody>
+                    </table>
+                </div>
+                <div class="col-md-5">
+                    <div class="small fw-bold text-muted mb-1"><i class="bi bi-list-ul"></i> 综合要闻</div>
+                    <table class="table table-sm table-hover">
+                        <thead><tr><th style="width:90px;">时间</th><th>标题</th></tr></thead>
+                        <tbody>${generalNewsRows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 六、明日交易计划 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-calendar-check"></i> 六、明日交易计划</div>
+        <div class="card-body">
+            <div class="mb-3">
+                <span class="badge ${actionBadge} fs-6 me-2">${r.plan.action}</span>
+                <span class="text-muted">建议仓位：<strong>${r.plan.position}</strong></span>
+            </div>
+            <div class="row g-2 mb-3">
+                <div class="col-md-6"><div class="border-start border-danger border-3 ps-2"><small class="text-muted d-block">核心关注</small>${focusTags}</div></div>
+                <div class="col-md-6"><div class="border-start border-success border-3 ps-2"><small class="text-muted d-block">回避方向</small>${avoidTags}</div></div>
+            </div>
+            <p class="mb-0 small">${r.plan.text}</p>
+        </div>
+    </div>
+
+    <!-- 七、风险提示 -->
+    <div class="card mb-4 report-section border-warning">
+        <div class="card-header fw-bold bg-warning bg-opacity-10"><i class="bi bi-exclamation-triangle"></i> 七、风险提示</div>
+        <div class="card-body">
+            <ul class="mb-0">${riskItems}</ul>
+        </div>
+    </div>
+
+    <!-- 四B. 历史纵向对比 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-graph-up"></i> 四B、历史纵向对比</div>
+        <div class="card-body">
+            <div class="row g-2 mb-3">
+                <div class="col-md-4"><div class="border rounded p-2 text-center"><div class="text-muted small">今日信号</div><div class="fw-bold fs-4 text-danger">${trendSummary.signal_now||'-'}</div></div></div>
+                <div class="col-md-4"><div class="border rounded p-2 text-center"><div class="text-muted small">近5日均值</div><div class="fw-bold fs-4">${trendSummary.signal_avg5||'-'}</div></div></div>
+                <div class="col-md-4"><div class="border rounded p-2 text-center"><div class="text-muted small">趋势判断</div><div class="fw-bold fs-5 ${(trendSummary.warming||'')==='升温'?'text-danger':(trendSummary.warming||'')==='退潮'?'text-success':'text-muted'}">${trendSummary.warming||'-'}</div></div></div>
+            </div>
+            <div style="height: 280px; position: relative;">
+                <canvas id="trendChart"></canvas>
+            </div>
+            <hr class="my-3">
+            <h6 class="text-muted mb-2">历史相似日匹配（TOP5）</h6>
+            <table class="table table-sm table-hover">
+                <thead><tr><th>日期</th><th>相似度（越小越像）</th><th>次日平均涨跌</th></tr></thead>
+                <tbody>${similarRows}</tbody>
+            </table>
+            ${(hist.similar_days||{}).next_day_win_rate != null ? `<div class="small"><i class="bi bi-info-circle"></i> 相似日次日上涨概率 ${hist.similar_days.next_day_win_rate}%，平均涨跌幅 ${(hist.similar_days.next_day_avg_chg||0).toFixed(2)}%</div>` : ''}
+        </div>
+    </div>
+
+    <!-- 五. 估值与宏观 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-pie-chart"></i> 五、估值与宏观</div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <h6 class="text-muted mb-2">指数估值分位</h6>
+                    ${valHtml || '<span class="text-muted">暂无</span>'}
+                    ${erp.erp != null ? `<div class="alert alert-light border py-2 mt-2 small"><strong>股权风险溢价 ERP</strong>：${erp.erp}%（盈利收益率 ${erp.earnings_yield}% - 国债 ${erp.treasury_10y}%）<span class="badge ${erp.level==='股优于债'?'bg-danger':'bg-success'}">${erp.level}</span></div>` : ''}
+                </div>
+                <div class="col-md-6">
+                    <h6 class="text-muted mb-2">宏观经济</h6>
+                    ${macro.pmi ? `<div class="mb-2"><span class="text-muted small">PMI</span> <strong>${macro.pmi.value}</strong> <span class="badge ${macro.pmi.signal==='扩张'?'bg-danger':'bg-success'}">${macro.pmi.signal}</span> <small class="text-muted">${macro.pmi.month}</small></div>` : ''}
+                    ${macro.m2 ? `<div class="mb-2"><span class="text-muted small">M2同比</span> <strong>${macro.m2.yoy}%</strong> <small class="text-muted">${macro.m2.month}</small></div>` : ''}
+                    ${macro.social_financing ? `<div class="mb-2"><span class="text-muted small">社融增量</span> <strong>${(macro.social_financing.value/1e4).toFixed(0)}亿</strong> <small class="text-muted">${macro.social_financing.month}</small></div>` : ''}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 六. 涨跌停结构 + 龙虎榜 -->
+    <div class="card mb-4 report-section">
+        <div class="card-header fw-bold"><i class="bi bi-fire"></i> 六、涨跌停结构与龙虎榜</div>
+        <div class="card-body">
+            <div class="row g-2 mb-3">
+                <div class="col-md-3"><div class="border rounded p-2 text-center"><div class="text-muted small">涨停</div><div class="fw-bold fs-5 text-danger">${ls.limit_up_total||0}</div></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 text-center"><div class="text-muted small">首板/连板</div><div class="fw-bold">${ls.first_board||0} / ${ls.consecutive||0}</div></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 text-center"><div class="text-muted small">最高连板</div><div class="fw-bold fs-5 text-danger">${ls.max_height||0}板</div></div></div>
+                <div class="col-md-3"><div class="border rounded p-2 text-center"><div class="text-muted small">跌停</div><div class="fw-bold fs-5 text-success">${ls.limit_down_total||0}</div></div></div>
+            </div>
+            ${ls.text ? `<p class="small text-muted mb-3">${ls.text}</p>` : ''}
+            <div class="row g-3">
+                <div class="col-md-7">
+                    <h6 class="text-muted mb-2">龙虎榜 - 个股净买入 TOP</h6>
+                    <table class="table table-sm table-hover">
+                        <thead><tr><th>个股</th><th>净买入</th><th>涨跌幅</th></tr></thead>
+                        <tbody>${lhbStockRows}</tbody>
+                    </table>
+                </div>
+                <div class="col-md-5">
+                    ${lhbInstRows ? `<h6 class="text-muted mb-2">机构净买入</h6><table class="table table-sm table-hover"><thead><tr><th>机构</th><th>净买入</th></tr></thead><tbody>${lhbInstRows}</tbody></table>` : ''}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="text-center text-muted small mb-4">数据来源：${r.data_source}</div>
+    `;
+
+    document.getElementById('report-meta').textContent = `交易日 ${r.date} · 生成于 ${r.generated_at}`;
+    // 绘制历史趋势图
+    if (trendSignal.length > 1 && typeof Chart !== 'undefined') {
+        drawTrendChart(trendDates, trendSignal, trendTurnover);
+    }
+}
+
+function drawTrendChart(labels, signal, turnover) {
+    const ctx = document.getElementById('trendChart');
+    if (!ctx) return;
+    if (window._trendChart) window._trendChart.destroy();
+    window._trendChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                { type: 'line', label: '信号评分', data: signal, borderColor: '#dc3545', backgroundColor: 'rgba(220,53,69,0.1)', yAxisID: 'y1', tension: 0.3, pointRadius: 1 },
+                { type: 'bar', label: '成交额(万亿)', data: turnover, backgroundColor: 'rgba(108,117,125,0.3)', yAxisID: 'y2' },
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: true, position: 'top' } },
+            scales: {
+                y1: { type: 'linear', position: 'left', title: { text: '信号', display: true }, min: 0, max: 100 },
+                y2: { type: 'linear', position: 'right', title: { text: '万亿', display: true }, grid: { drawOnChartArea: false } },
+            }
+        }
+    });
+}
+
+function indexText(r) {
+    if (!r.indices || r.indices.length === 0) return '指数数据获取失败（baostock 不可用）。';
+    const parts = r.indices.map(i => {
+        if (i.change_pct >= 2) return `${i.name}强势上攻（${i.change_pct >= 0 ? '+' : ''}${i.change_pct}%）`;
+        if (i.change_pct > 0) return `${i.name}震荡修复`;
+        if (i.change_pct <= 0) return `${i.name}逆势走弱`;
+        return i.name;
+    });
+    const strong = r.indices.filter(i => i.change_pct >= 2).map(i => i.name);
+    const weak = r.indices.filter(i => i.change_pct < 0).map(i => i.name);
+    let extra = '';
+    if (strong.length && weak.length) extra = `${weak.join('、')}的逆势表现是今日主要拖累项，而${strong.join('、')}为核心力量。`;
+    return `今日主要指数表现分化：${parts.join('；')}。${extra}`;
+}
+
+async function generateReport() {
+    const btn = document.getElementById('btn-analyze');
+    const statusEl = document.getElementById('analyze-status');
+    const statusText = document.getElementById('analyze-status-text');
+
+    btn.disabled = true;
+    statusEl.style.display = 'block';
+    statusText.textContent = '正在生成大盘分析报告，预计 5~10 秒...';
+
+    try {
+        const { task_id } = await api('/api/market/analyze', { method: 'POST' });
+        const result = await pollTask(task_id, (data) => {
+            statusText.textContent = data.status === 'running' ? '正在聚合指数与板块数据...' : '提交中...';
+        });
+
+        if (result.status === 'done') {
+            const report = await api('/api/market/report');
+            renderReport(report);
+            document.getElementById('report-empty').style.display = 'none';
+            document.getElementById('report-body').style.display = 'block';
+            showToast('大盘分析报告已生成');
+        } else {
+            showToast(`生成失败: ${result.error}`, 'error');
+        }
+    } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+    }
+
+    btn.disabled = false;
+    setTimeout(() => { statusEl.style.display = 'none'; }, 2500);
+}
+
+async function refreshIndustry() {
+    const btn = document.getElementById('btn-refresh-industry');
+    const statusEl = document.getElementById('analyze-status');
+    const statusText = document.getElementById('analyze-status-text');
+    btn.disabled = true;
+    statusEl.style.display = 'block';
+    statusEl.className = 'alert alert-info py-2 mb-3';
+    statusText.textContent = '正在刷新行业分类缓存，约 30~45 秒...';
+    try {
+        const { task_id } = await api('/api/market/refresh-industry', { method: 'POST' });
+        const result = await pollTask(task_id, () => { statusText.textContent = '正在从 baostock 拉取行业分类...'; });
+        if (result.status === 'done') {
+            statusEl.className = 'alert alert-success py-2 mb-3';
+            statusText.textContent = '行业分类缓存已更新';
+            showToast('行业分类缓存已更新');
+        } else {
+            showToast(`更新失败: ${result.error}`, 'error');
+        }
+    } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+    }
+    btn.disabled = false;
+    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+}
+
+if (INITIAL_REPORT) renderReport(INITIAL_REPORT);
+</script>
+{% endblock %}
