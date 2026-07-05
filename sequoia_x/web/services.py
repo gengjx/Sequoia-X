@@ -14,6 +14,8 @@ import pandas as pd
 
 from sequoia_x.core.config import Settings
 from sequoia_x.analysis.market import MarketAnalyzer
+from sequoia_x.analysis.backtest import SignalBacktester
+from sequoia_x.analysis.stock_analysis import StockAnalyzer
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -22,6 +24,9 @@ from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
+from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
+from sequoia_x.strategy.dragon_head import DragonHeadStrategy
+from sequoia_x.strategy.bottom_volume import BottomVolumeStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +42,9 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
         LimitUpShakeoutStrategy,
         UptrendLimitDownStrategy,
         RpsBreakoutStrategy,
+        ShrinkPullbackStrategy,
+        DragonHeadStrategy,
+        BottomVolumeStrategy,
     ]
 }
 
@@ -76,6 +84,24 @@ STRATEGY_META: dict[str, dict] = {
         "name_cn": "RPS相对强度",
         "description": "120日涨幅排名前10% + 接近120日新高",
         "min_bars": 120,
+    },
+    "pullback": {
+        "name": "ShrinkPullback",
+        "name_cn": "缩量回踩",
+        "description": "上升趋势回踩均线支撑 + 缩量企稳，右侧低吸买点",
+        "min_bars": 20,
+    },
+    "dragon": {
+        "name": "DragonHead",
+        "name_cn": "板块龙头",
+        "description": "领涨板块内跑赢板块+成交过亿的强势龙头",
+        "min_bars": 2,
+    },
+    "bottom": {
+        "name": "BottomVolume",
+        "name_cn": "底部放量",
+        "description": "超跌15%+异动放量3倍+下影线阳线，左侧反转信号",
+        "min_bars": 20,
     },
 }
 
@@ -143,6 +169,8 @@ class WebServices:
         self._result_cache: dict[str, list[str]] = {}
         self._market_report_cache: dict[str, dict] = {}
         self._market_analyzer: MarketAnalyzer | None = None
+        self._stock_analyzer: StockAnalyzer | None = None
+        self._backtest_cache: dict | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     # -- Strategy methods --
@@ -248,6 +276,14 @@ class WebServices:
             self._market_analyzer = MarketAnalyzer(self.settings)
         return self._market_analyzer
 
+    def _get_stock_analyzer(self) -> StockAnalyzer:
+        if self._stock_analyzer is None:
+            self._stock_analyzer = StockAnalyzer(self.settings)
+        return self._stock_analyzer
+
+    def analyze_stock(self, symbol: str) -> dict:
+        """同步分析个股（秒级返回），返回结构化决策报告。"""
+        return self._get_stock_analyzer().analyze(symbol)
     def analyze_market_async(self, target_date: str | None = None) -> str:
         """异步生成大盘分析报告，结果缓存到内存。"""
         task_id = uuid.uuid4().hex[:8]
@@ -280,6 +316,37 @@ class WebServices:
             return self._market_report_cache[target_date]
         return list(self._market_report_cache.values())[-1]
 
+    # ------------------------------------------------------------------
+    # 信号评分回测
+    # ------------------------------------------------------------------
+    def backtest_async(self) -> str:
+        """异步执行信号评分 IC 回测，结果缓存到内存。"""
+        task_id = uuid.uuid4().hex[:8]
+        record = TaskRecord(task_id=task_id, strategy_key="__backtest__")
+        self._task_store[task_id] = record
+        self._executor.submit(self._backtest_task, task_id)
+        return task_id
+
+    def _backtest_task(self, task_id: str) -> None:
+        record = self._task_store[task_id]
+        record.status = TaskStatus.RUNNING
+        record.started_at = datetime.now()
+        try:
+            bt = SignalBacktester(self.settings)
+            report = bt.run(min_days=120)
+            self._backtest_cache = report
+            record.results = [f"sample_days:{report.get('sample_days', 0)}"]
+            record.status = TaskStatus.DONE
+        except Exception as e:
+            record.status = TaskStatus.ERROR
+            record.error = str(e)
+        finally:
+            record.finished_at = datetime.now()
+
+    def get_backtest_report(self) -> dict | None:
+        """返回缓存的回测报告。"""
+        return self._backtest_cache
+
     def refresh_industry_cache_async(self) -> str:
         """异步刷新行业/板块分类缓存：东财细分板块映射 + 证监会行业分类。"""
         task_id = uuid.uuid4().hex[:8]
@@ -298,7 +365,13 @@ class WebServices:
             board_count = analyzer.refresh_board_cache()
             # 2. 证监会行业分类（回退数据源，约 30~45 秒）
             ind_count = analyzer.refresh_industry_cache()
-            record.results = [f"board_stocks:{board_count}", f"industries:{ind_count}"]
+            # 3. 流通市值缓存（板块市值加权用，约 10~15 秒）
+            cap_count = analyzer.refresh_market_cap_cache()
+            record.results = [
+                f"board_stocks:{board_count}",
+                f"industries:{ind_count}",
+                f"market_caps:{cap_count}",
+            ]
             record.status = TaskStatus.DONE
         except Exception as e:
             record.status = TaskStatus.ERROR

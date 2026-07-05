@@ -77,3 +77,12 @@ async def market_page(request: Request):
         request=request, name="market.html",
         context={"report": report},
     )
+
+
+@router.get("/stock-analysis")
+async def stock_analysis_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="stock_analysis.html",
+        context={},
+    )

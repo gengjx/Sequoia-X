@@ -36,6 +36,8 @@ _INDEX_DEFS: list[tuple[str, str, str]] = [
 
 _INDUSTRY_TABLE = "stock_industry"
 _BOARD_TABLE = "stock_board_em"
+_STOCK_BASIC_TABLE = "stock_basic"
+_MARKET_CAP_TABLE = "stock_market_cap"
 
 
 def _clean_industry_name(raw: str) -> str:
@@ -99,6 +101,8 @@ class MarketAnalyzer:
     def analyze(self, target_date: str | None = None) -> dict:
         """生成指定日期（默认最新交易日）的大盘分析报告。"""
         latest, prev = self._latest_dates(target_date)
+        self._ensure_stock_basic_cache()
+        self._ensure_market_cap_cache()
         report = MarketReport(
             date=latest,
             generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -211,24 +215,44 @@ class MarketAnalyzer:
             row = conn.execute(sql, (latest, prev)).fetchone()
         up, down, flat, total, turnover, avg_chg = row
 
-        # 涨跌停（按板块限幅近似：主板 10%、创业板/科创板 20%）
+        # 涨跌停：封板(close 涨幅达标)、触及(high/low 涨幅达标)、炸板(触及未封)
+        # 后复权下涨跌幅比例不变；按板块/ST 精确限幅，新股(上市≤5日)排除
         lim_sql = """
         WITH c AS (
-            SELECT t.symbol, (t.close - p.close) / p.close * 100 AS chg
-            FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+            SELECT t.symbol,
+                   (t.close - p.close) / p.close * 100 AS chg,
+                   (t.high  - p.close) / p.close * 100 AS hi,
+                   (t.low   - p.close) / p.close * 100 AS lo
+            FROM (SELECT symbol, close, high, low FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
+        ),
+        cl AS (
+            SELECT c.*,
+                   CASE
+                       WHEN c.symbol LIKE '30%' OR c.symbol LIKE '68%' THEN 19.5
+                       WHEN c.symbol LIKE '8%' OR c.symbol LIKE '4%' THEN 29.0
+                       WHEN COALESCE(b.name, '') LIKE '%ST%' THEN 4.6
+                       ELSE 9.7
+                   END AS th,
+                   julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
+            FROM c
+            LEFT JOIN stock_basic b ON b.symbol = c.symbol
         )
         SELECT
-            SUM(CASE WHEN (symbol LIKE '30%' OR symbol LIKE '68%') AND chg >= 19.5 THEN 1
-                     WHEN symbol NOT LIKE '30%' AND symbol NOT LIKE '68%' AND chg >= 9.7 THEN 1
-                     ELSE 0 END) AS lu,
-            SUM(CASE WHEN (symbol LIKE '30%' OR symbol LIKE '68%') AND chg <= -19.5 THEN 1
-                     WHEN symbol NOT LIKE '30%' AND symbol NOT LIKE '68%' AND chg <= -9.7 THEN 1
-                     ELSE 0 END) AS ld
-        FROM c
+            SUM(CASE WHEN age > 5 AND chg >=  th THEN 1 ELSE 0 END) AS lu,
+            SUM(CASE WHEN age > 5 AND hi  >=  th THEN 1 ELSE 0 END) AS touched_up,
+            SUM(CASE WHEN age > 5 AND chg <= -th THEN 1 ELSE 0 END) AS ld,
+            SUM(CASE WHEN age > 5 AND lo  <= -th THEN 1 ELSE 0 END) AS touched_dn
+        FROM cl
         """
         with sqlite3.connect(self.db_path) as conn:
-            lu, ld = conn.execute(lim_sql, (latest, prev)).fetchone()
+            lu, touched_up, ld, touched_dn = conn.execute(
+                lim_sql, (latest, prev, latest)
+            ).fetchone()
+        lu, touched_up = lu or 0, touched_up or 0
+        ld, touched_dn = ld or 0, touched_dn or 0
+        broken_up = touched_up - lu
+        broken_rate = round(broken_up / touched_up * 100, 1) if touched_up else 0.0
 
         turnover_yi = round((turnover or 0) / 1e8, 1)
         decided = (up or 0) + (down or 0)
@@ -240,9 +264,13 @@ class MarketAnalyzer:
             "flat": flat or 0,
             "total": total or 0,
             "up_ratio": up_ratio,
-            "limit_up": lu or 0,
-            "limit_down": ld or 0,
-            "limit_diff": (lu or 0) - (ld or 0),
+            "limit_up": lu,
+            "touched_up": touched_up,
+            "broken_up": broken_up,
+            "broken_rate": broken_rate,
+            "limit_down": ld,
+            "touched_down": touched_dn,
+            "limit_diff": lu - ld,
             "turnover_yi": turnover_yi,
             "avg_change": round(avg_chg or 0, 2),
             "turnover_label": self._turnover_label(turnover_yi),
@@ -397,6 +425,127 @@ class MarketAnalyzer:
     # ------------------------------------------------------------------
     # 3. 板块主线
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 股票元数据缓存（名称 / 上市日 → 涨跌停限幅与新股过滤）
+    # ------------------------------------------------------------------
+    def _ensure_stock_basic_cache(self) -> None:
+        """确保 stock_basic 缓存表存在；不存在则从 baostock 拉取股票名称与上市日。"""
+        with sqlite3.connect(self.db_path) as conn:
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (_STOCK_BASIC_TABLE,)
+            ).fetchone()
+            if exists:
+                return
+
+        logger.info("首次构建股票元数据缓存（baostock，约 10~20s）...")
+        import baostock as bs
+
+        bs.login()
+        rows: list[tuple[str, str, str]] = []
+        try:
+            rs = bs.query_stock_basic(code_name="", code="")
+            while rs.next():
+                data = rs.get_row_data()
+                if data[4] == "1":  # type == "1"：股票（含已退市，保留以覆盖历史回放）
+                    symbol = data[0].split(".")[-1]
+                    rows.append((symbol, data[1], data[2]))  # symbol, name, ipo_date
+        finally:
+            bs.logout()
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {_STOCK_BASIC_TABLE} ("
+                "symbol TEXT PRIMARY KEY, name TEXT, ipo_date TEXT)"
+            )
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {_STOCK_BASIC_TABLE} (symbol, name, ipo_date) VALUES (?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        logger.info(f"股票元数据缓存完成，共 {len(rows)} 条")
+
+    def refresh_stock_basic_cache(self) -> int:
+        """强制刷新股票元数据缓存，返回写入条数。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {_STOCK_BASIC_TABLE}")
+            conn.commit()
+        self._ensure_stock_basic_cache()
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM {_STOCK_BASIC_TABLE}").fetchone()[0]
+
+    # ------------------------------------------------------------------
+    # 流通市值缓存（板块市值加权用；缓变，周期刷新）
+    # ------------------------------------------------------------------
+    def _ensure_market_cap_cache(self) -> None:
+        """确保流通市值缓存表存在；不存在则从东财延迟行情拉取全市场快照。"""
+        with sqlite3.connect(self.db_path) as conn:
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (_MARKET_CAP_TABLE,)
+            ).fetchone()
+            if exists:
+                return
+        logger.info("首次构建流通市值缓存（东财延迟行情，约 5~10s）...")
+        rows = self._fetch_market_cap_all()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {_MARKET_CAP_TABLE} ("
+                "symbol TEXT PRIMARY KEY, circ_mv REAL)"
+            )
+            conn.executemany(
+                f"INSERT OR REPLACE INTO {_MARKET_CAP_TABLE} (symbol, circ_mv) VALUES (?, ?)", rows
+            )
+            conn.commit()
+        logger.info(f"流通市值缓存完成，共 {len(rows)} 条")
+
+    def refresh_market_cap_cache(self) -> int:
+        """强制刷新流通市值缓存，返回写入条数。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {_MARKET_CAP_TABLE}")
+            conn.commit()
+        self._ensure_market_cap_cache()
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM {_MARKET_CAP_TABLE}").fetchone()[0]
+
+    @staticmethod
+    def _fetch_market_cap_all() -> list[tuple[str, float]]:
+        """从东财 push2delay 拉取全市场流通市值（单位：元，与 turnover 同口径）。
+
+        push2delay 强制每页上限 100 条（total≈5800），故按页全量分页拉取；
+        端点为延迟行情，盘后稳定可用。字段：f12=代码, f21=流通市值。
+        """
+        import requests
+
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+        base_url = "https://push2delay.eastmoney.com/api/qt/clist/get"
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+        page_size = 100
+        rows: list[tuple[str, float]] = []
+        page = 1
+        while True:
+            params = {
+                "pn": page, "pz": page_size, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                "fid": "f3", "fs": fs, "fields": "f12,f21",
+            }
+            try:
+                r = requests.get(base_url, params=params, headers=headers, timeout=10)
+                data = r.json().get("data") or {}
+                diff = data.get("diff", []) or []
+                total = data.get("total", 0)
+            except Exception:
+                diff = []
+                total = 0
+            if not diff:
+                break
+            for b in diff:
+                sym, mv = str(b.get("f12", "")), b.get("f21")
+                if sym and mv is not None and mv != "-":
+                    rows.append((sym, float(mv)))
+            if total and len(rows) >= total:
+                break
+            page += 1
+            time.sleep(0.1)
+        return rows
+
     def _ensure_industry_cache(self) -> None:
         """确保 stock_industry 缓存表存在；不存在则从 baostock 拉取并写入。"""
         with sqlite3.connect(self.db_path) as conn:
@@ -614,18 +763,20 @@ class MarketAnalyzer:
         return self._compute_sectors_local(latest, prev)
 
     def _compute_sectors_local_em(self, latest: str, prev: str) -> dict:
-        """基于本地 stock_board_em 映射 + stock_daily 计算板块涨跌幅（零网络）。"""
+        """基于本地 stock_board_em 映射 + stock_daily 计算板块涨跌幅（流通市值加权）。"""
         sql = f"""
         WITH chg AS (
             SELECT bd.board AS sector,
-                   (t.close - p.close) / p.close * 100 AS pct
-            FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                   (t.close - p.close) / p.close * 100 AS pct,
+                   COALESCE(mc.circ_mv, t.turnover, 1) AS w
+            FROM (SELECT symbol, close, turnover FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
             JOIN {_BOARD_TABLE} bd ON bd.symbol = t.symbol
+            LEFT JOIN {_MARKET_CAP_TABLE} mc ON mc.symbol = t.symbol
         )
         SELECT sector,
                COUNT(*) AS cnt,
-               ROUND(AVG(pct), 2) AS avg_chg
+               ROUND(SUM(pct * w) / SUM(w), 2) AS avg_chg
         FROM chg
         GROUP BY sector
         HAVING cnt >= 1
@@ -642,19 +793,21 @@ class MarketAnalyzer:
         return {"top": top, "bottom": bottom, "text": text}
 
     def _compute_sectors_local(self, latest: str, prev: str) -> dict:
-        """回退方案：基于本地行情库 + 证监会行业分类（baostock）计算板块涨跌幅。"""
+        """回退方案：基于本地行情库 + 证监会行业分类（baostock），流通市值加权。"""
         self._ensure_industry_cache()
         sql = f"""
         WITH c AS (
             SELECT ind.industry AS sector,
-                   (t.close - p.close) / p.close * 100 AS chg
-            FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                   (t.close - p.close) / p.close * 100 AS chg,
+                   COALESCE(mc.circ_mv, t.turnover, 1) AS w
+            FROM (SELECT symbol, close, turnover FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
             JOIN {_INDUSTRY_TABLE} ind ON ind.symbol = t.symbol
+            LEFT JOIN {_MARKET_CAP_TABLE} mc ON mc.symbol = t.symbol
         )
         SELECT sector,
                COUNT(*) AS cnt,
-               ROUND(AVG(chg), 2) AS avg_chg
+               ROUND(SUM(chg * w) / SUM(w), 2) AS avg_chg
         FROM c
         WHERE sector != '未分类'
         GROUP BY sector
@@ -1305,19 +1458,26 @@ class MarketAnalyzer:
         with sqlite3.connect(self.db_path) as conn:
             for today, yest in date_pairs:
                 lu, ld = conn.execute("""
-                    SELECT
-                        SUM(CASE WHEN (symbol LIKE '30%' OR symbol LIKE '68%') AND chg >= 19.5 THEN 1
-                                 WHEN symbol NOT LIKE '30%' AND symbol NOT LIKE '68%' AND chg >= 9.7 THEN 1
-                                 ELSE 0 END) AS lu,
-                        SUM(CASE WHEN (symbol LIKE '30%' OR symbol LIKE '68%') AND chg <= -19.5 THEN 1
-                                 WHEN symbol NOT LIKE '30%' AND symbol NOT LIKE '68%' AND chg <= -9.7 THEN 1
-                                 ELSE 0 END) AS ld
-                    FROM (
+                    WITH c AS (
                         SELECT t.symbol, (t.close - p.close) / p.close * 100 AS chg
                         FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
                         JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                     )
-                """, (today, yest)).fetchone()
+                    SELECT
+                        SUM(CASE WHEN age > 5 AND chg >=  th THEN 1 ELSE 0 END) AS lu,
+                        SUM(CASE WHEN age > 5 AND chg <= -th THEN 1 ELSE 0 END) AS ld
+                    FROM (
+                        SELECT c.*,
+                               CASE
+                                   WHEN c.symbol LIKE '30%' OR c.symbol LIKE '68%' THEN 19.5
+                                   WHEN c.symbol LIKE '8%' OR c.symbol LIKE '4%' THEN 29.0
+                                   WHEN COALESCE(b.name, '') LIKE '%ST%' THEN 4.6
+                                   ELSE 9.7
+                               END AS th,
+                               julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
+                        FROM c LEFT JOIN stock_basic b ON b.symbol = c.symbol
+                    )
+                """, (today, yest, today)).fetchone()
                 result[today] = {"lu": lu or 0, "ld": ld or 0}
         return result
 
@@ -1400,7 +1560,12 @@ class MarketAnalyzer:
 
         # ERP：沪深300盈利收益率 - 10年期国债收益率
         try:
-            bond_df = ak.bond_china_yield(start_date="20260625", end_date="20260630")
+            from datetime import timedelta
+            _now = datetime.now()
+            bond_df = ak.bond_china_yield(
+                start_date=(_now - timedelta(days=30)).strftime("%Y%m%d"),
+                end_date=_now.strftime("%Y%m%d"),
+            )
             bond_row = bond_df[bond_df["曲线名称"] == "中债国债收益率曲线"]
             treasury_10y = float(bond_row.iloc[-1]["10年"]) if len(bond_row) > 0 else 2.0
             hs300 = next((i for i in result["indices"] if i["name"] == "沪深300"), None)
@@ -1478,12 +1643,22 @@ class MarketAnalyzer:
             for i in range(1, len(dates_5)):
                 today, yest = dates_5[i], dates_5[i - 1]
                 rows = conn.execute("""
-                    SELECT t.symbol FROM
-                    (SELECT symbol, close FROM stock_daily WHERE date = ?) t
-                    JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
-                    WHERE (symbol LIKE '30%' OR symbol LIKE '68%') AND (t.close-p.close)/p.close*100 >= 19.5
-                       OR (symbol NOT LIKE '30%' AND symbol NOT LIKE '68%') AND (t.close-p.close)/p.close*100 >= 9.7
-                """, (today, yest)).fetchall()
+                    SELECT symbol FROM (
+                        SELECT t.symbol,
+                               (t.close - p.close) / p.close * 100 AS chg,
+                               CASE
+                                   WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
+                                   WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
+                                   WHEN COALESCE(b.name, '') LIKE '%ST%' THEN 4.6
+                                   ELSE 9.7
+                               END AS th,
+                               julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
+                        FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                        JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
+                        LEFT JOIN stock_basic b ON b.symbol = t.symbol
+                    )
+                    WHERE age > 5 AND chg >= th
+                """, (today, today, yest)).fetchall()
                 daily_lu[today] = {r[0] for r in rows}
 
             today_lu = daily_lu.get(latest, set())
@@ -1508,16 +1683,48 @@ class MarketAnalyzer:
             # 最高连板高度
             max_height = max(echelon.keys()) if echelon else 0
 
-            # 炸板率近似：今日涨停数/今日触及涨停数（无法精确算，用涨停中昨日涨停今日未涨停的占比近似）
+            # 炸板率：触及涨停(high 涨幅达标) − 封板(close 涨幅达标)
+            broken = conn.execute("""
+                SELECT
+                    SUM(CASE WHEN age > 5 AND hi  >=  th THEN 1 ELSE 0 END) AS touched,
+                    SUM(CASE WHEN age > 5 AND chg >=  th THEN 1 ELSE 0 END) AS sealed
+                FROM (
+                    SELECT t.symbol,
+                           (t.high  - p.close) / p.close * 100 AS hi,
+                           (t.close - p.close) / p.close * 100 AS chg,
+                           CASE
+                               WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
+                               WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
+                               WHEN COALESCE(b.name, '') LIKE '%ST%' THEN 4.6
+                               ELSE 9.7
+                           END AS th,
+                           julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
+                    FROM (SELECT symbol, close, high FROM stock_daily WHERE date = ?) t
+                    JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
+                    LEFT JOIN stock_basic b ON b.symbol = t.symbol
+                )
+            """, (latest, latest, prev)).fetchone()
+            touched_up, sealed_up = broken[0] or 0, broken[1] or 0
+            broken_up = touched_up - sealed_up
+            broken_rate = round(broken_up / touched_up * 100, 1) if touched_up else 0.0
+
             # 跌停
             ld = conn.execute("""
                 SELECT COUNT(*) FROM (
-                    SELECT t.symbol, (t.close-p.close)/p.close*100 AS chg
+                    SELECT t.symbol,
+                           (t.close - p.close) / p.close * 100 AS chg,
+                           CASE
+                               WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
+                               WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
+                               WHEN COALESCE(b.name, '') LIKE '%ST%' THEN 4.6
+                               ELSE 9.7
+                           END AS th,
+                           julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
                     FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
                     JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
-                ) WHERE (symbol LIKE '30%' OR symbol LIKE '68%') AND chg <= -19.5
-                   OR (symbol NOT LIKE '30%' AND symbol NOT LIKE '68%') AND chg <= -9.7
-            """, (latest, prev)).fetchone()[0]
+                    LEFT JOIN stock_basic b ON b.symbol = t.symbol
+                ) WHERE age > 5 AND chg <= -th
+            """, (latest, latest, prev)).fetchone()[0]
 
         echelon_list = [{"height": k, "count": v} for k, v in sorted(echelon.items(), reverse=True)]
         return {
@@ -1527,9 +1734,13 @@ class MarketAnalyzer:
             "consecutive": len(consecutive),
             "max_height": max_height,
             "echelon": echelon_list,
+            "touched_up": touched_up,
+            "broken_up": broken_up,
+            "broken_rate": broken_rate,
             "text": (
                 f"涨停 {len(today_lu)} 家（首板 {len(first_board)} 家，连板 {len(consecutive)} 家），"
                 f"最高连板高度 {max_height} 板；跌停 {ld or 0} 家。"
+                f"盘中触及涨停 {touched_up} 家，炸板 {broken_up} 家，炸板率 {broken_rate}%。"
                 f"连板梯队：{'、'.join(f'{k}板{v}家' for k, v in sorted(echelon.items(), reverse=True)) or '无'}。"
             ),
         }

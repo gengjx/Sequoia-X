@@ -1,0 +1,251 @@
+{% extends "base.html" %}
+{% block title %}个股分析 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="mb-3">
+    <h2 class="mb-1"><i class="bi bi-graph-up"></i> 个股深度分析</h2>
+    <p class="text-muted mb-0">输入股票代码，秒级生成技术面+相对强度+市场环境+策略命中+买卖建议</p>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="input-group input-group-lg">
+            <input type="text" class="form-control" id="symbol-input" placeholder="输入股票代码，如 600519、000001、300750" onkeypress="if(event.key==='Enter')analyzeStock()">
+            <button class="btn btn-primary" onclick="analyzeStock()"><i class="bi bi-search"></i> 分析</button>
+        </div>
+        <div class="mt-2 d-flex gap-2 flex-wrap">
+            <span class="text-muted small">快速试用：</span>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickAnalyze('600519')">600519 茅台</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickAnalyze('300750')">300750 宁德</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickAnalyze('000001')">000001 平安</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickAnalyze('688981')">688981 中芯</button>
+        </div>
+    </div>
+</div>
+
+<div id="loading" class="text-center py-4" style="display:none;">
+    <div class="spinner-border text-primary" role="status"></div>
+    <p class="text-muted mt-2">正在分析...</p>
+</div>
+
+<div id="result"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function quickAnalyze(s) { document.getElementById('symbol-input').value = s; analyzeStock(); }
+
+async function analyzeStock() {
+    const symbol = document.getElementById('symbol-input').value.trim();
+    if (!symbol) { showToast('请输入股票代码', 'error'); return; }
+    const loading = document.getElementById('loading');
+    const result = document.getElementById('result');
+    loading.style.display = 'block'; result.innerHTML = '';
+    try {
+        const r = await api(`/api/stocks/${symbol}/analysis`);
+        loading.style.display = 'none';
+        renderReport(r);
+    } catch (e) {
+        loading.style.display = 'none';
+        result.innerHTML = `<div class="alert alert-danger">分析失败：${e.message}</div>`;
+    }
+}
+
+function fmtPrice(v) { return v != null ? v.toFixed(2) : '-'; }
+function fmtPct(v) { return v != null ? (v > 0 ? '+' : '') + v.toFixed(2) + '%' : '-'; }
+function fmtCap(v) { return v != null ? (v/1e8).toFixed(1) + '亿' : '-'; }
+function fmtAmt(v) { return v != null ? (v/1e8).toFixed(2) + '亿' : '-'; }
+function pctClass(v) { return v > 0 ? 'text-danger' : v < 0 ? 'text-success' : 'text-muted'; }
+function scoreBadge(score) {
+    let cls = 'bg-secondary', label = '';
+    if (score >= 80) { cls = 'bg-danger'; label = '强烈买入'; }
+    else if (score >= 65) { cls = 'bg-warning text-dark'; label = '买入'; }
+    else if (score >= 50) { cls = 'bg-info text-dark'; label = '观望'; }
+    else if (score >= 35) { cls = 'bg-secondary'; label = '减仓'; }
+    else { cls = 'bg-success'; label = '回避'; }
+    return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function renderReport(r) {
+    const t = r.technical || {}, rs = r.relative_strength || {}, mc = r.market_context || {};
+    const rec = r.recommendation || {}, hits = r.strategy_hits || [];
+    const sub = rec.sub_scores || {};
+    const f = r.fundamental || {}, c = r.capital || {};
+
+    // 技术面指标行
+    const techRow = (label, val, extra = '') => `<div class="d-flex justify-content-between border-bottom py-1"><span class="text-muted">${label}</span><span class="fw-semibold">${val} <small class="text-muted">${extra}</small></span></div>`;
+    const fundRow = (label, val, extra = '') => `<div class="d-flex justify-content-between border-bottom py-1"><span class="text-muted">${label}</span><span class="fw-semibold">${val} <small>${extra}</small></span></div>`;
+
+    // 子评分条
+    const scoreBar = (label, val) => {
+        const cls = val >= 65 ? 'bg-danger' : val >= 50 ? 'bg-warning' : 'bg-success';
+        return `<div class="mb-2"><div class="d-flex justify-content-between"><small>${label}</small><small class="fw-bold">${val}</small></div><div class="progress" style="height:6px"><div class="progress-bar ${cls}" style="width:${val}%"></div></div></div>`;
+    };
+
+    document.getElementById('result').innerHTML = `
+    <!-- 决策总览 -->
+    <div class="card border-primary mb-4">
+        <div class="card-header bg-primary text-white fw-bold">
+            <i class="bi bi-bullseye"></i> ${r.name || r.symbol}（${r.symbol}）
+            <span class="float-end">当前价 <strong>${fmtPrice(r.price)}</strong> · ${r.date}</span>
+        </div>
+        <div class="card-body">
+            <div class="row align-items-center">
+                <div class="col-md-3 text-center">
+                    <div class="display-4 fw-bold ${rec.score >= 65 ? 'text-danger' : rec.score < 50 ? 'text-success' : 'text-muted'}">${rec.score}</div>
+                    <div class="text-muted">综合评分 / 100</div>
+                    <div class="mt-1">${scoreBadge(rec.score)}</div>
+                </div>
+                <div class="col-md-9">
+                    <div class="alert ${rec.score >= 65 ? 'alert-danger' : rec.score >= 50 ? 'alert-info' : 'alert-secondary'} py-2 mb-3">${rec.detail}</div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            ${scoreBar('技术面 25%', sub.technical || 0)}
+                            ${scoreBar('相对强度 15%', sub.relative_strength || 0)}
+                            ${scoreBar('市场环境 15%', sub.market || 0)}
+                        </div>
+                        <div class="col-md-6">
+                            ${scoreBar('量价 10%', sub.volume || 0)}
+                            ${scoreBar('基本面 20%', sub.fundamental || 0)}
+                            ${scoreBar('资金面 15%', sub.capital || 0)}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <p class="mt-3 mb-0">${r.summary}</p>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <!-- 左列：买卖点位 -->
+        <div class="col-md-4">
+            <div class="card h-100 ${rec.score >= 65 ? 'border-danger' : 'border-secondary'}">
+                <div class="card-header fw-bold"><i class="bi bi-cash-stack"></i> 买卖点位</div>
+                <div class="card-body">
+                    <table class="table table-sm mb-0">
+                        <tr><td class="text-muted">操作建议</td><td class="fw-bold">${rec.action}</td></tr>
+                        <tr><td class="text-muted">建议仓位</td><td class="fw-bold">${rec.position}</td></tr>
+                        <tr><td class="text-muted">理想买点</td><td class="text-danger fw-bold">${fmtPrice(rec.entry_ideal)}</td></tr>
+                        <tr><td class="text-muted">次优买点</td><td class="text-danger">${fmtPrice(rec.entry_secondary)}</td></tr>
+                        <tr><td class="text-muted">止损位</td><td class="text-success fw-bold">${fmtPrice(rec.stop_loss)}</td></tr>
+                        <tr><td class="text-muted">目标位</td><td class="text-danger fw-bold">${fmtPrice(rec.target)}</td></tr>
+                        <tr><td class="text-muted">盈亏比</td><td>${rec.risk_reward_ratio || '1:3'}</td></tr>
+                        <tr><td class="text-muted">ATR波动率</td><td>${fmtPrice(rec.atr_pct)}%</td></tr>
+                        ${rec.suggested_shares ? `<tr><td class="text-muted">建议股数</td><td class="fw-bold">${rec.suggested_shares} 股</td></tr><tr><td class="text-muted">占用资金</td><td>¥${rec.suggested_capital?.toLocaleString()}</td></tr>` : ''}
+                    </table>
+                    <div class="alert alert-info py-1 mt-2 small mb-0"><i class="bi bi-info-circle"></i> 仓位基于10万本金·单笔风险1.5%计算</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 中列：技术面 -->
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header fw-bold"><i class="bi bi-activity"></i> 技术面</div>
+                <div class="card-body small">
+                    ${techRow('趋势排列', t.arrangement || '-')}
+                    ${techRow('趋势强度', (t.trend_strength||0) + '/100')}
+                    ${techRow('MACD', t.macd?.signal || '-', `DIF ${t.macd?.dif||'-'}`)}
+                    ${techRow('RSI(14)', t.rsi || '-', t.rsi_signal || '')}
+                    ${techRow('KDJ', `K${t.kdj?.k||'-'} D${t.kdj?.d||'-'} J${t.kdj?.j||'-'}`)}
+                    ${techRow('量能', (t.volume_trend||''), `量比${t.volume_ratio||'-'}`)}
+                    ${t.divergence ? techRow('量价', t.divergence) : ''}
+                    ${techRow('K线形态', t.pattern || '-')}
+                    ${techRow('布林位置', ((t.boll?.position||0.5)*100).toFixed(0) + '%')}
+                    ${techRow('支撑位', fmtPrice(t.support), '近20日低点')}
+                    ${techRow('压力位', fmtPrice(t.resistance), '近20日高点')}
+                </div>
+            </div>
+        </div>
+
+        <!-- 右列：相对强度+市场 -->
+        <div class="col-md-4">
+            <div class="card h-100">
+                <div class="card-header fw-bold"><i class="bi bi-bar-chart"></i> 相对强度 & 市场</div>
+                <div class="card-body small">
+                    ${techRow('今日涨幅', `<span class="${pctClass(rs.today_chg)}">${fmtPct(rs.today_chg)}</span>`)}
+                    ${techRow('全市场排名', `${rs.today_rank||'-'}/${rs.today_total||'-'}`, `前${(100-(rs.today_percentile||0)).toFixed(0)}%`)}
+                    ${techRow('板块', rs.board || '-')}
+                    ${techRow('板块内排名', `${rs.board_rank||'-'}/${rs.board_total||'-'}`, `vs板块 ${fmtPct(rs.vs_board)}`)}
+                    ${techRow('120日涨幅', fmtPct(rs.rps_120_ret))}
+                    ${techRow('60日涨幅', fmtPct(rs.rps_60_ret))}
+                    ${techRow('20日涨幅', fmtPct(rs.rps_20_ret))}
+                    ${techRow('年内位置', (rs.year_position||0).toFixed(0) + '%')}
+                    ${techRow('距年内高点', (rs.dist_to_high||0).toFixed(1) + '%')}
+                    <hr class="my-2">
+                    ${techRow('大盘评分', `${mc.market_score||'-'}/100`, mc.market_state || '')}
+                    ${techRow('大盘涨跌比', (mc.up_ratio||0).toFixed(0) + '%上涨')}
+                    ${techRow('板块是否领涨', mc.board_hot?.is_top10 ? `<span class="text-danger fw-bold">是（第${mc.board_hot?.rank}名）</span>` : `<span class="text-success">否</span>`)}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- V2 基本面 + 资金面 -->
+    <div class="row g-4 mt-0">
+        <div class="col-md-6">
+            <div class="card h-100 border-info">
+                <div class="card-header fw-bold text-info">
+                    <i class="bi bi-bank"></i> 基本面（估值·财务·成长）
+                    <span class="float-end badge ${f.score>=65?'bg-danger':f.score>=50?'bg-warning text-dark':'bg-secondary'}">${f.score||'-'}/100</span>
+                </div>
+                <div class="card-body small">
+                    ${fundRow('市盈率PE', f.pe!=null?f.pe.toFixed(1):'-', f.pe>80?'<span class="text-warning">偏高</span>':(f.pe>0&&f.pe<15?'<span class="text-success">低估</span>':''))}
+                    ${fundRow('市净率PB', f.pb!=null?f.pb.toFixed(2):'-', f.pb<1&&f.pb>0?'<span class="text-success">破净</span>':'')}
+                    ${fundRow('所属行业', f.industry || '-')}
+                    ${fundRow('总市值', fmtCap(f.market_cap))}
+                    ${fundRow('ROE', f.roe!=null?f.roe.toFixed(1)+'%':'-', f.roe>=15?'<span class="text-danger">优秀</span>':(f.roe<3?'<span class="text-warning">偏弱</span>':''))}
+                    ${fundRow('净利率', f.np_margin!=null?f.np_margin.toFixed(1)+'%':'-')}
+                    ${fundRow('毛利率', f.gp_margin!=null?f.gp_margin.toFixed(1)+'%':'-')}
+                    ${fundRow('净利同比', f.yoy_ni!=null?(f.yoy_ni>0?'+':'')+f.yoy_ni.toFixed(1)+'%':'-', f.yoy_ni<0?'<span class="text-success">下滑</span>':(f.yoy_ni>=30?'<span class="text-danger">高增</span>':''))}
+                    ${fundRow('EPS(TTM)', f.eps_ttm!=null?f.eps_ttm.toFixed(3):'-')}
+                    ${fundRow('净利润', fmtAmt(f.net_profit))}
+                    ${fundRow('报告期', f.stat_date || '-')}
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card h-100 border-warning">
+                <div class="card-header fw-bold text-warning">
+                    <i class="bi bi-cash-coin"></i> 资金面（主力·龙虎榜）
+                    <span class="float-end badge ${c.score>=65?'bg-danger':c.score>=50?'bg-warning text-dark':'bg-secondary'}">${c.score||'-'}/100</span>
+                </div>
+                <div class="card-body small">
+                    ${fundRow('主力净流入占比', c.main_pct!=null?(c.main_pct>=0?'+':'')+c.main_pct.toFixed(2)+'%':'-', c.main_pct<0?'<span class="text-success">净流出</span>':'<span class="text-danger">净流入</span>')}
+                    ${fundRow('主力净额', c.main_amount!=null?fmtAmt(c.main_amount):'-')}
+                    ${fundRow('净额强度', c.amount_ratio!=null?(c.amount_ratio>=0?'+':'')+c.amount_ratio.toFixed(2)+'%':'-')}
+                    <hr class="my-2">
+                    ${c.lhb ? fundRow('龙虎榜', c.lhb.date, c.lhb.net_buy>=0?'<span class="text-danger">净买'+fmtAmt(c.lhb.net_buy)+'</span>':'<span class="text-success">净卖'+fmtAmt(Math.abs(c.lhb.net_buy))+'</span>') : fundRow('龙虎榜(近7日)', '未上榜')}
+                    ${c.lhb ? fundRow('上榜解读', c.lhb.reason || '-') : ''}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略命中 -->
+    ${hits.length ? `
+    <div class="card mt-4 border-success">
+        <div class="card-header fw-bold"><i class="bi bi-stars"></i> 策略命中（${hits.length}个）</div>
+        <div class="card-body">
+            ${hits.map(h => `<span class="badge bg-success me-2 mb-1 fs-6">${h.strategy}：${h.signal}</span>`).join('')}
+        </div>
+    </div>` : `<div class="alert alert-light mt-3 small">该股当前未命中任何选股策略信号</div>`}
+
+    <!-- 风险提示 -->
+    <div class="card mt-4 border-warning">
+        <div class="card-header fw-bold text-warning"><i class="bi bi-exclamation-triangle"></i> 风险提示</div>
+        <div class="card-body">
+            <ul class="mb-0">
+                ${r.risks.map(rk => `<li class="small">${rk}</li>`).join('')}
+            </ul>
+        </div>
+    </div>
+
+    <div class="text-center text-muted small mt-3 mb-4">
+        <i class="bi bi-shield-exclamation"></i> 量化分析仅供参考，不构成投资建议。A股T+1交易，请结合自身风险偏好决策。
+    </div>
+    `;
+}
+
+document.getElementById('symbol-input').focus();
+</script>
+{% endblock %}

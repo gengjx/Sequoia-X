@@ -39,3 +39,6 @@ build/
 
 # Hypothesis 测试缓存
 .hypothesis/
+
+# macOS
+.DS_Store

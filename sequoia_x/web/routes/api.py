@@ -79,6 +79,11 @@ async def get_stock_summary(symbol: str, request: Request):
     if summary is None:
         raise HTTPException(404, f"未找到股票: {symbol}")
     return summary
+@router.get("/stocks/{symbol}/analysis")
+async def analyze_stock(symbol: str, request: Request):
+    """个股深度分析：技术面+相对强度+市场环境+策略命中+买卖建议。"""
+    services = request.app.state.services
+    return services.analyze_stock(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -205,3 +210,19 @@ async def refresh_industry(request: Request):
     services = request.app.state.services
     task_id = services.refresh_industry_cache_async()
     return {"task_id": task_id, "status": TaskStatus.PENDING}
+
+
+@router.post("/market/backtest")
+async def run_backtest(request: Request):
+    services = request.app.state.services
+    task_id = services.backtest_async()
+    return {"task_id": task_id, "status": TaskStatus.PENDING}
+
+
+@router.get("/market/backtest/report")
+async def get_backtest_report(request: Request):
+    services = request.app.state.services
+    report = services.get_backtest_report()
+    if report is None:
+        raise HTTPException(404, "暂无回测报告，请先运行回测")
+    return report
