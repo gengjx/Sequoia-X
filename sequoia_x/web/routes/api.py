@@ -111,6 +111,26 @@ async def generate_decision(body: DecisionRequest, request: Request):
     )
 
 
+@router.get("/decision/backtest")
+async def backtest_combos(request: Request):
+    """组合历史回测对比（向量化，秒级返回）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.backtest_combos)
+
+
+@router.post("/decision/push-feishu")
+async def push_decision_feishu(body: DecisionRequest, request: Request):
+    """推送交易决策清单到飞书。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(
+        services.push_decision_feishu,
+        None, body.strategy_keys, body.capital, body.min_score,
+        body.exclude_markets, body.exclude_st,
+    )
+
+
 # ---------------------------------------------------------------------------
 # System endpoints
 # ---------------------------------------------------------------------------

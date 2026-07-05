@@ -41,12 +41,16 @@
         <div class="mt-3">
             <label class="form-label fw-bold small mb-2">⚡ 快速组合（点击自动勾选策略+推荐评分）</label>
             <div id="combo-box" class="row g-2"></div>
-            <div class="mt-2 d-flex gap-2">
+            <div class="mt-2 d-flex gap-2 flex-wrap">
                 <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(true)">全选策略</button>
                 <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">清空</button>
+                <button class="btn btn-outline-info btn-sm" onclick="backtestCombos()"><i class="bi bi-graph-up-arrow"></i> 组合回测对比</button>
+                <button class="btn btn-outline-success btn-sm" onclick="pushFeishu()"><i class="bi bi-send"></i> 推送飞书</button>
             </div>
         </div>
     </div>
+
+<div id="backtest-result"></div>
 </div>
 
 <div id="combo-tip" class="alert alert-light border d-none mb-3 small">
@@ -139,6 +143,79 @@ function applyCombo(id) {
         `<strong>${c.icon} ${c.name}</strong> · ${c.strategies.length}个策略 · 推荐≥${c.minScore}分<br>` +
         `<span class="text-muted">适用：${c.market}</span><br>` +
         `<span class="text-muted">逻辑：${c.logic}</span>`;
+}
+
+async function backtestCombos() {
+    const el = document.getElementById('backtest-result');
+    el.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-info"></div> 回测中（采样500只×3持有期，约2秒）...</div>';
+    try {
+        const data = await api('/api/decision/backtest');
+        renderBacktest(data);
+    } catch(e) { el.innerHTML = `<div class="alert alert-danger">回测失败：${e.message}</div>`; }
+}
+
+function renderBacktest(data) {
+    const combos = data.combos || [];
+    // 按组合分组
+    const groups = {};
+    combos.forEach(c => { (groups[c.combo] = groups[c.combo] || []).push(c); });
+    const holdDays = [...new Set(combos.map(c=>c.hold_days))].sort((a,b)=>a-b);
+    const names = Object.keys(groups);
+    const maxRet = Math.max(...combos.map(c=>Math.abs(c.avg_return)), 1);
+
+    let html = '<div class="card mb-4 border-info"><div class="card-header fw-bold text-info"><i class="bi bi-graph-up-arrow"></i> 组合历史回测对比（采样'+data.sample_size+'只）</div><div class="card-body">';
+    // 柱状图（纯CSS）
+    html += '<div class="mb-3">';
+    names.forEach(name => {
+        const items = groups[name];
+        // 取10天持有期做主对比
+        const main = items.find(i=>i.hold_days===10) || items[0];
+        const w = Math.abs(main.avg_return) / maxRet * 100;
+        const pos = main.avg_return >= 0;
+        html += `<div class="d-flex align-items-center mb-1" style="font-size:0.85rem">
+            <span style="width:90px" class="text-end me-2">${name}</span>
+            <div class="flex-grow-1 bg-light rounded" style="height:18px;position:relative">
+                <div class="rounded ${pos?'bg-danger':'bg-success'}" style="width:${w}%;height:18px"></div>
+            </div>
+            <span class="ms-2 fw-bold ${pos?'text-danger':'text-success'}" style="width:80px">${main.avg_return>=0?'+':''}${main.avg_return}%</span>
+            <span class="text-muted ms-1" style="width:55px">胜率${main.win_rate}%</span>
+        </div>`;
+    });
+    html += '</div>';
+    // 详细表格
+    html += '<div class="table-responsive"><table class="table table-sm table-hover small mb-0"><thead class="table-light"><tr><th>组合</th>';
+    holdDays.forEach(h => html += `<th>${h}天收益</th><th>胜率</th><th>样本</th>`);
+    html += '</tr></thead><tbody>';
+    names.forEach(name => {
+        html += `<tr><td class="fw-bold">${name}</td>`;
+        holdDays.forEach(h => {
+            const it = groups[name].find(i=>i.hold_days===h) || {};
+            const cls = it.avg_return>=0?'text-danger':'text-success';
+            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+    html += '<p class="text-muted small mt-2 mb-0"><i class="bi bi-info-circle"></i> 收益=持有期正收益(红正绿负)；胜率=盈利交易占比；夏普越高风险调整后收益越好。基于历史数据回测，不代表未来收益。</p>';
+    html += '</div></div>';
+    document.getElementById('backtest-result').innerHTML = html;
+}
+
+async function pushFeishu() {
+    const keys = [...document.querySelectorAll('.strat-cb:checked')].map(cb => cb.value);
+    if (!keys.length) { showToast('请先选择策略', 'error'); return; }
+    const capital = parseFloat(document.getElementById('capital').value) || 100000;
+    const minScore = parseInt(document.getElementById('min-score').value) || 50;
+    const excludeMarkets = [...document.querySelectorAll('[id^=ex-]:checked')].filter(c=>c.value!=='st').map(c=>c.value);
+    const excludeSt = document.getElementById('ex-st').checked;
+    if (!confirm('推送当前选择的决策到飞书？')) return;
+    showToast('推送中...', 'info');
+    try {
+        const r = await api('/api/decision/push-feishu', {
+            method:'POST', body:JSON.stringify({strategy_keys:keys,capital,min_score:minScore,exclude_markets:excludeMarkets,exclude_st:excludeSt})
+        });
+        showToast(r.success ? `推送成功！${r.buy_count}只买入清单已发送` : '推送失败，请检查飞书配置', r.success?'success':'error');
+    } catch(e) { showToast('推送失败：'+e.message, 'error'); }
 }
 
 async function generateDecision() {

@@ -138,3 +138,75 @@ class FeishuNotifier:
 
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+
+    def send_decision(self, decision: dict, webhook_key: str = "default") -> bool:
+        """推送交易决策清单到飞书。
+
+        Args:
+            decision: DecisionEngine.generate 的返回（含 buy_list/summary）
+            webhook_key: 路由标识
+        Returns:
+            True=成功
+        """
+        today = date.today().strftime("%Y-%m-%d")
+        sm = decision.get("summary", {})
+        buys = decision.get("buy_list", [])[:10]  # 最多展示10只，避免卡片过长
+
+        # 构建买入清单文本
+        lines = []
+        for i, r in enumerate(buys, 1):
+            grade_emoji = {"A": "🔴", "B": "🟡", "C": "🔵"}.get(r.get("grade"), "⚪")
+            xq = self._to_xueqiu_code(r["symbol"])
+            lines.append(
+                f"{i}. {grade_emoji}[{r.get('name','')}]"
+                f"(https://xueqiu.com/S/{xq})({r['symbol']}) "
+                f"评分{r.get('score','-')} 共振{r.get('resonance','-')} "
+                f"仓位{r.get('position_pct',0)}% {r.get('shares',0)}股"
+            )
+        buy_text = "\n".join(lines) if lines else "（暂无符合买入条件的标的）"
+
+        # 淘汰摘要
+        gc = sm.get("grade_count", {})
+        summary_text = (
+            f"**日期：** {today}\n"
+            f"**候选池：** {decision.get('pool_size', 0)} 只\n"
+            f"**买入：** {sm.get('buy_count', 0)} 只（A{gc.get('A',0)} B{gc.get('B',0)} C{gc.get('C',0)}）\n"
+            f"**淘汰：** {sm.get('reject_count', 0)} 只\n"
+            f"**仓位占用：** {sm.get('position_ratio', 0)}%（现金{sm.get('cash_ratio', 0)}%）"
+        )
+
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"🎯 Sequoia-X 交易决策 | {today}"},
+                    "template": "red",
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": summary_text}},
+                    {"tag": "hr"},
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**买入清单：**\n{buy_text}"}},
+                    {"tag": "hr"},
+                    {"tag": "note",
+                     "elements": [{"tag": "plain_text",
+                                   "content": "⚠️ 量化决策仅供参考，A股T+1，请结合大盘环境决策"}]},
+                ],
+            },
+        }
+        return self._post(payload, webhook_key)
+
+    def _post(self, payload: dict, webhook_key: str = "default") -> bool:
+        """底层 POST，复用于 send 和 send_decision。"""
+        url = self.settings.get_webhook_url(webhook_key)
+        try:
+            resp = requests.post(url, data=json.dumps(payload),
+                                 headers={"Content-Type": "application/json"}, timeout=10)
+            resp_json = resp.json()
+            if resp.status_code != 200 or resp_json.get("code") != 0:
+                logger.error(f"飞书推送失败 [{webhook_key}] HTTP={resp.status_code} {resp.text}")
+                return False
+            logger.info(f"飞书推送成功 [{webhook_key}]")
+            return True
+        except requests.RequestException as exc:
+            logger.error(f"飞书推送异常 [{webhook_key}]：{exc}")
+            return False

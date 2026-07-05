@@ -17,6 +17,8 @@ from sequoia_x.analysis.market import MarketAnalyzer
 from sequoia_x.analysis.backtest import SignalBacktester
 from sequoia_x.analysis.stock_analysis import StockAnalyzer
 from sequoia_x.analysis.decision import DecisionEngine
+from sequoia_x.analysis.combo_backtest import ComboBacktester, SIGNAL_FUNCS
+from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -458,6 +460,34 @@ class WebServices:
             f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
         )
         return result
+
+    def backtest_combos(self, combos: dict[str, list[str]] | None = None,
+                         hold_days: list[int] | None = None) -> dict:
+        """组合历史回测对比（向量化，采样500只，秒级返回）。"""
+        if combos is None:
+            combos = {
+                "趋势突破": ["turtle", "ma_volume", "rps"],
+                "低吸埋伏": ["pullback", "bottom"],
+                "均衡全天候": ["rps", "turtle", "pullback", "bottom"],
+            }
+        hold_days = hold_days or [5, 10, 20]
+        bt = ComboBacktester(self.engine, self.settings)
+        return bt.run(combos, hold_days=hold_days)
+
+    def push_decision_feishu(self, decision: dict | None = None,
+                             strategy_keys: list[str] | None = None,
+                             capital: float = 100000.0, min_score: int = 50,
+                             exclude_markets: list[str] | None = None,
+                             exclude_st: bool = False) -> dict:
+        """推送交易决策清单到飞书。无 decision 参数时自动生成。"""
+        if decision is None:
+            decision = self.generate_decision(
+                strategy_keys=strategy_keys, capital=capital, min_score=min_score,
+                exclude_markets=exclude_markets, exclude_st=exclude_st,
+            )
+        notifier = FeishuNotifier(self.settings)
+        ok = notifier.send_decision(decision)
+        return {"success": ok, "buy_count": decision.get("summary", {}).get("buy_count", 0)}
 
     def analyze_market_async(self, target_date: str | None = None) -> str:
         """异步生成大盘分析报告，结果缓存到内存。"""
