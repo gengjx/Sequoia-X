@@ -508,6 +508,18 @@ class DecisionEngine:
 
     @staticmethod
     def _get_analyzer(analyze_fn) -> object | None:
-        """从闭包/绑定对象提取 StockAnalyzer 实例（用于预热快照）。"""
+        """从闭包/绑定对象提取 StockAnalyzer 实例（用于预热快照）。
+
+        兼容两种传入方式：
+          - StockAnalyzer.analyze（绑定方法）→ __self__ 即 analyzer
+          - services.analyze_stock（带缓存包装）→ __self__ 是 WebServices，
+            需取其底层 _stock_analyzer
+        """
         obj = getattr(analyze_fn, "__self__", None)
-        return obj
+        if obj is None:
+            return None
+        if hasattr(obj, "_get_stock_analyzer"):
+            return obj._get_stock_analyzer()
+        if hasattr(obj, "_refresh_quote_cache"):
+            return obj
+        return None

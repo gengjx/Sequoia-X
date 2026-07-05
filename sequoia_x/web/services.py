@@ -174,8 +174,8 @@ class WebServices:
         self._market_report_cache: dict[str, dict] = {}
         self._market_analyzer: MarketAnalyzer | None = None
         self._stock_analyzer: StockAnalyzer | None = None
-        self._stock_result_cache: dict[str, tuple[float, dict]] = {}
-        self._decision_cache: dict[str, tuple[float, dict]] = {}
+        self._stock_result_cache: dict[str, tuple[dict, dict]] = {}
+        self._decision_cache: dict[str, tuple[dict, dict]] = {}
         self._decision_cache_ts: float = 0.0
         self._backtest_cache: dict | None = None
         self._position_tracker: PositionTracker | None = None
@@ -290,14 +290,19 @@ class WebServices:
         return self._stock_analyzer
 
     def analyze_stock(self, symbol: str) -> dict:
-        """同步分析个股，返回六层结构化决策报告（5分钟结果缓存）。"""
+        """同步分析个股，返回六层结构化决策报告（当日有效缓存）。
+
+        A股T+1：日K收盘后技术指标/财报日内不变，分析结果当日有效。
+        缓存 key 含日期，自然跨日失效；盘中实时价变化不影响决策逻辑。
+        """
         import time
-        now = time.time()
+        from datetime import date
+        today = date.today().isoformat()
         cached = self._stock_result_cache.get(symbol)
-        if cached and now - cached[0] < 300:
+        if cached and cached[0].get("date") == today:
             return cached[1]
         result = self._get_stock_analyzer().analyze(symbol)
-        self._stock_result_cache[symbol] = (now, result)
+        self._stock_result_cache[symbol] = ({"date": today}, result)
         return result
 
     def analyze_portfolio(self, symbols: list[str]) -> dict:
@@ -408,8 +413,10 @@ class WebServices:
         now = time.time()
         # 缓存 key 包含策略+过滤参数，避免不同条件复用错误结果
         cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}"
+        from datetime import date
+        today = date.today().isoformat()
         cached = self._decision_cache.get(cache_key)
-        if cached and now - cached[0] < 600:
+        if cached and cached[0].get("date") == today:
             return cached[1]
         if strategy_keys is None:
             strategy_keys = list(STRATEGY_REGISTRY.keys())
@@ -453,7 +460,7 @@ class WebServices:
             return self._get_analyzer().analyze()
         result = engine.generate(
             strategy_results=strategy_results,
-            analyze_fn=analyzer.analyze,
+            analyze_fn=self.analyze_stock,
             capital=capital,
             min_score=min_score,
             exclude_markets=exclude_markets,
@@ -463,7 +470,7 @@ class WebServices:
         result["strategies_run"] = {
             k: len(v) for k, v in strategy_results.items()
         }
-        self._decision_cache[cache_key] = (time.time(), result)
+        self._decision_cache[cache_key] = ({"date": today}, result)
         logging.getLogger(__name__).info('决策缓存写入 key=' + cache_key[:40])
         logging.getLogger(__name__).info(
             f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
