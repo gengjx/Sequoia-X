@@ -474,6 +474,12 @@ class WebServices:
         bt = ComboBacktester(self.engine, self.settings)
         return bt.run(combos, hold_days=hold_days)
 
+    def backtest_resonance(self, hold_days: list[int] | None = None) -> dict:
+        """共振度分档回测（验证多策略共振是否带来超额收益）。"""
+        hold_days = hold_days or [5, 10, 20]
+        bt = ComboBacktester(self.engine, self.settings)
+        return bt.run_resonance(hold_days=hold_days)
+
     def push_decision_feishu(self, decision: dict | None = None,
                              strategy_keys: list[str] | None = None,
                              capital: float = 100000.0, min_score: int = 50,

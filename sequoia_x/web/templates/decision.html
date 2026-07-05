@@ -44,7 +44,8 @@
             <div class="mt-2 d-flex gap-2 flex-wrap">
                 <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(true)">全选策略</button>
                 <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">清空</button>
-                <button class="btn btn-outline-info btn-sm" onclick="backtestCombos()"><i class="bi bi-graph-up-arrow"></i> 组合回测对比</button>
+                <button class="btn btn-outline-info btn-sm" onclick="backtestCombos()"><i class="bi bi-graph-up-arrow"></i> 组合对比</button>
+                <button class="btn btn-outline-warning btn-sm" onclick="backtestResonance()"><i class="bi bi-diagram-2"></i> 共振分档</button>
                 <button class="btn btn-outline-success btn-sm" onclick="pushFeishu()"><i class="bi bi-send"></i> 推送飞书</button>
             </div>
         </div>
@@ -143,6 +144,67 @@ function applyCombo(id) {
         `<strong>${c.icon} ${c.name}</strong> · ${c.strategies.length}个策略 · 推荐≥${c.minScore}分<br>` +
         `<span class="text-muted">适用：${c.market}</span><br>` +
         `<span class="text-muted">逻辑：${c.logic}</span>`;
+}
+
+async function backtestResonance() {
+    const el = document.getElementById('backtest-result');
+    el.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-warning"></div> 共振分档回测中（约8秒）...</div>';
+    try {
+        const data = await api('/api/decision/backtest-resonance');
+        renderResonance(data);
+    } catch(e) { el.innerHTML = `<div class="alert alert-danger">回测失败：${e.message}</div>`; }
+}
+
+function renderResonance(data) {
+    const items = data.resonance || [];
+    const bands = {};
+    items.forEach(c => { (bands[c.resonance] = bands[c.resonance] || []).push(c); });
+    const holdDays = [...new Set(items.map(c=>c.hold_days))].sort((a,b)=>a-b);
+    const bandOrder = ['1','2','3+'];
+
+    let html = '<div class="card mb-4 border-warning"><div class="card-header fw-bold text-warning"><i class="bi bi-diagram-2"></i> 共振度分档回测（采样'+data.sample_size+'只）</div><div class="card-body">';
+    html += '<div class="alert alert-light border small mb-3"><i class="bi bi-lightbulb"></i> 验证决策中枢核心假设：<strong>多策略共振是否真能带来超额收益？</strong></div>';
+
+    // 柱状图：取10天持有期对比
+    const main10 = bandOrder.map(b => bands[b]?.find(i=>i.hold_days===10)).filter(Boolean);
+    const maxRet = Math.max(...main10.map(c=>Math.abs(c.avg_return)), 1);
+    html += '<div class="mb-3">';
+    main10.forEach(c => {
+        const w = Math.abs(c.avg_return)/maxRet*100;
+        const pos = c.avg_return >= 0;
+        const label = c.resonance==='1'?'单策略':c.resonance==='2'?'2策略共振':'3+共振';
+        html += `<div class="d-flex align-items-center mb-1" style="font-size:0.85rem">
+            <span style="width:90px" class="text-end me-2">${label}</span>
+            <div class="flex-grow-1 bg-light rounded" style="height:22px;position:relative">
+                <div class="rounded d-flex align-items-center justify-content-end ${pos?'bg-danger':'bg-success'}" style="width:${Math.max(w,5)}%;height:22px">
+                    <span class="text-white small px-1">${c.avg_return>=0?'+':''}${c.avg_return}%</span>
+                </div>
+            </div>
+            <span class="ms-2 text-muted" style="width:60px">胜率${c.win_rate}%</span>
+            <span class="text-muted" style="width:60px">样本${c.count}</span>
+        </div>`;
+    });
+    html += '</div>';
+
+    // 详细表
+    html += '<div class="table-responsive"><table class="table table-sm table-hover small mb-0"><thead class="table-light"><tr><th>共振度</th>';
+    holdDays.forEach(h => html += `<th>${h}天收益</th><th>胜率</th><th>样本</th>`);
+    html += '</tr></thead><tbody>';
+    bandOrder.forEach(b => {
+        if (!bands[b]) return;
+        const label = b==='1'?'单策略（共振1）':b==='2'?'2策略共振':'3+策略共振';
+        html += `<tr><td class="fw-bold">${label}</td>`;
+        holdDays.forEach(h => {
+            const it = bands[b].find(i=>i.hold_days===h) || {};
+            const cls = (it.avg_return||0)>=0?'text-danger':'text-success';
+            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+    html += '<div class="alert alert-warning small mt-2 mb-0"><i class="bi bi-exclamation-triangle"></i> <strong>关键发现：</strong>若3+共振收益转负/胜率下降，说明多重信号共振在A股常为过热见顶信号（非越共振越好），决策定级需警惕"共振陷阱"。基于历史回测，不代表未来。</div>';
+    html += '</div></div>';
+    document.getElementById('backtest-result').innerHTML = html;
 }
 
 async function backtestCombos() {

@@ -119,6 +119,14 @@ async def backtest_combos(request: Request):
     return await asyncio.to_thread(services.backtest_combos)
 
 
+@router.get("/decision/backtest-resonance")
+async def backtest_resonance(request: Request):
+    """共振度分档回测（1/2/3+共振的收益对比）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.backtest_resonance)
+
+
 @router.post("/decision/push-feishu")
 async def push_decision_feishu(body: DecisionRequest, request: Request):
     """推送交易决策清单到飞书。"""

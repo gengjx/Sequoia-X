@@ -92,26 +92,90 @@ class ComboBacktester:
         self, combos: dict[str, list[str]], hold_days: list[int] | None = None,
         sample_size: int = 500, seed: int = 42,
     ) -> dict:
-        """回测多个组合，返回横向对比报告。
+        """回测多个组合，返回横向对比报告。"""
+        hold_days = hold_days or [5, 10, 20]
+        strategy_returns = self._collect_returns(hold_days, sample_size, seed)
+        processed = strategy_returns.pop("__processed__", 0)
 
-        Args:
-            combos: {组合名: [策略key列表]}
-            hold_days: 持有期天数列表，默认 [5, 10, 20]
-            sample_size: 采样股票数（控制耗时）
+        results = []
+        for combo_name, skeys in combos.items():
+            valid_keys = [k for k in skeys if k in SIGNAL_FUNCS]
+            for h in hold_days:
+                all_rets: list[float] = []
+                for k in valid_keys:
+                    all_rets.extend(strategy_returns.get(k, {}).get(h, []))
+                results.append({
+                    "combo": combo_name, "hold_days": h,
+                    **self._stats(all_rets),
+                })
+        return {"combos": results, "sample_size": processed}
+
+    def run_resonance(self, hold_days: list[int] | None = None,
+                      sample_size: int = 500, seed: int = 42) -> dict:
+        """共振度分档回测：统计不同共振度（1/2/3+）下的持有期收益。
+
+        核心验证：多策略共振是否真能带来超额收益（决策中枢定级矩阵的基础假设）。
         """
         hold_days = hold_days or [5, 10, 20]
         symbols = self.engine.get_local_symbols()
         if sample_size and len(symbols) > sample_size:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
+        logger.info(f"共振回测：采样 {len(symbols)} 只股票")
+
+        # {共振度档位: {hold: [收益率]}}
+        bands = {"1": {h: [] for h in hold_days},
+                 "2": {h: [] for h in hold_days},
+                 "3+": {h: [] for h in hold_days}}
+        processed = 0
+
+        for symbol in symbols:
+            try:
+                df = self.engine.get_ohlcv(symbol)
+                if len(df) < 60:
+                    continue
+                df = df.reset_index(drop=True)
+                signals = _compute_signals(df)
+                if not signals:
+                    continue
+                # 计算每日共振度（同时命中几个策略）
+                sig_df = pd.DataFrame({k: v.fillna(False) for k, v in signals.items()})
+                resonance_count = sig_df.sum(axis=1)  # 每日共振数
+                for h in hold_days:
+                    for idx in resonance_count.index:
+                        rc = resonance_count.iloc[idx]
+                        if rc == 0 or idx >= len(df) - h - 1:
+                            continue
+                        entry = df["close"].iloc[idx]
+                        exit_p = df["close"].iloc[idx + h]
+                        if entry <= 0:
+                            continue
+                        ret = exit_p / entry - 1
+                        band = "3+" if rc >= 3 else str(rc)
+                        if band in bands:
+                            bands[band][h].append(ret)
+                processed += 1
+            except Exception:
+                continue
+
+        logger.info(f"共振回测：处理 {processed}/{len(symbols)} 只")
+        results = []
+        for band in ["1", "2", "3+"]:
+            for h in hold_days:
+                results.append({"resonance": band, "hold_days": h,
+                                **self._stats(bands[band][h])})
+        return {"resonance": results, "sample_size": processed}
+
+    def _collect_returns(self, hold_days: list[int], sample_size: int,
+                         seed: int) -> dict:
+        """采集每个策略的触发点收益（共享数据采集循环）。"""
+        symbols = self.engine.get_local_symbols()
+        if sample_size and len(symbols) > sample_size:
+            rng = random.Random(seed)
+            symbols = rng.sample(symbols, sample_size)
         logger.info(f"组合回测：采样 {len(symbols)} 只股票，持有期 {hold_days}")
 
-        # 收集每个策略的触发点收益
-        # {策略key: {hold: [收益率...]}}
-        strategy_returns: dict[str, dict[int, list[float]]] = {}
-        for skey in SIGNAL_FUNCS:
-            strategy_returns[skey] = {h: [] for h in hold_days}
-
+        strategy_returns: dict = {skey: {h: [] for h in hold_days} for skey in SIGNAL_FUNCS}
         processed = 0
         for symbol in symbols:
             try:
@@ -129,23 +193,9 @@ class ComboBacktester:
                 processed += 1
             except Exception:
                 continue
-
         logger.info(f"组合回测：处理 {processed}/{len(symbols)} 只")
-
-        # 聚合组合收益（命中任一策略即纳入）
-        results = []
-        for combo_name, skeys in combos.items():
-            valid_keys = [k for k in skeys if k in SIGNAL_FUNCS]
-            for h in hold_days:
-                all_rets: list[float] = []
-                for k in valid_keys:
-                    all_rets.extend(strategy_returns[k][h])
-                results.append({
-                    "combo": combo_name,
-                    "hold_days": h,
-                    **self._stats(all_rets),
-                })
-        return {"combos": results, "sample_size": processed}
+        strategy_returns["__processed__"] = processed
+        return strategy_returns
 
     @staticmethod
     def _forward_returns(df: pd.DataFrame, signal: pd.Series, hold: int) -> list[float]:
