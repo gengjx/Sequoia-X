@@ -170,6 +170,7 @@ class WebServices:
         self._market_report_cache: dict[str, dict] = {}
         self._market_analyzer: MarketAnalyzer | None = None
         self._stock_analyzer: StockAnalyzer | None = None
+        self._stock_result_cache: dict[str, tuple[float, dict]] = {}
         self._backtest_cache: dict | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
@@ -282,8 +283,15 @@ class WebServices:
         return self._stock_analyzer
 
     def analyze_stock(self, symbol: str) -> dict:
-        """同步分析个股（秒级返回），返回结构化决策报告。"""
-        return self._get_stock_analyzer().analyze(symbol)
+        """同步分析个股，返回六层结构化决策报告（5分钟结果缓存）。"""
+        import time
+        now = time.time()
+        cached = self._stock_result_cache.get(symbol)
+        if cached and now - cached[0] < 300:
+            return cached[1]
+        result = self._get_stock_analyzer().analyze(symbol)
+        self._stock_result_cache[symbol] = (now, result)
+        return result
     def analyze_market_async(self, target_date: str | None = None) -> str:
         """异步生成大盘分析报告，结果缓存到内存。"""
         task_id = uuid.uuid4().hex[:8]

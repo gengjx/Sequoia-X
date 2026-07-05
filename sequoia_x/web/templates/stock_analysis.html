@@ -189,8 +189,8 @@ function renderReport(r) {
                     <span class="float-end badge ${f.score>=65?'bg-danger':f.score>=50?'bg-warning text-dark':'bg-secondary'}">${f.score||'-'}/100</span>
                 </div>
                 <div class="card-body small">
-                    ${fundRow('市盈率PE', f.pe!=null?f.pe.toFixed(1):'-', f.pe>80?'<span class="text-warning">偏高</span>':(f.pe>0&&f.pe<15?'<span class="text-success">低估</span>':''))}
-                    ${fundRow('市净率PB', f.pb!=null?f.pb.toFixed(2):'-', f.pb<1&&f.pb>0?'<span class="text-success">破净</span>':'')}
+                    ${fundRow('市盈率PE', f.pe!=null?f.pe.toFixed(1):'-', f.pe_industry_pct!=null?`<span class="text-muted">行业${f.pe_industry_pct}%分位</span>`:'')}
+                    ${fundRow('市净率PB', f.pb!=null?f.pb.toFixed(2):'-', f.pb_industry_pct!=null?`<span class="text-muted">行业${f.pb_industry_pct}%分位</span>`:'')}
                     ${fundRow('所属行业', f.industry || '-')}
                     ${fundRow('总市值', fmtCap(f.market_cap))}
                     ${fundRow('ROE', f.roe!=null?f.roe.toFixed(1)+'%':'-', f.roe>=15?'<span class="text-danger">优秀</span>':(f.roe<3?'<span class="text-warning">偏弱</span>':''))}
@@ -199,7 +199,7 @@ function renderReport(r) {
                     ${fundRow('净利同比', f.yoy_ni!=null?(f.yoy_ni>0?'+':'')+f.yoy_ni.toFixed(1)+'%':'-', f.yoy_ni<0?'<span class="text-success">下滑</span>':(f.yoy_ni>=30?'<span class="text-danger">高增</span>':''))}
                     ${fundRow('EPS(TTM)', f.eps_ttm!=null?f.eps_ttm.toFixed(3):'-')}
                     ${fundRow('净利润', fmtAmt(f.net_profit))}
-                    ${fundRow('报告期', f.stat_date || '-')}
+                    ${fundRow('报告期', f.stat_date || '-', f.finance_basis?`<span class="text-info">${f.finance_basis}</span>`:'')}
                 </div>
             </div>
         </div>

@@ -81,9 +81,14 @@ async def get_stock_summary(symbol: str, request: Request):
     return summary
 @router.get("/stocks/{symbol}/analysis")
 async def analyze_stock(symbol: str, request: Request):
-    """个股深度分析：技术面+相对强度+市场环境+策略命中+买卖建议。"""
+    """个股深度分析：技术面+相对强度+市场环境+策略命中+基本面+资金面。
+
+    分析在后台线程执行（asyncio.to_thread），不阻塞事件循环，
+    分析期间其他页面/请求正常响应。
+    """
+    import asyncio
     services = request.app.state.services
-    return services.analyze_stock(symbol)
+    return await asyncio.to_thread(services.analyze_stock, symbol)
 
 
 # ---------------------------------------------------------------------------

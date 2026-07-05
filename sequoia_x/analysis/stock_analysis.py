@@ -713,13 +713,21 @@ class StockAnalyzer:
         pb = quote.get("pb")
         fin_latest = finance[0] if finance else {}
         fin_prev = finance[1] if len(finance) > 1 else {}
-        roe = self._sf(fin_latest.get("roe"))
-        np_margin = self._sf(fin_latest.get("np_margin"))
-        gp_margin = self._sf(fin_latest.get("gp_margin"))
+        # TTM：财务质量优先取年报数据（全年值，比单季稳定，避免 Q1/三季报 ROE 偏低）
+        annual = next((r for r in finance if (r.get("stat_date") or "").endswith("12-31")), None)
+        fin_quality = annual or fin_latest
+        roe = self._sf(fin_quality.get("roe"))
+        np_margin = self._sf(fin_quality.get("np_margin"))
+        gp_margin = self._sf(fin_quality.get("gp_margin"))
         yoy_ni_now = self._sf(fin_latest.get("yoy_ni"))
         yoy_ni_prev = self._sf(fin_prev.get("yoy_ni"))
 
-        val_score = 0.6 * self._pe_score(pe) + 0.4 * self._pb_score(pb)
+        # 行业分位估值（优先）：PE/PB 在同行业内排名，跨行业可比性更强
+        pe_pct = self._industry_percentile(symbol, "pe")
+        pb_pct = self._industry_percentile(symbol, "pb")
+        pe_score = self._score_from_percentile(pe_pct) if pe_pct is not None else self._pe_score(pe)
+        pb_score = self._score_from_percentile(pb_pct) if pb_pct is not None else self._pb_score(pb)
+        val_score = 0.6 * pe_score + 0.4 * pb_score
         quality_score = self._quality_score(roe, np_margin)
         growth_score = self._growth_score(yoy_ni_now, yoy_ni_prev)
         score = round(0.40 * val_score + 0.30 * quality_score + 0.30 * growth_score)
@@ -729,14 +737,17 @@ class StockAnalyzer:
             "market_cap": quote.get("market_cap"),
             "float_cap": quote.get("float_cap"),
             "industry": quote.get("industry"),
+            "pe_industry_pct": pe_pct,
+            "pb_industry_pct": pb_pct,
             "roe": round(roe * 100, 1) if roe is not None else None,
             "np_margin": round(np_margin * 100, 1) if np_margin is not None else None,
             "gp_margin": round(gp_margin * 100, 1) if gp_margin is not None else None,
             "yoy_ni": round(yoy_ni_now * 100, 1) if yoy_ni_now is not None else None,
-            "net_profit": self._sf(fin_latest.get("net_profit")),
+            "net_profit": self._sf(fin_quality.get("net_profit")),
             "eps_ttm": self._sf(fin_latest.get("eps_ttm")),
-            "revenue": self._sf(fin_latest.get("revenue")),
-            "stat_date": fin_latest.get("stat_date"),
+            "revenue": self._sf(fin_quality.get("revenue")),
+            "finance_basis": "年报(TTM)" if annual else "最新单季",
+            "stat_date": fin_quality.get("stat_date"),
             "score": score,
             "sub_scores": {
                 "valuation": round(val_score),
@@ -1028,9 +1039,58 @@ class StockAnalyzer:
             qs = [(y, 3), (y, 2), (y, 1), (y - 1, 4)]
         return qs[:n]
 
+    def _industry_percentile(self, symbol: str, field: str) -> float | None:
+        """计算该股指标在同行业内的分位（0-100，越低越便宜）。
+
+        基于全市场快照缓存（含 PE/PB + 行业），仅统计正值样本。
+        样本不足 5 只或行业缺失时返回 None，回退到绝对档位评分。
+        """
+        cache = self._cache_quote
+        if not cache:
+            return None
+        my = cache.get(symbol, {})
+        industry = my.get("industry")
+        if not industry or industry == "-":
+            return None
+        my_val = self._sf(my.get(field))
+        if my_val is None or my_val <= 0:
+            return None
+        peers = []
+        for v in cache.values():
+            if v.get("industry") != industry:
+                continue
+            pv = self._sf(v.get(field))
+            if pv is not None and pv > 0:
+                peers.append(pv)
+        if len(peers) < 5:
+            return None
+        peers.sort()
+        rank = sum(1 for x in peers if x <= my_val)
+        return round(rank / len(peers) * 100, 1)
+
+    @staticmethod
+    def _score_from_percentile(pct: float) -> float:
+        """行业分位评分（0-100）：分位越低（行业内越便宜）得分越高。
+
+        极低分位（行业内最便宜）给高分，但保留合理区间，避免"便宜陷阱"。
+        """
+        if pct is None:
+            return 50.0
+        if pct <= 15:
+            return 88.0   # 行业内显著低估
+        if pct <= 30:
+            return 80.0   # 偏低估
+        if pct <= 50:
+            return 70.0   # 中性偏低
+        if pct <= 70:
+            return 58.0   # 中性偏高
+        if pct <= 85:
+            return 44.0   # 偏贵
+        return 32.0       # 行业内显著高估
+
     @staticmethod
     def _pe_score(pe) -> float:
-        """PE 估值评分（0-100）：适中最高，两端递减，亏损重扣。"""
+        """PE 估值评分（0-100）：适中最高，两端递减，亏损重扣（行业分位缺失时的回退）。"""
         pe = StockAnalyzer._sf(pe)
         if pe is None:
             return 50.0
