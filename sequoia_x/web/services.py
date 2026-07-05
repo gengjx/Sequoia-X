@@ -16,6 +16,7 @@ from sequoia_x.core.config import Settings
 from sequoia_x.analysis.market import MarketAnalyzer
 from sequoia_x.analysis.backtest import SignalBacktester
 from sequoia_x.analysis.stock_analysis import StockAnalyzer
+from sequoia_x.analysis.decision import DecisionEngine
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -171,6 +172,8 @@ class WebServices:
         self._market_analyzer: MarketAnalyzer | None = None
         self._stock_analyzer: StockAnalyzer | None = None
         self._stock_result_cache: dict[str, tuple[float, dict]] = {}
+        self._decision_cache: dict | None = None
+        self._decision_cache_ts: float = 0.0
         self._backtest_cache: dict | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
@@ -387,6 +390,69 @@ class WebServices:
             "weighted_pb": avg_pb,
             "alerts": alerts,
         }
+
+    def generate_decision(
+        self, strategy_keys: list[str] | None = None,
+        capital: float = 100000.0, min_score: int = 50,
+    ) -> dict:
+        """交易决策中枢：多策略选股 → 质量过滤 → 共振定级 → 仓位分配。
+
+        并行运行选定策略，汇总去重后跑个股分析，输出可执行买卖清单（10分钟缓存）。
+        """
+        import time
+        now = time.time()
+        if self._decision_cache and now - self._decision_cache_ts < 600:
+            return self._decision_cache
+        if strategy_keys is None:
+            strategy_keys = list(STRATEGY_REGISTRY.keys())
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Step1: 并行运行选定策略
+        strategy_results: dict[str, list[str]] = {}
+        def _run_strategy(key: str) -> tuple[str, list[str]]:
+            # 优先用缓存结果（5min内跑过的）
+            cached = self._result_cache.get(key, [])
+            if cached:
+                return key, cached
+            cls = STRATEGY_REGISTRY.get(key)
+            if not cls:
+                return key, []
+            try:
+                strat = cls(engine=self.engine, settings=self.settings)
+                results = strat.run()
+                self._result_cache[key] = results
+                return key, results
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"策略 {key} 运行失败：{e!r}")
+                return key, []
+
+        workers = min(4, len(strategy_keys) or 1)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_run_strategy, k) for k in strategy_keys]
+            for fut in as_completed(futs):
+                k, syms = fut.result()
+                strategy_results[k] = syms
+
+        # Step2-4: 决策引擎融合
+        analyzer = self._get_stock_analyzer()
+        engine = DecisionEngine(self.engine, self.settings)
+        result = engine.generate(
+            strategy_results=strategy_results,
+            analyze_fn=analyzer.analyze,
+            capital=capital,
+            min_score=min_score,
+        )
+        result["strategies_run"] = {
+            k: len(v) for k, v in strategy_results.items()
+        }
+        self._decision_cache = result
+        self._decision_cache_ts = time.time()
+        logging.getLogger(__name__).info(
+            f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
+        )
+        return result
+
     def analyze_market_async(self, target_date: str | None = None) -> str:
         """异步生成大盘分析报告，结果缓存到内存。"""
         task_id = uuid.uuid4().hex[:8]

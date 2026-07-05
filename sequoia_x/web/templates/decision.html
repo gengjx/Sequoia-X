@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}交易决策 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="mb-3">
+    <h2 class="mb-1"><i class="bi bi-list-check"></i> 交易决策中枢</h2>
+    <p class="text-muted mb-0">勾选策略 → 多策略选股汇总 → 六层评分过滤 → 共振定级 → 仓位分配，输出可执行买卖清单</p>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="row g-3 align-items-end">
+            <div class="col-md-7">
+                <label class="form-label fw-bold small mb-2">选择策略（多选 = 共振分析）</label>
+                <div id="strategy-box" class="d-flex flex-wrap gap-2"></div>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label small">总资金（元）</label>
+                <input type="number" class="form-control" id="capital" value="100000" step="10000">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label small">最低评分</label>
+                <input type="number" class="form-control" id="min-score" value="50" min="0" max="100">
+            </div>
+            <div class="col-md-1">
+                <button class="btn btn-primary w-100" onclick="generateDecision()"><i class="bi bi-magic"></i></button>
+            </div>
+        </div>
+        <div class="mt-2">
+            <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(true)">全选</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">清空</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickPreset('突破组')">突破组</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="quickPreset('低吸组')">低吸组</button>
+        </div>
+    </div>
+</div>
+
+<div id="loading" class="text-center py-4" style="display:none;">
+    <div class="spinner-border text-primary" role="status"></div>
+    <p class="text-muted mt-2" id="loading-text">正在运行策略并生成决策...</p>
+</div>
+
+<div id="result"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const STRATEGIES = [
+    {key:'ma_volume', name:'均线放量', type:'突破'},
+    {key:'turtle', name:'海龟突破', type:'突破'},
+    {key:'rps', name:'RPS强势', type:'突破'},
+    {key:'flag', name:'高位旗形', type:'强势'},
+    {key:'dragon', name:'板块龙头', type:'强势'},
+    {key:'pullback', name:'缩量回踩', type:'低吸'},
+    {key:'bottom', name:'底部放量', type:'低吸'},
+    {key:'shakeout', name:'涨停洗盘', type:'特殊'},
+    {key:'limit_down', name:'上升趋势跌停', type:'特殊'},
+];
+const TYPE_COLORS = {'突破':'primary','强势':'danger','低吸':'success','特殊':'warning'};
+
+function initStrategies() {
+    const box = document.getElementById('strategy-box');
+    box.innerHTML = STRATEGIES.map(s => `
+        <div class="form-check form-check-inline bg-light rounded px-2 py-1">
+            <input class="form-check-input strat-cb" type="checkbox" value="${s.key}" id="cb-${s.key}" checked>
+            <label class="form-check-label small" for="cb-${s.key}">${s.name} <span class="badge bg-${TYPE_COLORS[s.type]}">${s.type}</span></label>
+        </div>`).join('');
+}
+
+function selectAll(checked) { document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = checked); }
+function quickPreset(group) {
+    const map = {'突破组':['ma_volume','turtle','rps'],'低吸组':['pullback','bottom']};
+    const keys = map[group]||[];
+    document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = keys.includes(cb.value));
+}
+
+async function generateDecision() {
+    const keys = [...document.querySelectorAll('.strat-cb:checked')].map(cb => cb.value);
+    if (!keys.length) { showToast('请至少选择一个策略', 'error'); return; }
+    const capital = parseFloat(document.getElementById('capital').value) || 100000;
+    const minScore = parseInt(document.getElementById('min-score').value) || 50;
+    const loading = document.getElementById('loading');
+    const result = document.getElementById('result');
+    loading.style.display = 'block'; result.innerHTML = '';
+    document.getElementById('loading-text').textContent = `正在运行 ${keys.length} 个策略并分析候选股...（首次较慢）`;
+    try {
+        const data = await api('/api/decision/generate', {
+            method: 'POST', body: JSON.stringify({ strategy_keys: keys, capital, min_score: minScore })
+        });
+        loading.style.display = 'none';
+        renderDecision(data);
+    } catch (e) {
+        loading.style.display = 'none';
+        result.innerHTML = `<div class="alert alert-danger">决策生成失败：${e.message}</div>`;
+    }
+}
+
+const GRADE_BADGE = {'A':'<span class="badge bg-danger">A·重仓</span>','B':'<span class="badge bg-warning text-dark">B·建仓</span>','C':'<span class="badge bg-info text-dark">C·试探</span>'};
+const GRADE_ROW = {'A':'table-danger','B':'table-warning','C':'table-info'};
+
+function renderDecision(data) {
+    const sm = data.summary || {};
+    const buys = data.buy_list || [];
+    const rejects = data.reject_list || [];
+    let html = '';
+
+    // 策略运行概览
+    const srun = data.strategies_run || {};
+    const srunStr = Object.entries(srun).map(([k,v]) => {
+        const meta = STRATEGIES.find(s=>s.key===k);
+        return `${meta?meta.name:k} ${v}只`;
+    }).join(' · ');
+    html += `<div class="alert alert-light border small mb-3"><i class="bi bi-info-circle"></i> 运行 ${data.strategy_count} 个策略 → 候选池 <strong>${data.pool_size}</strong> 只（${srunStr}）</div>`;
+
+    // 组合摘要
+    html += `
+    <div class="row g-3 mb-4">
+        <div class="col-md-3"><div class="card h-100 text-center border-primary"><div class="card-body">
+            <div class="display-6 fw-bold text-primary">${sm.buy_count||0}</div><div class="text-muted small">可买入</div>
+            <small>A${(sm.grade_count||{}).A||0} B${(sm.grade_count||{}).B||0} C${(sm.grade_count||{}).C||0}</small>
+        </div></div></div>
+        <div class="col-md-3"><div class="card h-100 text-center"><div class="card-body">
+            <div class="display-6 fw-bold">${sm.reject_count||0}</div><div class="text-muted small">已淘汰</div>
+        </div></div></div>
+        <div class="col-md-3"><div class="card h-100 text-center"><div class="card-body">
+            <div class="display-6 fw-bold text-success">${sm.position_ratio||0}%</div><div class="text-muted small">仓位占用</div>
+            <small>现金 ${sm.cash_ratio||0}% · ¥${(sm.used_capital||0).toLocaleString()}</small>
+        </div></div></div>
+        <div class="col-md-3"><div class="card h-100 text-center ${sm.concentration>=50?'border-warning':''}"><div class="card-body">
+            <div class="display-6 fw-bold ${sm.concentration>=50?'text-warning':''}">${sm.concentration||0}%</div><div class="text-muted small">行业集中</div>
+            <small>${sm.top_industry||'分散'}</small>
+        </div></div></div>
+    </div>`;
+
+    // 买入清单
+    if (buys.length) {
+        html += `
+        <div class="card mb-4">
+            <div class="card-header fw-bold"><i class="bi bi-cart-plus"></i> 买入清单（按评级排序，点击进个股分析）</div>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-0">
+                    <thead class="table-light small"><tr>
+                        <th>评级</th><th>股票</th><th>共振</th><th>命中策略</th><th>评分</th>
+                        <th>现价</th><th>止损</th><th>目标</th><th>仓位</th><th>股数</th><th>资金</th>
+                    </tr></thead>
+                    <tbody class="small">
+                    ${buys.map(r => `
+                        <tr class="${GRADE_ROW[r.grade]||''}">
+                            <td>${GRADE_BADGE[r.grade]||'-'}</td>
+                            <td><a href="/stock-analysis" onclick="localStorage.setItem('qs','${r.symbol}')" class="text-decoration-none fw-semibold">${r.name}<br><small class="text-muted">${r.symbol}</small></a></td>
+                            <td>${r.resonance>1?`<span class="badge bg-danger">${r.resonance}共振</span>`:r.resonance}</td>
+                            <td><small>${r.hit_strategies.map(s=>`<span class="badge bg-light text-dark me-1">${s}</span>`).join('')}</small></td>
+                            <td class="fw-bold">${r.score}</td>
+                            <td>${r.price!=null?r.price.toFixed(2):'-'}</td>
+                            <td class="text-success">${r.stop_loss!=null?r.stop_loss.toFixed(2):'-'}</td>
+                            <td class="text-danger">${r.target!=null?r.target.toFixed(2):'-'}</td>
+                            <td class="fw-bold">${r.position_pct||0}%</td>
+                            <td>${r.shares||0}</td>
+                            <td>¥${(r.capital||0).toLocaleString()}</td>
+                        </tr>
+                        <tr class="${GRADE_ROW[r.grade]||''}"><td colspan="11" class="py-1"><small class="text-muted">💡 ${r.reason}</small></td></tr>
+                    `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>`;
+    } else {
+        html += `<div class="alert alert-warning">当前策略组合无符合买入条件的标的，可降低最低评分或更换策略</div>`;
+    }
+
+    // 淘汰清单
+    if (rejects.length) {
+        html += `
+        <div class="card border-secondary">
+            <div class="card-header fw-bold text-muted"><i class="bi bi-funnel"></i> 淘汰清单（${rejects.length}只，${rejects.length>5?'前5':''}）</div>
+            <div class="table-responsive">
+                <table class="table table-sm mb-0">
+                    <thead class="table-light small"><tr><th>股票</th><th>共振</th><th>评分</th><th>淘汰原因</th></tr></thead>
+                    <tbody class="small">
+                    ${rejects.slice(0,5).map(r => `
+                        <tr><td>${r.name}（${r.symbol}）</td><td>${r.resonance}</td><td>${r.score}</td><td class="text-muted">${r.reject_reason||'-'}</td></tr>
+                    `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>`;
+    }
+
+    html += `<p class="text-center text-muted small mt-3 mb-4"><i class="bi bi-shield-exclamation"></i> 量化决策仅供参考，A股T+1，请结合大盘环境与自身风险偏好。仓位基于ATR风险预算（单笔1.5%）。</p>`;
+    document.getElementById('result').innerHTML = html;
+}
+
+initStrategies();
+</script>
+{% endblock %}

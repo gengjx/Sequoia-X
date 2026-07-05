@@ -99,6 +99,17 @@ async def analyze_portfolio(body: PortfolioRequest, request: Request):
     return await asyncio.to_thread(services.analyze_portfolio, body.symbols)
 
 
+@router.post("/decision/generate")
+async def generate_decision(body: DecisionRequest, request: Request):
+    """交易决策中枢：多策略融合生成买卖清单（10分钟缓存）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(
+        services.generate_decision,
+        body.strategy_keys, body.capital, body.min_score,
+    )
+
+
 # ---------------------------------------------------------------------------
 # System endpoints
 # ---------------------------------------------------------------------------
@@ -147,6 +158,12 @@ async def get_config(request: Request):
 
 class PortfolioRequest(BaseModel):
     symbols: list[str]
+
+
+class DecisionRequest(BaseModel):
+    strategy_keys: list[str] | None = None
+    capital: float = 100000.0
+    min_score: int = 50
 
 
 class ConfigUpdate(BaseModel):

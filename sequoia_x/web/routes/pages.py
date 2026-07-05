@@ -95,3 +95,12 @@ async def portfolio_page(request: Request):
         request=request, name="portfolio.html",
         context={},
     )
+
+
+@router.get("/decision")
+async def decision_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="decision.html",
+        context={},
+    )
