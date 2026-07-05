@@ -24,45 +24,49 @@ class TurtleTradeStrategy(BaseStrategy):
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+        """获取候选股票的流通市值（仅用于结果排序，不影响选股逻辑）。
 
-        流通股本 = 成交量 / (换手率% / 100)
-        流通市值 = 流通股本 × 不复权收盘价
+        优先用本地 stock_market_cap 缓存（东财市值，5350只），毫秒级。
+        无缓存时回退用最近日成交额(turnover)近似排序——流通市值与成交额
+        高度相关，排序结果足够接近。baostock串行查询38s且周末无数据，弃用。
         """
-        from datetime import date
-
-        import baostock as bs
-        from sequoia_x.analysis.stock_analysis import _baostock_acquire, _baostock_release
-
-        today_str = date.today().strftime("%Y-%m-%d")
+        import sqlite3
         market_caps: dict[str, float] = {}
-
-        _baostock_acquire()
+        if not symbols:
+            return market_caps
+        placeholders = ",".join("?" * len(symbols))
         try:
-            for symbol in symbols:
-                bs_code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="3",  # 不复权，真实价格
-                )
-                while rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        close = float(row[0])
-                        volume = float(row[1])
-                        turn = float(row[2])
-                        if turn > 0:
-                            circulating_shares = volume / (turn / 100)
-                            market_caps[symbol] = circulating_shares * close
-                    except (ValueError, ZeroDivisionError):
-                        continue
-        finally:
-            _baostock_release()
-
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    f"SELECT symbol, market_cap FROM stock_market_cap "
+                    f"WHERE symbol IN ({placeholders})",
+                    symbols,
+                ).fetchall()
+            for sym, mc in rows:
+                if mc:
+                    market_caps[sym] = mc
+        except Exception:
+            pass
+        # 缺失的用最近日成交额近似（成交额与市值正相关，排序够用）
+        missing = [s for s in symbols if s not in market_caps]
+        if missing:
+            try:
+                with sqlite3.connect(self.engine.db_path) as conn:
+                    last_date = conn.execute(
+                        "SELECT MAX(date) FROM stock_daily"
+                    ).fetchone()[0]
+                    if last_date:
+                        ph = ",".join("?" * len(missing))
+                        rows = conn.execute(
+                            f"SELECT symbol, turnover FROM stock_daily "
+                            f"WHERE date=? AND symbol IN ({ph})",
+                            [last_date] + missing,
+                        ).fetchall()
+                        for sym, turn in rows:
+                            if turn:
+                                market_caps[sym] = turn
+            except Exception:
+                pass
         return market_caps
 
     def run(self) -> list[str]:
