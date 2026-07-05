@@ -125,13 +125,33 @@ class DecisionEngine:
         if analyzer and hasattr(analyzer, "batch_prefetch_finance"):
             prefetch = analyzer.batch_prefetch_finance(list(pool.keys()))
 
-        # ── Step 2: 并行个股分析（质量过滤）──
+        # ── Step 2: 并行个股分析（网络密集，串行→并行提速）──
+        # 财报已预采落库，个股分析的主要耗时是东财网络请求（真实价/龙虎榜），可安全并发。
+        # 过滤+定级（CPU密集）保持串行，逻辑清晰且无并发风险。
+        import time as _t
+        _t0 = _t.time()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        syms_list = list(pool.keys())
+        reports: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(syms_list))) as ex:
+            futs = {ex.submit(analyze_fn, sym): sym for sym in syms_list}
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    rep = fut.result()
+                    if rep and not rep.get("error"):
+                        reports[sym] = rep
+                except Exception as e:
+                    logger.warning(f"决策分析 {sym} 失败：{e!r}")
+        logger.info(f"个股分析并行完成：{len(reports)}/{len(syms_list)} 只，耗时{_t.time() - _t0:.1f}s")
+
+        # 串行：过滤 + 定级（毫秒级）
         items: list[DecisionItem] = []
         for sym, strat_names in pool.items():
+            report = reports.get(sym)
+            if not report:
+                continue
             try:
-                report = analyze_fn(sym)
-                if report.get("error"):
-                    continue
                 # ST 过滤（分析后拿到股票名称才能判断）
                 if exclude_st and "ST" in report.get("name", "").upper():
                     items.append(DecisionItem(
@@ -172,7 +192,7 @@ class DecisionEngine:
 
                 items.append(item)
             except Exception as e:
-                logger.warning(f"决策分析 {sym} 失败：{e!r}")
+                logger.warning(f"决策定级 {sym} 失败：{e!r}")
 
         # ── Step 3: 定级后排序（评级→共振→评分）──
         grade_order = {"A": 0, "B": 1, "C": 2, "观望": 3, "淘汰": 4}

@@ -32,11 +32,12 @@ class TurtleTradeStrategy(BaseStrategy):
         from datetime import date
 
         import baostock as bs
+        from sequoia_x.analysis.stock_analysis import _baostock_acquire, _baostock_release
 
         today_str = date.today().strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
-        bs.login()
+        _baostock_acquire()
         try:
             for symbol in symbols:
                 bs_code = self.engine._to_baostock_code(symbol)
@@ -60,7 +61,7 @@ class TurtleTradeStrategy(BaseStrategy):
                     except (ValueError, ZeroDivisionError):
                         continue
         finally:
-            bs.logout()
+            _baostock_release()
 
         return market_caps
 

@@ -170,7 +170,7 @@ class WebServices:
         self.settings = settings
         self.engine = engine
         self._task_store: dict[str, TaskRecord] = {}
-        self._result_cache: dict[str, list[str]] = {}
+        self._result_cache: dict[str, tuple[str, list[str]]] = {}  # key -> (data_date, symbols)
         self._market_report_cache: dict[str, dict] = {}
         self._market_analyzer: MarketAnalyzer | None = None
         self._stock_analyzer: StockAnalyzer | None = None
@@ -195,7 +195,7 @@ class WebServices:
                 "min_bars": meta["min_bars"],
                 "webhook_key": key,
                 "webhook_url": webhook_url,
-                "latest_result_count": len(self._result_cache.get(key, [])),
+                "latest_result_count": len(self._result_cache.get(key, ("", []))[1]),
                 "last_run_at": None,
             })
         return result
@@ -231,7 +231,7 @@ class WebServices:
         return self._task_store.get(task_id)
 
     def get_cached_results(self, key: str) -> list[str]:
-        return self._result_cache.get(key, [])
+        return self._result_cache.get(key, ("", []))[1]
 
     # -- Data sync methods --
 
@@ -321,6 +321,8 @@ class WebServices:
         """
         self._stock_result_cache.clear()
         self._decision_cache.clear()
+        self._result_cache.clear()
+        self._market_report_cache.clear()
         self._data_date_cache = None  # 清版本缓存，下次读最新data_date
         logging.getLogger(__name__).info("数据同步完成，已清空分析/决策缓存（下次请求重算）")
 
@@ -455,20 +457,21 @@ class WebServices:
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Step1: 并行运行选定策略
+        # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
         strategy_results: dict[str, list[str]] = {}
+
         def _run_strategy(key: str) -> tuple[str, list[str]]:
-            # 优先用缓存结果（5min内跑过的）
-            cached = self._result_cache.get(key, [])
-            if cached:
-                return key, cached
+            # 缓存命中：同一data_date内策略结果不变（K线数据没变，选股结果一致）
+            cached = self._result_cache.get(key)
+            if cached and cached[0] == data_date:
+                return key, cached[1]
             cls = STRATEGY_REGISTRY.get(key)
             if not cls:
                 return key, []
             try:
                 strat = cls(engine=self.engine, settings=self.settings)
                 results = strat.run()
-                self._result_cache[key] = results
+                self._result_cache[key] = (data_date, results)
                 return key, results
             except Exception as e:
                 logging.getLogger(__name__).warning(f"策略 {key} 运行失败：{e!r}")
@@ -484,12 +487,17 @@ class WebServices:
         # Step2-4: 决策引擎融合
         analyzer = self._get_stock_analyzer()
         engine = DecisionEngine(self.engine, self.settings)
-        # 大盘状态择时：复用已缓存的market报告，无缓存则实时分析
+        # 大盘状态择时：复用已缓存的market报告；无缓存则实时分析并自动缓存（绑定data_date）
+        # 大盘分析需拉东财496板块数据~30s，决策内缓存后同data_date复用秒级
         def _market_fn():
-            if self._market_report_cache:
-                latest_date = max(self._market_report_cache.keys())
-                return self._market_report_cache[latest_date]
-            return self._get_analyzer().analyze()
+            report = self._market_report_cache.get(data_date)
+            if report:
+                return report
+            report = self._get_analyzer().analyze()
+            if report and report.get("date"):
+                self._market_report_cache[report["date"]] = report
+                logging.getLogger(__name__).info("大盘分析已完成并缓存，后续决策复用")
+            return report
         result = engine.generate(
             strategy_results=strategy_results,
             analyze_fn=self.analyze_stock,
