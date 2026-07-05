@@ -280,7 +280,10 @@ async function pushFeishu() {
     } catch(e) { showToast('推送失败：'+e.message, 'error'); }
 }
 
+let _decisionRunning = false;  // 防重复提交锁
+
 async function generateDecision() {
+    if (_decisionRunning) { showToast('上一个分析还在进行中，请稍候', 'warning'); return; }
     const keys = [...document.querySelectorAll('.strat-cb:checked')].map(cb => cb.value);
     if (!keys.length) { showToast('请至少选择一个策略', 'error'); return; }
     const capital = parseFloat(document.getElementById('capital').value) || 100000;
@@ -290,17 +293,32 @@ async function generateDecision() {
     const filterDesc = excludeMarkets.length||excludeSt ? '（剔除:'+[...excludeMarkets,excludeSt?'ST':''].filter(x=>x).join('+')+'）' : '';
     const loading = document.getElementById('loading');
     const result = document.getElementById('result');
+    const btn = document.querySelector('button[onclick="generateDecision()"]');
+    // 锁定+禁用按钮
+    _decisionRunning = true;
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; }
     loading.style.display = 'block'; result.innerHTML = '';
-    document.getElementById('loading-text').textContent = `正在运行 ${keys.length} 个策略${filterDesc}并分析候选股...（首次较慢）`;
+    const t0 = Date.now();
+    document.getElementById('loading-text').textContent = `正在运行 ${keys.length} 个策略${filterDesc}并分析候选股...（首次较慢，已用 0 秒）`;
+    // 进度计时器
+    const timer = setInterval(() => {
+        const sec = Math.round((Date.now()-t0)/1000);
+        document.getElementById('loading-text').textContent = `正在运行 ${keys.length} 个策略${filterDesc}并分析候选股... 已用 ${sec} 秒`;
+    }, 1000);
     try {
         const data = await api('/api/decision/generate', {
             method: 'POST', body: JSON.stringify({ strategy_keys: keys, capital, min_score: minScore, exclude_markets: excludeMarkets, exclude_st: excludeSt })
         });
+        clearInterval(timer);
         loading.style.display = 'none';
         renderDecision(data);
     } catch (e) {
+        clearInterval(timer);
         loading.style.display = 'none';
         result.innerHTML = `<div class="alert alert-danger">决策生成失败：${e.message}</div>`;
+    } finally {
+        _decisionRunning = false;
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-magic"></i>'; }
     }
 }
 
