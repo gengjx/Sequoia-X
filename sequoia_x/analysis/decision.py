@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -106,12 +107,10 @@ class DecisionEngine:
         market_state, market_score, market_label = self._get_market_state(market_fn)
         logger.info(f"市场状态：{market_state}（评分{market_score} {market_label}）")
 
-        # 按共振度排序，截断候选池（共振高的优先分析，控制冷启动耗时）
-        if len(pool) > max_candidates:
-            sorted_syms = sorted(pool.keys(), key=lambda x: -len(pool[x]))
-            truncated = {k: pool[k] for k in sorted_syms[:max_candidates]}
-            logger.info(f"候选池截断：{len(pool)} → {max_candidates}（按共振度优先）")
-            pool = truncated
+        # 分层截断候选池（对齐回测价值，非纯共振度排序）
+        # 回测事实：单策略+1.22%/47%最优，2策略+1.08%/44%，3+策略-2.07%/27%过热见顶
+        # 故：3+共振直接淘汰 → 共振2全保留 → 单策略按动量预筛补足
+        pool = self._truncate_pool(pool, max_candidates)
 
         # 预热东财快照（analyze_fn 内部会刷新，但预热后并发无竞争）
         analyzer = self._get_analyzer(analyze_fn)
@@ -280,6 +279,81 @@ class DecisionEngine:
             item.reject_reason = f"评分{s}<{t_low}（{market_state}市场门槛）"
             return
         item.action = {"A": "重点买入", "B": "逢低建仓", "C": "小仓试探/观望"}.get(item.grade, "")
+
+    def _truncate_pool(self, pool: dict[str, list[str]], max_candidates: int) -> dict[str, list[str]]:
+        """截断候选池（数据驱动，对齐回测价值）。
+
+        回测事实（497只×10天持有期）：
+          - 单策略(共振1): +1.22% 胜率47% ← 收益&胜率双优
+          - 2策略共振: +1.08% 胜率44%
+          - 3+共振: -2.07% 胜率27% ← 过热见顶，反而亏损
+
+        截断策略（让市场动量来选，非人为设定共振档优先级）：
+          1. 3+共振直接淘汰（回测亏损，省财报采集）
+          2. 剩余票按"动量分位 + 共振bonus"统一排序取前N
+             - 动量是趋势跟随核心因子，决定谁先进分析池
+             - 共振每多1个策略 +10分（多策略确认bonus，但不足以压制高动量票）
+             - 避免共振2占满名额把回测最优的单策略高动量票挤出
+        """
+        if len(pool) <= max_candidates:
+            return pool
+
+        candidates = {k: v for k, v in pool.items() if len(v) < 3}
+        dropped = len(pool) - len(candidates)
+        if dropped:
+            logger.info(f"分层截断：剔除 {dropped} 只3+共振（过热见顶，回测-2.07%）")
+
+        if len(candidates) <= max_candidates:
+            return candidates
+
+        kept = self._top_by_momentum_bonus(candidates, max_candidates)
+        kept_res = Counter(len(v) for v in kept.values())
+        logger.info(
+            f"候选池截断：{len(pool)} → {len(kept)} "
+            f"（动量+共振预筛：单策略{kept_res.get(1, 0)} 共振2+{sum(v for k, v in kept_res.items() if k >= 2)}）"
+        )
+        return kept
+
+    def _top_by_momentum_bonus(self, pool: dict[str, list[str]], n: int) -> dict[str, list[str]]:
+        """按"动量分位(0-100) + 共振bonus(每策略+10)"统一排序取前n。
+
+        纯量价计算不依赖财报，毫秒级。动量分位用近20日涨幅在全市场排名，
+        让市场来决定谁先进分析池；共振只作确定性bonus（多策略确认），
+        但不足以压制高动量的单策略票（回测单策略收益&胜率双优）。
+        """
+        import sqlite3
+        from collections import defaultdict
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, close FROM stock_daily WHERE date >= "
+                    "(SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT 1 OFFSET 19) "
+                    "ORDER BY symbol, date",
+                ).fetchall()
+            by_sym = defaultdict(list)
+            for sym, close in rows:
+                by_sym[sym].append(close)
+            all_mom = {}
+            for sym, closes in by_sym.items():
+                if len(closes) >= 2 and closes[0]:
+                    all_mom[sym] = (closes[-1] / closes[0] - 1) * 100
+            import numpy as np
+            vals = np.array(sorted(all_mom.values()))
+
+            def _pctile(m):
+                if not len(vals):
+                    return 50.0
+                return float((vals <= m).sum() / len(vals) * 100)
+
+            scored = {}
+            for sym, strats in pool.items():
+                scored[sym] = _pctile(all_mom.get(sym, 0)) + (len(strats) - 1) * 10
+            ranked = sorted(pool.keys(), key=lambda x: -scored.get(x, -999))[:n]
+            return {k: pool[k] for k in ranked}
+        except Exception as e:
+            logger.warning(f"动量预筛失败，退化为随意取前{n}：{e!r}")
+            keys = list(pool.keys())[:n]
+            return {k: pool[k] for k in keys}
 
     @staticmethod
     def _has_hard_risk(risks: list[str]) -> bool:
