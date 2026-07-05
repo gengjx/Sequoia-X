@@ -452,7 +452,10 @@ class WebServices:
         import time
         now = time.time()
         # 缓存 key 包含策略+过滤参数，避免不同条件复用错误结果
-        cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}"
+        # 缓存key含全部决策参数：不同分析池上限(60/120/不限)选出的股票集合不同，
+        # 必须独立缓存，否则选60分析后选120会错误命中返回60的结果
+        mc = max_candidates or 60
+        cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}|mc{mc}"
         data_date = self._data_date()
         cached = self._decision_cache.get(cache_key)
         if cached and cached[0].get("data_date") == data_date:
