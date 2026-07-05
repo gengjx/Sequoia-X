@@ -249,6 +249,8 @@ class WebServices:
         try:
             count = self.engine.sync_today_bulk()
             record.results = [f"synced:{count}"]
+            # 数据更新后清缓存：决策/个股分析将基于新数据重算
+            self.invalidate_caches()
             record.status = TaskStatus.DONE
         except Exception as e:
             record.status = TaskStatus.ERROR
@@ -270,6 +272,7 @@ class WebServices:
         try:
             all_symbols = self.engine.get_all_symbols()
             self.engine.backfill(all_symbols)
+            self.invalidate_caches()
             record.status = TaskStatus.DONE
         except Exception as e:
             record.status = TaskStatus.ERROR
@@ -309,6 +312,17 @@ class WebServices:
             return val
         except Exception:
             return ""
+
+    def invalidate_caches(self) -> None:
+        """数据同步后清空决策/个股分析缓存，使下次请求基于新数据重算。
+
+        缓存版本绑定 data_date，但 _data_date 有60s内存缓存需手动清除，
+        且清空结果缓存可让正在等待的请求立即感知数据更新。
+        """
+        self._stock_result_cache.clear()
+        self._decision_cache.clear()
+        self._data_date_cache = None  # 清版本缓存，下次读最新data_date
+        logging.getLogger(__name__).info("数据同步完成，已清空分析/决策缓存（下次请求重算）")
 
     def analyze_stock(self, symbol: str) -> dict:
         """同步分析个股，返回六层结构化决策报告（当日有效缓存）。

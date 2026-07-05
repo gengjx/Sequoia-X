@@ -27,6 +27,40 @@ _MARKET_CAP_TABLE = "stock_market_cap"
 _STOCK_BASIC_TABLE = "stock_basic"
 _FINANCE_TABLE = "stock_finance"
 _BAOSTOCK_LOCK = threading.Lock()
+_BAOSTOCK_SESSION = {"count": 0, "alive": False}  # 引用计数，避免反复login/logout
+
+
+def _baostock_acquire() -> None:
+    """获取 baostock 会话（引用计数管理）。
+
+    baostock 全局 socket 非线程安全，且 login 约1-2s。
+    决策批量分析40只票时，若每只都login+logout要40次握手，
+    改为首次login、末次logout，中间复用同一会话。
+    """
+    import baostock as bs
+    with _BAOSTOCK_LOCK:
+        if not _BAOSTOCK_SESSION["alive"]:
+            bs.login()
+            _BAOSTOCK_SESSION["alive"] = True
+            _BAOSTOCK_SESSION["count"] = 1
+        else:
+            _BAOSTOCK_SESSION["count"] += 1
+
+
+def _baostock_release() -> None:
+    """释放 baostock 会话（引用计数归零才真正logout）。"""
+    import baostock as bs
+    with _BAOSTOCK_LOCK:
+        if not _BAOSTOCK_SESSION["alive"]:
+            return
+        _BAOSTOCK_SESSION["count"] -= 1
+        if _BAOSTOCK_SESSION["count"] <= 0:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            _BAOSTOCK_SESSION["alive"] = False
+            _BAOSTOCK_SESSION["count"] = 0
 
 
 @dataclass
@@ -917,63 +951,54 @@ class StockAnalyzer:
             return [dict(zip(cols, r)) for r in rows]
 
         # 库中不足 4 季，从 baostock 拉取（最近 6 个候选季度，取有效者）。
-        # baostock 全局 socket 非线程安全，加锁串行化财报采集（批量分析并发场景）。
+        # 引用计数管理 baostock 会话：批量分析时复用同一 login，避免反复握手。
         import baostock as bs
         bs_code = self._to_baostock_code(symbol)
         fetched: list[dict] = []
-        logged_in = False
+        _baostock_acquire()
         try:
-            with _BAOSTOCK_LOCK:
-                bs.login()
-                logged_in = True
-                for year, q in self._recent_quarters(6):
-                    rec = {"symbol": symbol, "stat_date": None}
-                    try:
-                        rp = bs.query_profit_data(code=bs_code, year=year, quarter=q)
-                        if rp.error_code != "0":
-                            continue
-                        p = None
-                        while rp.next():
-                            p = rp.get_row_data()
-                        if not p:
-                            continue
-                        # fields: code,pubDate,statDate,roeAvg,npMargin,gpMargin,netProfit,epsTTM,MBRevenue,...
-                        rec["report_date"], rec["stat_date"] = p[1], p[2]
-                        rec["roe"] = self._sf(p[3])
-                        rec["np_margin"] = self._sf(p[4])
-                        rec["gp_margin"] = self._sf(p[5])
-                        rec["net_profit"] = self._sf(p[6])
-                        rec["eps_ttm"] = self._sf(p[7])
-                        rec["revenue"] = self._sf(p[8])
-
-                        rg = bs.query_growth_data(code=bs_code, year=year, quarter=q)
-                        while rg.next():
-                            g = rg.get_row_data()
-                            rec["yoy_equity"] = self._sf(g[3])
-                            rec["yoy_asset"] = self._sf(g[4])
-                            rec["yoy_ni"] = self._sf(g[5])
-                            rec["yoy_eps"] = self._sf(g[6])
-                            rec["yoy_pni"] = self._sf(g[7])
-
-                        ro = bs.query_operation_data(code=bs_code, year=year, quarter=q)
-                        while ro.next():
-                            o = ro.get_row_data()
-                            rec["nr_turn"] = self._sf(o[3])
-                            rec["inv_turn"] = self._sf(o[5])
-                            rec["asset_turn"] = self._sf(o[8])
-                        fetched.append(rec)
-                    except Exception as e:
-                        logger.debug(f"财报采集季度 {year}Q{q} 失败：{e!r}")
+            for year, q in self._recent_quarters(6):
+                rec = {"symbol": symbol, "stat_date": None}
+                try:
+                    rp = bs.query_profit_data(code=bs_code, year=year, quarter=q)
+                    if rp.error_code != "0":
                         continue
+                    p = None
+                    while rp.next():
+                        p = rp.get_row_data()
+                    if not p:
+                        continue
+                    rec["report_date"], rec["stat_date"] = p[1], p[2]
+                    rec["roe"] = self._sf(p[3])
+                    rec["np_margin"] = self._sf(p[4])
+                    rec["gp_margin"] = self._sf(p[5])
+                    rec["net_profit"] = self._sf(p[6])
+                    rec["eps_ttm"] = self._sf(p[7])
+                    rec["revenue"] = self._sf(p[8])
+
+                    rg = bs.query_growth_data(code=bs_code, year=year, quarter=q)
+                    while rg.next():
+                        g = rg.get_row_data()
+                        rec["yoy_equity"] = self._sf(g[3])
+                        rec["yoy_asset"] = self._sf(g[4])
+                        rec["yoy_ni"] = self._sf(g[5])
+                        rec["yoy_eps"] = self._sf(g[6])
+                        rec["yoy_pni"] = self._sf(g[7])
+
+                    ro = bs.query_operation_data(code=bs_code, year=year, quarter=q)
+                    while ro.next():
+                        o = ro.get_row_data()
+                        rec["nr_turn"] = self._sf(o[3])
+                        rec["inv_turn"] = self._sf(o[5])
+                        rec["asset_turn"] = self._sf(o[8])
+                    fetched.append(rec)
+                except Exception as e:
+                    logger.debug(f"财报采集季度 {year}Q{q} 失败：{e!r}")
+                    continue
         except Exception as e:
             logger.warning(f"baostock 财报采集异常：{e!r}")
         finally:
-            if logged_in:
-                try:
-                    with _BAOSTOCK_LOCK:
-                        bs.logout()
-                except Exception:
-                    pass
+            _baostock_release()
 
         if fetched:
             with sqlite3.connect(self.db_path) as conn:
@@ -984,6 +1009,116 @@ class StockAnalyzer:
                 )
             logger.info(f"财报入库 {symbol}：{len(fetched)} 季")
         return fetched[:4]
+
+    def batch_prefetch_finance(self, symbols: list[str]) -> dict:
+        """批量预采财报：一次 login 集中采完所有缺财报的票，再 logout。
+
+        决策批量分析前的预热步骤。避免分析时逐只串行采集（每只3个接口×6季度），
+        统一 login 后顺序采集，省去重复握手开销。
+        返回 {missing: 缺财报数量, fetched: 实际采集数量, skipped: 已有数量}。
+        """
+        if not symbols:
+            return {"missing": 0, "fetched": 0, "skipped": 0}
+        # 查哪些票缺财报
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {_FINANCE_TABLE} ("
+                "symbol TEXT NOT NULL, stat_date TEXT NOT NULL, report_date TEXT,"
+                "roe REAL, np_margin REAL, gp_margin REAL, net_profit REAL, eps_ttm REAL, revenue REAL,"
+                "yoy_equity REAL, yoy_asset REAL, yoy_ni REAL, yoy_eps REAL, yoy_pni REAL,"
+                "nr_turn REAL, inv_turn REAL, asset_turn REAL,"
+                "PRIMARY KEY (symbol, stat_date))"
+            )
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_fin_sym ON {_FINANCE_TABLE}(symbol)")
+            placeholders = ",".join("?" * len(symbols))
+            rows = conn.execute(
+                f"SELECT symbol, COUNT(*) FROM {_FINANCE_TABLE} "
+                f"WHERE symbol IN ({placeholders}) GROUP BY symbol",
+                symbols,
+            ).fetchall()
+        have = {r[0]: r[1] for r in rows}
+        missing = [s for s in symbols if have.get(s, 0) < 4]
+        if not missing:
+            logger.info(f"财报预采：{len(symbols)}只全部已有，无需采集")
+            return {"missing": 0, "fetched": 0, "skipped": len(symbols)}
+
+        logger.info(f"财报批量预采：{len(missing)}/{len(symbols)} 只缺财报，集中采集...")
+        import time
+        t0 = time.time()
+        import baostock as bs
+        _baostock_acquire()
+        fetched_total = 0
+        try:
+            for i, sym in enumerate(missing):
+                try:
+                    result = self._fetch_finance_from_baostock(sym)
+                    fetched_total += len(result)
+                except Exception as e:
+                    logger.debug(f"财报预采 {sym} 失败：{e!r}")
+                if (i + 1) % 10 == 0:
+                    logger.info(f"财报预采进度：{i + 1}/{len(missing)}")
+        finally:
+            _baostock_release()
+        cost = time.time() - t0
+        logger.info(
+            f"财报批量预采完成：{fetched_total}季 / {len(missing)}只，耗时{cost:.1f}s"
+            f"（平均{cost / max(len(missing), 1):.1f}s/只）"
+        )
+        return {"missing": len(missing), "fetched": fetched_total, "skipped": len(symbols) - len(missing)}
+
+    def _fetch_finance_from_baostock(self, symbol: str) -> list[dict]:
+        """从 baostock 采集单股财报并入库（假设已在外层 acquire 了 baostock 会话）。"""
+        cols = [
+            "symbol", "stat_date", "report_date", "roe", "np_margin", "gp_margin",
+            "net_profit", "eps_ttm", "revenue", "yoy_equity", "yoy_asset", "yoy_ni",
+            "yoy_eps", "yoy_pni", "nr_turn", "inv_turn", "asset_turn",
+        ]
+        import baostock as bs
+        bs_code = self._to_baostock_code(symbol)
+        fetched: list[dict] = []
+        for year, q in self._recent_quarters(6):
+            rec = {"symbol": symbol, "stat_date": None}
+            try:
+                rp = bs.query_profit_data(code=bs_code, year=year, quarter=q)
+                if rp.error_code != "0":
+                    continue
+                p = None
+                while rp.next():
+                    p = rp.get_row_data()
+                if not p:
+                    continue
+                rec["report_date"], rec["stat_date"] = p[1], p[2]
+                rec["roe"] = self._sf(p[3])
+                rec["np_margin"] = self._sf(p[4])
+                rec["gp_margin"] = self._sf(p[5])
+                rec["net_profit"] = self._sf(p[6])
+                rec["eps_ttm"] = self._sf(p[7])
+                rec["revenue"] = self._sf(p[8])
+                rg = bs.query_growth_data(code=bs_code, year=year, quarter=q)
+                while rg.next():
+                    g = rg.get_row_data()
+                    rec["yoy_equity"] = self._sf(g[3])
+                    rec["yoy_asset"] = self._sf(g[4])
+                    rec["yoy_ni"] = self._sf(g[5])
+                    rec["yoy_eps"] = self._sf(g[6])
+                    rec["yoy_pni"] = self._sf(g[7])
+                ro = bs.query_operation_data(code=bs_code, year=year, quarter=q)
+                while ro.next():
+                    o = ro.get_row_data()
+                    rec["nr_turn"] = self._sf(o[3])
+                    rec["inv_turn"] = self._sf(o[5])
+                    rec["asset_turn"] = self._sf(o[8])
+                fetched.append(rec)
+            except Exception:
+                continue
+        if fetched:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {_FINANCE_TABLE} ({','.join(cols)}) "
+                    f"VALUES ({','.join('?' * len(cols))})",
+                    [tuple(rec.get(c) for c in cols) for rec in fetched],
+                )
+        return fetched
 
     def _fetch_lhb(self, symbol: str) -> dict | None:
         """东财龙虎榜：查近 7 日该股是否上榜，返回上榜日/净买额/解读。"""

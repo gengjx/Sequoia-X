@@ -119,6 +119,12 @@ class DecisionEngine:
         if analyzer:
             analyzer._refresh_quote_cache()
 
+        # 批量预采财报：一次 login 集中采完缺财报的票，避免分析时逐只串行握手
+        # baostock 季报是冷启动主要瓶颈（每只~10-20s），预采后个股分析财报读库秒级
+        prefetch = {"missing": 0, "fetched": 0, "skipped": 0}
+        if analyzer and hasattr(analyzer, "batch_prefetch_finance"):
+            prefetch = analyzer.batch_prefetch_finance(list(pool.keys()))
+
         # ── Step 2: 并行个股分析（质量过滤）──
         items: list[DecisionItem] = []
         for sym, strat_names in pool.items():
@@ -209,6 +215,7 @@ class DecisionEngine:
                 "r2_kept": pool_post.get(2, 0),
                 "max_candidates": max_candidates,
             },
+            "finance_prefetch": prefetch,
         }
 
     # ------------------------------------------------------------------

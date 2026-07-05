@@ -127,7 +127,7 @@ async function syncData() {
             statusEl.className = 'alert alert-success py-2 mb-3';
             statusText.textContent = '同步完成！正在刷新数据...';
             await refreshAll();
-            showToast('数据同步完成');
+            showToast('数据同步完成，决策/分析缓存已自动刷新（下次分析基于最新数据重算）');
         } else {
             statusEl.className = 'alert alert-danger py-2 mb-3';
             statusText.textContent = '同步失败: ' + (result.error || '未知错误');
@@ -166,7 +166,7 @@ async function backfillData() {
             statusEl.className = 'alert alert-success py-2 mb-3';
             statusText.textContent = '回填完成！正在刷新数据...';
             await refreshAll();
-            showToast('历史数据回填完成');
+            showToast('历史数据回填完成，决策/分析缓存已自动刷新');
         } else {
             statusEl.className = 'alert alert-danger py-2 mb-3';
             statusText.textContent = '回填失败: ' + (result.error || '未知错误');

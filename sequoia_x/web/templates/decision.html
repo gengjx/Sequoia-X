@@ -386,6 +386,20 @@ function renderDecision(data) {
         </div>`;
     }
 
+    // 财报预采提示
+    const fp = data.finance_prefetch;
+    if (fp) {
+        if (fp.missing > 0) {
+            html += `<div class="alert alert-warning py-2 mb-3 small"><i class="bi bi-database-check"></i>
+                <strong>财报批量预采</strong>：缺${fp.missing}只 → 采集${fp.fetched}季 · 已有${fp.skipped}只秒级命中（baostock单次会话集中采集）
+            </div>`;
+        } else if (fp.skipped > 0) {
+            html += `<div class="alert alert-light border py-2 mb-3 small"><i class="bi bi-check-circle text-success"></i>
+                财报全部已有（${fp.skipped}只秒级命中库），无需采集
+            </div>`;
+        }
+    }
+
     // 组合摘要
     html += `
     <div class="row g-3 mb-4">
