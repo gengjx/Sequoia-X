@@ -152,17 +152,49 @@ class FeishuNotifier:
         sm = decision.get("summary", {})
         buys = decision.get("buy_list", [])[:10]  # 最多展示10只，避免卡片过长
 
-        # 构建买入清单文本
+        # 构建买入清单文本（含现价/止损/目标/盈亏比 → 可执行交易指令单）
+
+        def _fp(v):
+            return f"{v:.2f}" if isinstance(v, (int, float)) and v else "-"
+
+        def _pct(cur, ref):
+            if not cur or not ref:
+                return None
+            return (cur / ref - 1) * 100
+
         lines = []
         for i, r in enumerate(buys, 1):
             grade_emoji = {"A": "🔴", "B": "🟡", "C": "🔵"}.get(r.get("grade"), "⚪")
             xq = self._to_xueqiu_code(r["symbol"])
-            lines.append(
+            price = r.get("price", 0) or 0
+            sl = r.get("stop_loss", 0) or 0
+            tgt = r.get("target")
+            sl_pct = _pct(sl, price)
+            tgt_pct = _pct(tgt, price) if tgt else None
+            rr = None
+            if price and sl and tgt and (price - sl) > 0:
+                rr = round((tgt - price) / (price - sl), 1)
+            cap = r.get("capital", 0) or 0
+            cap_str = f"{cap/10000:.1f}万" if cap >= 10000 else f"{int(cap)}"
+
+            head = (
                 f"{i}. {grade_emoji}[{r.get('name','')}]"
-                f"(https://xueqiu.com/S/{xq})({r['symbol']}) "
-                f"评分{r.get('score','-')} 共振{r.get('resonance','-')} "
-                f"仓位{r.get('position_pct',0)}% {r.get('shares',0)}股"
+                f"(https://xueqiu.com/S/{xq})`{r['symbol']}` "
+                f"评分{r.get('score','-')} 共振{r.get('resonance','-')}"
             )
+            trade = f"现价 {_fp(price)}"
+            if sl:
+                trade += f" ｜ 止损 {_fp(sl)}"
+                if sl_pct is not None:
+                    trade += f"({sl_pct:+.1f}%)"
+            if tgt:
+                trade += f" ｜ 目标 {_fp(tgt)}"
+                if tgt_pct is not None:
+                    trade += f"({tgt_pct:+.1f}%)"
+            if rr is not None:
+                trade += f" ｜ 盈亏比 1:{rr}"
+            pos = f"仓位{r.get('position_pct',0)}% · {r.get('shares',0)}股 · 资金{cap_str}"
+            lines.append(f"{head}\n{trade}\n{pos}")
         buy_text = "\n".join(lines) if lines else "（暂无符合买入条件的标的）"
 
         # 淘汰摘要
