@@ -443,6 +443,12 @@ class WebServices:
         # Step2-4: 决策引擎融合
         analyzer = self._get_stock_analyzer()
         engine = DecisionEngine(self.engine, self.settings)
+        # 大盘状态择时：复用已缓存的market报告，无缓存则实时分析
+        def _market_fn():
+            if self._market_report_cache:
+                latest_date = max(self._market_report_cache.keys())
+                return self._market_report_cache[latest_date]
+            return self._get_analyzer().analyze()
         result = engine.generate(
             strategy_results=strategy_results,
             analyze_fn=analyzer.analyze,
@@ -450,6 +456,7 @@ class WebServices:
             min_score=min_score,
             exclude_markets=exclude_markets,
             exclude_st=exclude_st,
+            market_fn=_market_fn,
         )
         result["strategies_run"] = {
             k: len(v) for k, v in strategy_results.items()

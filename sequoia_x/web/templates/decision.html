@@ -313,6 +313,18 @@ function renderDecision(data) {
     const rejects = data.reject_list || [];
     let html = '';
 
+    // 市场状态横幅（择时层）
+    const ms = data.market_state || {};
+    const msEmoji = {'bull':'🟢','neutral':'🟡','bear':'🔴'}[ms.state]||'⚪';
+    const msLabel = {'bull':'偏暖(放宽门槛·满仓)','neutral':'中性(标准门槛·仓位80%)','bear':'偏冷(收紧门槛·仓位50%)'}[ms.state]||'未知';
+    if (ms.state) {
+        html += `<div class="alert ${ms.state==='bull'?'alert-success':ms.state==='bear'?'alert-danger':'alert-warning'} mb-3 py-2">
+            <i class="bi bi-thermometer-half"></i> <strong>${msEmoji} 市场状态：${msLabel}</strong>
+            · 大盘评分 ${ms.score||'-'}/100 ${ms.label?('· '+ms.label):''}
+            · 仓位系数×${ms.position_scale||0.8}
+        </div>`;
+    }
+
     // 策略运行概览
     const srun = data.strategies_run || {};
     const srunStr = Object.entries(srun).map(([k,v]) => {

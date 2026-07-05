@@ -67,6 +67,7 @@ class DecisionEngine:
         max_candidates: int = 40,
         exclude_markets: list[str] | None = None,
         exclude_st: bool = False,
+        market_fn: Callable[[], dict] | None = None,
     ) -> dict:
         """生成买卖决策清单。
 
@@ -76,8 +77,8 @@ class DecisionEngine:
             capital: 总资金（元）
             min_score: 综合评分下限，低于此值淘汰
             exclude_markets: 剔除的市场板块，如 ['chinext','star','bse']
-                chinext=创业板(300) star=科创板(688) bse=北交所(8/4)
             exclude_st: 是否剔除 ST/*ST 股票
+            market_fn: 大盘分析函数（返回 report dict），用于市场状态择时
 
         Returns:
             {buy_list, watch_list, reject_list, summary}
@@ -98,6 +99,10 @@ class DecisionEngine:
 
         if not pool:
             return self._empty_result(capital)
+
+        # 市场状态择时层：获取大盘评分，判定牛/震荡/熊
+        market_state, market_score, market_label = self._get_market_state(market_fn)
+        logger.info(f"市场状态：{market_state}（评分{market_score} {market_label}）")
 
         # 按共振度排序，截断候选池（共振高的优先分析，控制冷启动耗时）
         if len(pool) > max_candidates:
@@ -154,7 +159,7 @@ class DecisionEngine:
                     item.grade = "淘汰"
                     item.reject_reason = f"高风险信号：{risks_real[0][:30]}"
                 else:
-                    self._grade_item(item, capital)
+                    self._grade_item(item, capital, market_state)
 
                 items.append(item)
             except Exception as e:
@@ -168,7 +173,10 @@ class DecisionEngine:
         reject_list = [i for i in items if i.grade == "淘汰"]
 
         # ── Step 4: 资金分配（仓位不超过总资金）──
-        self._allocate_capital(buy_list, capital)
+        # 市场状态仓位缩放：熊市×0.5、震荡×0.8、牛市×1.0
+        position_scale = {"bull": 1.0, "neutral": 0.8, "bear": 0.5}.get(market_state, 0.8)
+        scaled_capital = capital * position_scale
+        self._allocate_capital(buy_list, scaled_capital)
 
         # 仓位 0%（ATR 约束下无法建整手）的降级为观望
         cannot_buy = [i for i in buy_list if i.shares == 0]
@@ -183,6 +191,8 @@ class DecisionEngine:
             "buy_list": [self._to_dict(i) for i in buy_list],
             "reject_list": [self._to_dict(i) for i in reject_list],
             "summary": self._build_summary(buy_list, reject_list, capital),
+            "market_state": {"state": market_state, "score": market_score,
+                             "label": market_label, "position_scale": position_scale},
             "strategy_count": len(strategy_results),
             "pool_size": len(pool),
         }
@@ -221,32 +231,51 @@ class DecisionEngine:
     # ------------------------------------------------------------------
     # 定级逻辑
     # ------------------------------------------------------------------
-    def _grade_item(self, item: DecisionItem, capital: float) -> None:
-        """决策矩阵定级：共振度 × 综合评分。"""
+    def _grade_item(self, item: DecisionItem, capital: float, market_state: str = "neutral") -> None:
+        """数据驱动定级矩阵（基于共振回测实测结论）。
+
+        回测事实（497只×10天持有期）：
+          - 单策略(共振1): +1.22% 胜率47% ← 最稳健
+          - 2策略共振: +1.08% 胜率44%
+          - 3+共振: -2.07% 胜率27% ← 过热见顶，反而亏损
+        故：3+共振降级为风险预警（非重仓），单策略高评分提升。
+
+        market_state: bull/neutral/bear，影响评分门槛和仓位系数。
+        """
         r, s = item.resonance, item.score
-        if r >= 3 and s >= 65:
+        # 市场状态调整评分门槛（牛市放宽、熊市收紧）
+        threshold_map = {"bull": 60, "neutral": 50, "bear": 55}
+        hi_threshold = {"bull": 72, "neutral": 65, "bear": 70}
+        t_low = threshold_map.get(market_state, 50)
+        t_hi = hi_threshold.get(market_state, 65)
+
+        # 3+共振：过热风险，降级处理
+        if r >= 3:
+            item.grade = "淘汰"
+            item.reject_reason = f"{r}策略共振→过热见顶风险（回测{r}共振10天-2.07%胜率27%）"
+            return
+
+        # 单策略高评分：回测最稳健，提升评级
+        if r == 1 and s >= t_hi:
             item.grade = "A"
-            item.reason = f"{r}策略共振 + 高评分{s}，多维度共振·重点参与"
+            item.reason = f"单策略+高评分{s}（回测单策略最稳健+1.22%），数据支持重点参与"
             item.position_pct = self.GRADE_POSITION["A"][0]
-        elif r >= 2 and s >= 65:
+        elif r == 2 and s >= t_hi:
             item.grade = "B"
-            item.reason = f"{r}策略共振 + 高评分{s}，趋势确认"
+            item.reason = f"{r}策略共振+高评分{s}，趋势确认"
             item.position_pct = self.GRADE_POSITION["B"][0]
-        elif r >= 2 and s >= 50:
+        elif s >= t_hi:
             item.grade = "B"
-            item.reason = f"{r}策略共振 + 中性评分{ s}，逢低关注"
+            item.reason = f"评分{s}达标，可逢低建仓"
             item.position_pct = self.GRADE_POSITION["B"][0]
-        elif s >= 65:
+        elif s >= t_low:
             item.grade = "C"
-            item.reason = f"单策略 + 高评分{s}，小仓位试探"
+            item.reason = f"评分{s}中性，小仓试探"
             item.position_pct = self.GRADE_POSITION["C"][0]
-        elif s >= 50:
-            item.grade = "C"
-            item.reason = f"单策略 + 中性评分{ s}，观望为主"
-            item.position_pct = self.GRADE_POSITION["C"][0] * 0.5
         else:
             item.grade = "淘汰"
-            item.reject_reason = f"评分 {s} 不足"
+            item.reject_reason = f"评分{s}<{t_low}（{market_state}市场门槛）"
+            return
         item.action = {"A": "重点买入", "B": "逢低建仓", "C": "小仓试探/观望"}.get(item.grade, "")
 
     @staticmethod
@@ -341,6 +370,32 @@ class DecisionEngine:
                         "grade_count": {"A": 0, "B": 0, "C": 0}, "buy_count": 0, "reject_count": 0},
             "strategy_count": 0, "pool_size": 0,
         }
+
+    @staticmethod
+    def _get_market_state(market_fn) -> tuple[str, int, str]:
+        """从大盘分析报告提取市场状态（bull/neutral/bear）。
+
+        基于 market.py 的 signal_score（0-100）：
+          >=55 bull（偏暖/强势）放宽门槛、满仓
+          45-54 neutral（中性）标准门槛、仓位×0.8
+          <45 bear（偏冷/弱势）收紧门槛、仓位×0.5
+        """
+        if market_fn is None:
+            return "neutral", 50, "未接入大盘数据"
+        try:
+            report = market_fn()
+            score = report.get("overview", {}).get("signal_score", 50)
+            label = report.get("overview", {}).get("signal_label", "")
+            if score >= 55:
+                state = "bull"
+            elif score >= 45:
+                state = "neutral"
+            else:
+                state = "bear"
+            return state, score, label
+        except Exception as e:
+            logger.warning(f"大盘状态获取失败，默认neutral：{e!r}")
+            return "neutral", 50, f"获取失败({e})"
 
     @staticmethod
     def _get_analyzer(analyze_fn) -> object | None:
