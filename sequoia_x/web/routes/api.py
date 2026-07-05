@@ -91,6 +91,14 @@ async def analyze_stock(symbol: str, request: Request):
     return await asyncio.to_thread(services.analyze_stock, symbol)
 
 
+@router.post("/portfolio/analyze")
+async def analyze_portfolio(body: PortfolioRequest, request: Request):
+    """批量分析多只股票，返回组合体检报告（持仓扫描）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.analyze_portfolio, body.symbols)
+
+
 # ---------------------------------------------------------------------------
 # System endpoints
 # ---------------------------------------------------------------------------
@@ -135,6 +143,10 @@ async def get_config(request: Request):
         "db_path": settings.db_path,
         "start_date": settings.start_date,
     }
+
+
+class PortfolioRequest(BaseModel):
+    symbols: list[str]
 
 
 class ConfigUpdate(BaseModel):

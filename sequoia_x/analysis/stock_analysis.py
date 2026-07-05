@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -25,6 +26,7 @@ _BOARD_TABLE = "stock_board_em"
 _MARKET_CAP_TABLE = "stock_market_cap"
 _STOCK_BASIC_TABLE = "stock_basic"
 _FINANCE_TABLE = "stock_finance"
+_BAOSTOCK_LOCK = threading.Lock()
 
 
 @dataclass
@@ -914,59 +916,62 @@ class StockAnalyzer:
         if len(rows) >= 4:
             return [dict(zip(cols, r)) for r in rows]
 
-        # 库中不足 4 季，从 baostock 拉取（最近 6 个候选季度，取有效者）
+        # 库中不足 4 季，从 baostock 拉取（最近 6 个候选季度，取有效者）。
+        # baostock 全局 socket 非线程安全，加锁串行化财报采集（批量分析并发场景）。
         import baostock as bs
         bs_code = self._to_baostock_code(symbol)
         fetched: list[dict] = []
         logged_in = False
         try:
-            bs.login()
-            logged_in = True
-            for year, q in self._recent_quarters(6):
-                rec = {"symbol": symbol, "stat_date": None}
-                try:
-                    rp = bs.query_profit_data(code=bs_code, year=year, quarter=q)
-                    if rp.error_code != "0":
-                        continue
-                    p = None
-                    while rp.next():
-                        p = rp.get_row_data()
-                    if not p:
-                        continue
-                    # fields: code,pubDate,statDate,roeAvg,npMargin,gpMargin,netProfit,epsTTM,MBRevenue,...
-                    rec["report_date"], rec["stat_date"] = p[1], p[2]
-                    rec["roe"] = self._sf(p[3])
-                    rec["np_margin"] = self._sf(p[4])
-                    rec["gp_margin"] = self._sf(p[5])
-                    rec["net_profit"] = self._sf(p[6])
-                    rec["eps_ttm"] = self._sf(p[7])
-                    rec["revenue"] = self._sf(p[8])
+            with _BAOSTOCK_LOCK:
+                bs.login()
+                logged_in = True
+                for year, q in self._recent_quarters(6):
+                    rec = {"symbol": symbol, "stat_date": None}
+                    try:
+                        rp = bs.query_profit_data(code=bs_code, year=year, quarter=q)
+                        if rp.error_code != "0":
+                            continue
+                        p = None
+                        while rp.next():
+                            p = rp.get_row_data()
+                        if not p:
+                            continue
+                        # fields: code,pubDate,statDate,roeAvg,npMargin,gpMargin,netProfit,epsTTM,MBRevenue,...
+                        rec["report_date"], rec["stat_date"] = p[1], p[2]
+                        rec["roe"] = self._sf(p[3])
+                        rec["np_margin"] = self._sf(p[4])
+                        rec["gp_margin"] = self._sf(p[5])
+                        rec["net_profit"] = self._sf(p[6])
+                        rec["eps_ttm"] = self._sf(p[7])
+                        rec["revenue"] = self._sf(p[8])
 
-                    rg = bs.query_growth_data(code=bs_code, year=year, quarter=q)
-                    while rg.next():
-                        g = rg.get_row_data()
-                        rec["yoy_equity"] = self._sf(g[3])
-                        rec["yoy_asset"] = self._sf(g[4])
-                        rec["yoy_ni"] = self._sf(g[5])
-                        rec["yoy_eps"] = self._sf(g[6])
-                        rec["yoy_pni"] = self._sf(g[7])
+                        rg = bs.query_growth_data(code=bs_code, year=year, quarter=q)
+                        while rg.next():
+                            g = rg.get_row_data()
+                            rec["yoy_equity"] = self._sf(g[3])
+                            rec["yoy_asset"] = self._sf(g[4])
+                            rec["yoy_ni"] = self._sf(g[5])
+                            rec["yoy_eps"] = self._sf(g[6])
+                            rec["yoy_pni"] = self._sf(g[7])
 
-                    ro = bs.query_operation_data(code=bs_code, year=year, quarter=q)
-                    while ro.next():
-                        o = ro.get_row_data()
-                        rec["nr_turn"] = self._sf(o[3])
-                        rec["inv_turn"] = self._sf(o[5])
-                        rec["asset_turn"] = self._sf(o[8])
-                    fetched.append(rec)
-                except Exception as e:
-                    logger.debug(f"财报采集季度 {year}Q{q} 失败：{e!r}")
-                    continue
+                        ro = bs.query_operation_data(code=bs_code, year=year, quarter=q)
+                        while ro.next():
+                            o = ro.get_row_data()
+                            rec["nr_turn"] = self._sf(o[3])
+                            rec["inv_turn"] = self._sf(o[5])
+                            rec["asset_turn"] = self._sf(o[8])
+                        fetched.append(rec)
+                    except Exception as e:
+                        logger.debug(f"财报采集季度 {year}Q{q} 失败：{e!r}")
+                        continue
         except Exception as e:
             logger.warning(f"baostock 财报采集异常：{e!r}")
         finally:
             if logged_in:
                 try:
-                    bs.logout()
+                    with _BAOSTOCK_LOCK:
+                        bs.logout()
                 except Exception:
                     pass
 

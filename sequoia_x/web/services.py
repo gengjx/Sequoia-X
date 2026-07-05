@@ -292,6 +292,101 @@ class WebServices:
         result = self._get_stock_analyzer().analyze(symbol)
         self._stock_result_cache[symbol] = (now, result)
         return result
+
+    def analyze_portfolio(self, symbols: list[str]) -> dict:
+        """批量分析多只股票，返回 {stocks, summary}（持仓体检）。
+
+        - 预热东财全市场快照缓存（一次请求），避免并发刷新竞争。
+        - ThreadPoolExecutor 并行分析（baostock 财报内部已加锁串行化）。
+        - 聚合组合体检摘要：评分分布 / 行业集中度 / 加权估值 / 风险预警。
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        symbols = [str(x).strip() for x in symbols if str(x).strip()]
+        if not symbols:
+            return {"stocks": [], "summary": {}}
+
+        # 预热快照缓存
+        self._get_stock_analyzer()._refresh_quote_cache()
+
+        results: list[dict] = []
+        workers = min(4, len(symbols))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self.analyze_stock, sym): sym for sym in symbols}
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    results.append({"symbol": sym, "error": str(e), "recommendation": {"score": 0}})
+
+        results.sort(key=lambda x: x.get("recommendation", {}).get("score", 0), reverse=True)
+        summary = self._portfolio_summary(results)
+        logging.getLogger(__name__).info(f"批量分析完成：{len(symbols)} 只，平均评分 {summary.get('avg_score')}")
+        return {"stocks": results, "summary": summary}
+
+    def _portfolio_summary(self, results: list[dict]) -> dict:
+        """聚合组合体检摘要。"""
+        valid = [r for r in results if not r.get("error")]
+        if not valid:
+            return {"count": 0}
+        scores = [r.get("recommendation", {}).get("score", 0) for r in valid]
+        avg = round(sum(scores) / len(scores)) if scores else 0
+        strong = sum(1 for s in scores if s >= 65)
+        neutral = sum(1 for s in scores if 50 <= s < 65)
+        weak = sum(1 for s in scores if s < 50)
+
+        # 行业集中度
+        industry_map: dict[str, int] = {}
+        for r in valid:
+            ind = r.get("fundamental", {}).get("industry") or "未知"
+            industry_map[ind] = industry_map.get(ind, 0) + 1
+        industries = sorted(industry_map.items(), key=lambda x: -x[1])[:5]
+        top_industry = industries[0] if industries else ("", 0)
+        concentration = round(top_industry[1] / len(valid) * 100) if valid else 0
+
+        # 市值加权 PE/PB
+        total_cap = 0.0
+        w_pe = 0.0
+        w_pb = 0.0
+        for r in valid:
+            f = r.get("fundamental", {})
+            cap = f.get("market_cap") or 0
+            pe = f.get("pe")
+            pb = f.get("pb")
+            if cap and pe and pe > 0:
+                w_pe += pe * cap
+                total_cap += cap
+            if cap and pb and pb > 0:
+                w_pb += pb * cap
+        avg_pe = round(w_pe / total_cap, 1) if total_cap else None
+        avg_pb = round(w_pb / total_cap, 2) if total_cap else None
+
+        # 风险预警（评分<50 或 有多条风险提示）
+        alerts = []
+        for r in valid:
+            rec = r.get("recommendation", {})
+            risks = r.get("risks", [])
+            if rec.get("score", 100) < 50 or len([x for x in risks if "暂无" not in x]) >= 3:
+                alerts.append({
+                    "symbol": r.get("symbol"),
+                    "name": r.get("name"),
+                    "score": rec.get("score", 0),
+                    "action": rec.get("action", ""),
+                    "top_risk": next((x for x in risks if "暂无" not in x), ""),
+                })
+
+        return {
+            "count": len(valid),
+            "avg_score": avg,
+            "distribution": {"strong": strong, "neutral": neutral, "weak": weak},
+            "industries": [{"name": n, "count": c} for n, c in industries],
+            "top_industry": top_industry[0],
+            "concentration": concentration,
+            "weighted_pe": avg_pe,
+            "weighted_pb": avg_pb,
+            "alerts": alerts,
+        }
     def analyze_market_async(self, target_date: str | None = None) -> str:
         """异步生成大盘分析报告，结果缓存到内存。"""
         task_id = uuid.uuid4().hex[:8]

@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}持仓体检 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="mb-3">
+    <h2 class="mb-1"><i class="bi bi-clipboard-check"></i> 持仓体检 / 批量分析</h2>
+    <p class="text-muted mb-0">输入持仓或自选股代码（空格/逗号/换行分隔），一键扫描全部，输出组合体检 + 排序</p>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <textarea class="form-control mb-2" id="symbols-input" rows="3" placeholder="如：600519 000001 300750 600522 000858&#10;支持空格、逗号、换行分隔"></textarea>
+        <div class="d-flex gap-2 align-items-center flex-wrap">
+            <button class="btn btn-primary" onclick="analyzePortfolio()"><i class="bi bi-search"></i> 批量分析</button>
+            <span class="text-muted small">示例组合：</span>
+            <button class="btn btn-outline-secondary btn-sm" onclick="loadSample('600519 000858 000333 300750 600522')">白酒+新能源</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="loadSample('000001 600036 601318 601398')">金融</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="loadSample('688981 002049 600519 000001 600522 000858 300750')">混合</button>
+        </div>
+    </div>
+</div>
+
+<div id="loading" class="text-center py-4" style="display:none;">
+    <div class="spinner-border text-primary" role="status"></div>
+    <p class="text-muted mt-2" id="loading-text">批量分析中（首次需采集财报，约数秒/只）...</p>
+</div>
+
+<div id="result"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function loadSample(s) { document.getElementById('symbols-input').value = s; }
+
+async function analyzePortfolio() {
+    const raw = document.getElementById('symbols-input').value.trim();
+    if (!raw) { showToast('请输入股票代码', 'error'); return; }
+    const symbols = raw.split(/[\s,，、\n]+/).map(s => s.trim()).filter(s => s);
+    if (symbols.length > 30) { showToast('单次最多30只', 'error'); return; }
+    const loading = document.getElementById('loading');
+    const result = document.getElementById('result');
+    loading.style.display = 'block'; result.innerHTML = '';
+    document.getElementById('loading-text').textContent = `正在批量分析 ${symbols.length} 只（首次需采集财报，约数秒/只）...`;
+    try {
+        const data = await api('/api/portfolio/analyze', {
+            method: 'POST', body: JSON.stringify({ symbols })
+        });
+        loading.style.display = 'none';
+        renderPortfolio(data);
+    } catch (e) {
+        loading.style.display = 'none';
+        result.innerHTML = `<div class="alert alert-danger">分析失败：${e.message}</div>`;
+    }
+}
+
+function fmtPct(v) { return v != null ? (v > 0 ? '+' : '') + Number(v).toFixed(2) + '%' : '-'; }
+function fmtNum(v, d=1) { return v != null ? Number(v).toFixed(d) : '-'; }
+function scoreCls(s) { return s >= 65 ? 'text-danger fw-bold' : s >= 50 ? 'text-warning fw-bold' : 'text-success fw-bold'; }
+function actionBadge(action) {
+    const m = {'强烈买入':'bg-danger','买入':'bg-warning text-dark','观望':'bg-info text-dark','减仓':'bg-secondary','回避':'bg-success'};
+    return `<span class="badge ${m[action]||'bg-secondary'}">${action||'-'}</span>`;
+}
+
+function renderPortfolio(data) {
+    const stocks = data.stocks || [];
+    const sm = data.summary || {};
+    const dist = sm.distribution || {};
+    const total = sm.count || stocks.length || 1;
+
+    let html = '';
+
+    // 组合体检摘要
+    if (sm.count) {
+        html += `
+        <div class="row g-3 mb-4">
+            <div class="col-md-3">
+                <div class="card h-100 border-primary text-center">
+                    <div class="card-body">
+                        <div class="display-5 fw-bold text-primary">${sm.avg_score}</div>
+                        <div class="text-muted small">组合平均评分</div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 text-center">
+                    <div class="card-header fw-bold small">评分分布</div>
+                    <div class="card-body py-2">
+                        <span class="badge bg-danger me-1">强 ${dist.strong||0}</span>
+                        <span class="badge bg-info text-dark me-1">中 ${dist.neutral||0}</span>
+                        <span class="badge bg-success">弱 ${dist.weak||0}</span>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 text-center">
+                    <div class="card-header fw-bold small">组合估值（市值加权）</div>
+                    <div class="card-body py-2">
+                        <span class="me-2">PE <strong class="${(sm.weighted_pe||0)>60?'text-warning':''}">${fmtNum(sm.weighted_pe)}</strong></span>
+                        <span>PB <strong>${fmtNum(sm.weighted_pb,2)}</strong></span>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 text-center ${sm.concentration>=50?'border-warning':''}">
+                    <div class="card-header fw-bold small">行业集中度</div>
+                    <div class="card-body py-2">
+                        <div class="${sm.concentration>=50?'text-warning fw-bold':''}">${sm.concentration||0}% · ${sm.top_industry||'分散'}</div>
+                        ${sm.concentration>=50?'<small class="text-warning">⚠ 过度集中</small>':''}
+                    </div>
+                </div>
+            </div>
+        </div>`;
+
+        // 行业分布
+        if (sm.industries && sm.industries.length) {
+            html += `<div class="card mb-3"><div class="card-header fw-bold small"><i class="bi bi-diagram-3"></i> 行业分布</div><div class="card-body py-2">`;
+            sm.industries.forEach(it => {
+                const w = (it.count/total*100).toFixed(0);
+                html += `<span class="badge bg-secondary me-2 mb-1">${it.name} ${it.count}只(${w}%)</span>`;
+            });
+            html += `</div></div>`;
+        }
+
+        // 风险预警
+        if (sm.alerts && sm.alerts.length) {
+            html += `<div class="card mb-3 border-warning"><div class="card-header fw-bold text-warning"><i class="bi bi-exclamation-triangle"></i> 风险预警（${sm.alerts.length}只需关注）</div><div class="card-body py-2">`;
+            sm.alerts.forEach(a => {
+                html += `<div class="d-flex justify-content-between border-bottom py-1">
+                    <span><a href="/stock-analysis" onclick="localStorage.setItem('qs', '${a.symbol}')" class="text-decoration-none">${a.name}（${a.symbol}）</a> <span class="badge bg-success">${a.score}</span></span>
+                    <small class="text-muted">${a.top_risk||a.action}</small>
+                </div>`;
+            });
+            html += `</div></div>`;
+        }
+    }
+
+    // 排序表格
+    html += `
+    <div class="card">
+        <div class="card-header fw-bold"><i class="bi bi-table"></i> 持仓明细（按评分排序，点击代码进个股分析）</div>
+        <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle mb-0">
+                <thead class="table-light small">
+                    <tr>
+                        <th>股票</th><th>评分</th><th>建议</th><th>现价</th><th>涨跌</th>
+                        <th>PE</th><th>PB</th><th>ROE</th><th>主力资金</th><th>行业</th>
+                    </tr>
+                </thead>
+                <tbody class="small">
+                ${stocks.map(r => {
+                    if (r.error) return `<tr class="table-danger"><td colspan="10">${r.symbol} <span class="text-danger">失败：${r.error}</span></td></tr>`;
+                    const rec = r.recommendation||{}, f = r.fundamental||{}, rs = r.relative_strength||{}, c = r.capital||{};
+                    return `<tr>
+                        <td><a href="/stock-analysis" onclick="localStorage.setItem('qs','${r.symbol}')" class="text-decoration-none fw-semibold">${r.name||r.symbol}<br><small class="text-muted">${r.symbol}</small></a></td>
+                        <td class="${scoreCls(rec.score)}">${rec.score||'-'}</td>
+                        <td>${actionBadge(rec.action)}</td>
+                        <td>${r.price!=null?r.price.toFixed(2):'-'}</td>
+                        <td class="${(rs.today_chg||0)>0?'text-danger':(rs.today_chg||0)<0?'text-success':''}">${fmtPct(rs.today_chg)}</td>
+                        <td>${f.pe!=null?fmtNum(f.pe):'-'}</td>
+                        <td>${f.pb!=null?fmtNum(f.pb,2):'-'}</td>
+                        <td>${f.roe!=null?fmtNum(f.roe)+'%':'-'}</td>
+                        <td class="${(c.main_pct||0)<0?'text-success':(c.main_pct||0)>0?'text-danger':''}">${fmtPct(c.main_pct)}</td>
+                        <td><small class="text-muted">${f.industry||'-'}</small></td>
+                    </tr>`;
+                }).join('')}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <p class="text-center text-muted small mt-3 mb-4">
+        <i class="bi bi-shield-exclamation"></i> 量化分析仅供参考，不构成投资建议。
+    </p>`;
+
+    document.getElementById('result').innerHTML = html;
+}
+
+// 支持从个股分析页 localStorage 快捷回填
+const qs = localStorage.getItem('qs');
+if (qs) { document.getElementById('symbols-input').value = qs; localStorage.removeItem('qs'); }
+</script>
+{% endblock %}

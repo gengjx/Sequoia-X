@@ -86,3 +86,12 @@ async def stock_analysis_page(request: Request):
         request=request, name="stock_analysis.html",
         context={},
     )
+
+
+@router.get("/portfolio")
+async def portfolio_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="portfolio.html",
+        context={},
+    )
