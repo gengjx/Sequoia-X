@@ -246,6 +246,16 @@ function renderReport(r) {
     `;
 }
 
-document.getElementById('symbol-input').focus();
+// 自动填充代码：优先 URL 参数 symbol=，其次 localStorage.qs（决策页跳转携带）
+    // 填入后自动触发分析，实现决策→个股分析无缝衔接
+    const paramSym = new URLSearchParams(location.search).get('symbol');
+    const carrySym = paramSym || localStorage.getItem('qs');
+    if (carrySym) {
+        localStorage.removeItem('qs');  // 用完即清，避免刷新重复触发
+        document.getElementById('symbol-input').value = carrySym;
+        analyzeStock();
+    } else {
+        document.getElementById('symbol-input').focus();
+    }
 </script>
 {% endblock %}

@@ -444,7 +444,7 @@ function renderDecision(data) {
                     ${buys.map(r => `
                         <tr class="${GRADE_ROW[r.grade]||''}">
                             <td>${GRADE_BADGE[r.grade]||'-'}</td>
-                            <td><a href="/stock-analysis" onclick="localStorage.setItem('qs','${r.symbol}')" class="text-decoration-none fw-semibold">${r.name}<br><small class="text-muted">${r.symbol}</small></a></td>
+                            <td><a href="/stock-analysis?symbol=${r.symbol}" class="text-decoration-none fw-semibold">${r.name}<br><small class="text-muted">${r.symbol}</small></a></td>
                             <td>${r.resonance>1?`<span class="badge bg-danger">${r.resonance}共振</span>`:r.resonance}</td>
                             <td><small>${r.hit_strategies.map(s=>`<span class="badge bg-light text-dark me-1">${s}</span>`).join('')}</small></td>
                             <td class="fw-bold">${r.score}</td>
