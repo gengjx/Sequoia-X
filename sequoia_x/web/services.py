@@ -324,6 +324,10 @@ class WebServices:
         self._result_cache.clear()
         self._market_report_cache.clear()
         self._data_date_cache = None  # 清版本缓存，下次读最新data_date
+        # 清共享全量K线缓存（数据更新后需重新加载）
+        if hasattr(self.engine, "_all_daily_cache"):
+            self.engine._all_daily_cache = None
+            self.engine._daily_groups_cache = None
         logging.getLogger(__name__).info("数据同步完成，已清空分析/决策缓存（下次请求重算）")
 
     def analyze_stock(self, symbol: str) -> dict:
@@ -439,6 +443,7 @@ class WebServices:
         self, strategy_keys: list[str] | None = None,
         capital: float = 100000.0, min_score: int = 50,
         exclude_markets: list[str] | None = None, exclude_st: bool = False,
+        max_candidates: int | None = None,
     ) -> dict:
         """交易决策中枢：多策略选股 → 质量过滤 → 共振定级 → 仓位分配。
 
@@ -458,6 +463,7 @@ class WebServices:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
+        # 每策略独立读K线+结果缓存；共享DF实测在3M行下groupby慢+内存复制开销，无净收益
         strategy_results: dict[str, list[str]] = {}
 
         def _run_strategy(key: str) -> tuple[str, list[str]]:
@@ -506,6 +512,7 @@ class WebServices:
             exclude_markets=exclude_markets,
             exclude_st=exclude_st,
             market_fn=_market_fn,
+            max_candidates=max_candidates or 60,
         )
         result["strategies_run"] = {
             k: len(v) for k, v in strategy_results.items()

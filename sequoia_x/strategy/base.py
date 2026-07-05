@@ -29,6 +29,21 @@ class BaseStrategy(ABC):
         """
         self.engine = engine
         self.settings = settings
+        self._shared_daily = None  # 共享K线分组dict（批量选股时注入，避免重复I/O）
+
+    def set_shared_daily(self, groups: dict) -> None:
+        """注入共享K线分组dict（{symbol: DataFrame}），run()中优先用它替代逐只get_ohlcv。
+
+        必须传预分组dict而非原始DataFrame：逐只布尔过滤是O(n)全表扫描(5000只要1200s)，
+        dict取片O(1)。groups由DataEngine.get_daily_groups()生成。
+        """
+        self._shared_daily = groups
+
+    def get_daily(self, symbol: str):
+        """获取单股K线：优先用共享分组dict O(1)取片，否则逐只查库。"""
+        if self._shared_daily is not None:
+            return self._shared_daily.get(symbol)
+        return self.engine.get_ohlcv(symbol)
 
     @abstractmethod
     def run(self) -> list[str]:

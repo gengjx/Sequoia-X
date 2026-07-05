@@ -31,12 +31,15 @@ class BottomVolumeStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         """遍历全市场，返回满足底部放量条件的股票代码列表。"""
-        symbols = self.engine.get_local_symbols()
+        if self._shared_daily is not None:
+            symbols = list(self._shared_daily.keys())
+        else:
+            symbols = self.engine.get_local_symbols()
         selected: list[str] = []
 
         for symbol in symbols:
             try:
-                df = self.engine.get_ohlcv(symbol)
+                df = self.get_daily(symbol)
                 if len(df) < self._MIN_BARS:
                     continue
 

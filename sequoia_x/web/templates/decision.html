@@ -21,6 +21,15 @@
                 <label class="form-label small">最低评分</label>
                 <input type="number" class="form-control" id="min-score" value="50" min="0" max="100">
             </div>
+            <div class="col-md-2">
+                <label class="form-label small">分析池上限</label>
+                <select class="form-select form-select-sm" id="max-candidates">
+                    <option value="40">40只（快）</option>
+                    <option value="60" selected>60只（默认）</option>
+                    <option value="100">100只（全面）</option>
+                    <option value="300">不限（全分析）</option>
+                </select>
+            </div>
             <div class="col-md-1">
                 <button class="btn btn-primary w-100" onclick="generateDecision()"><i class="bi bi-magic"></i></button>
             </div>
@@ -274,7 +283,7 @@ async function pushFeishu() {
     showToast('推送中...', 'info');
     try {
         const r = await api('/api/decision/push-feishu', {
-            method:'POST', body:JSON.stringify({strategy_keys:keys,capital,min_score:minScore,exclude_markets:excludeMarkets,exclude_st:excludeSt})
+            method:'POST', body:JSON.stringify({strategy_keys:keys,capital,min_score:minScore,exclude_markets:excludeMarkets,exclude_st:excludeSt,max_candidates:parseInt(document.getElementById('max-candidates').value)})
         });
         showToast(r.success ? `推送成功！${r.buy_count}只买入清单已发送` : '推送失败，请检查飞书配置', r.success?'success':'error');
     } catch(e) { showToast('推送失败：'+e.message, 'error'); }
@@ -307,7 +316,7 @@ async function generateDecision() {
     }, 1000);
     try {
         const data = await api('/api/decision/generate', {
-            method: 'POST', body: JSON.stringify({ strategy_keys: keys, capital, min_score: minScore, exclude_markets: excludeMarkets, exclude_st: excludeSt })
+            method: 'POST', body: JSON.stringify({ strategy_keys: keys, capital, min_score: minScore, exclude_markets: excludeMarkets, exclude_st: excludeSt, max_candidates: parseInt(document.getElementById('max-candidates').value) })
         });
         clearInterval(timer);
         loading.style.display = 'none';
