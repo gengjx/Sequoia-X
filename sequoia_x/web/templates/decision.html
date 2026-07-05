@@ -351,6 +351,41 @@ function renderDecision(data) {
     }).join(' · ');
     html += `<div class="alert alert-light border small mb-3"><i class="bi bi-info-circle"></i> 运行 ${data.strategy_count} 个策略 → 候选池 <strong>${data.pool_size}</strong> 只（${srunStr}）</div>`;
 
+    // 候选池漏斗：截断前后构成对比（动量预筛可视化）
+    const pf = data.pool_funnel;
+    if (pf && pf.total_before > pf.total_after) {
+        const r1b = pf.resonance_before['1']||0, r2b = pf.resonance_before['2']||0, r3b = pf.resonance_before['3']||0;
+        const r1a = pf.resonance_after['1']||0, r2a = pf.resonance_after['2']||0;
+        html += `<div class="card mb-3 border-start border-4 border-info">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span class="fw-bold small"><i class="bi bi-funnel"></i> 候选池预筛漏斗（动量分位+共振bonus）</span>
+                    <span class="badge bg-info">${pf.total_before} → ${pf.total_after} 只（上限${pf.max_candidates}）</span>
+                </div>
+                <div class="row text-center small g-2">
+                    <div class="col-3"><div class="border rounded py-2 ${r3b?'border-danger bg-danger bg-opacity-10':''}">
+                        <div class="fw-bold ${r3b?'text-danger':''}">${r3b}</div>
+                        <div class="text-muted">3+共振<br><small class="text-danger">❌淘汰(过热见顶)</small></div>
+                    </div></div>
+                    <div class="col-1 d-flex align-items-center justify-content-center text-muted"><i class="bi bi-arrow-right"></i></div>
+                    <div class="col-2"><div class="border rounded py-2 ${r2a?'border-primary':''}">
+                        <div class="fw-bold text-primary">${r2b}→${r2a}</div>
+                        <div class="text-muted">共振2<br><small>+1.08%/44%</small></div>
+                    </div></div>
+                    <div class="col-1 d-flex align-items-center justify-content-center text-muted"><i class="bi bi-plus"></i></div>
+                    <div class="col-2"><div class="border rounded py-2 ${r1a?'border-success':''}">
+                        <div class="fw-bold text-success">${r1b}→${r1a}</div>
+                        <div class="text-muted">单策略<br><small class="text-success">+1.22%/47%最优</small></div>
+                    </div></div>
+                    <div class="col-3 d-flex align-items-center"><div class="text-muted small ps-2">
+                        <i class="bi bi-lightbulb text-warning"></i> 让市场动量选票，非纯共振度排序<br>
+                        回测最优的单策略高动量票优先入选
+                    </div></div>
+                </div>
+            </div>
+        </div>`;
+    }
+
     // 组合摘要
     html += `
     <div class="row g-3 mb-4">

@@ -109,8 +109,10 @@ class DecisionEngine:
 
         # 分层截断候选池（对齐回测价值，非纯共振度排序）
         # 回测事实：单策略+1.22%/47%最优，2策略+1.08%/44%，3+策略-2.07%/27%过热见顶
-        # 故：3+共振直接淘汰 → 共振2全保留 → 单策略按动量预筛补足
+        # 故：3+共振直接淘汰 → 剩余按动量+共振bonus预筛
+        pool_pre = Counter(len(v) for v in pool.values())  # 截断前分布
         pool = self._truncate_pool(pool, max_candidates)
+        pool_post = Counter(len(v) for v in pool.values())  # 截断后分布
 
         # 预热东财快照（analyze_fn 内部会刷新，但预热后并发无竞争）
         analyzer = self._get_analyzer(analyze_fn)
@@ -197,6 +199,16 @@ class DecisionEngine:
                              "label": market_label, "position_scale": position_scale},
             "strategy_count": len(strategy_results),
             "pool_size": len(pool),
+            "pool_funnel": {
+                "total_before": sum(pool_pre.values()),
+                "total_after": sum(pool_post.values()),
+                "resonance_before": {str(k): pool_pre.get(k, 0) for k in (1, 2, 3)},
+                "resonance_after": {str(k): pool_post.get(k, 0) for k in (1, 2, 3)},
+                "r3_dropped": pool_pre.get(3, 0),
+                "r1_kept": pool_post.get(1, 0),
+                "r2_kept": pool_post.get(2, 0),
+                "max_candidates": max_candidates,
+            },
         }
 
     # ------------------------------------------------------------------
