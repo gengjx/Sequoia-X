@@ -289,20 +289,39 @@ class WebServices:
             self._stock_analyzer = StockAnalyzer(self.settings)
         return self._stock_analyzer
 
+    def _data_date(self) -> str:
+        """获取数据库K线最新交易日，作为缓存版本依据。
+
+        K线是决策/分析的真正数据源，盘后同步数据后 MAX(date) 变化，
+        以此为缓存版本可自动失效（盘后刷新），无需绑定自然日。
+        结果缓存60s（MAX(date)扫3M行~80ms，但数据同步是低频操作无需每次查）。
+        """
+        import time
+        now = time.time()
+        cached = getattr(self, "_data_date_cache", None)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        try:
+            with sqlite3.connect(self.settings.db_path) as conn:
+                r = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+                val = r[0] if r and r[0] else ""
+            self._data_date_cache = (now, val)
+            return val
+        except Exception:
+            return ""
+
     def analyze_stock(self, symbol: str) -> dict:
         """同步分析个股，返回六层结构化决策报告（当日有效缓存）。
 
         A股T+1：日K收盘后技术指标/财报日内不变，分析结果当日有效。
         缓存 key 含日期，自然跨日失效；盘中实时价变化不影响决策逻辑。
         """
-        import time
-        from datetime import date
-        today = date.today().isoformat()
+        data_date = self._data_date()
         cached = self._stock_result_cache.get(symbol)
-        if cached and cached[0].get("date") == today:
+        if cached and cached[0].get("data_date") == data_date:
             return cached[1]
         result = self._get_stock_analyzer().analyze(symbol)
-        self._stock_result_cache[symbol] = ({"date": today}, result)
+        self._stock_result_cache[symbol] = ({"data_date": data_date}, result)
         return result
 
     def analyze_portfolio(self, symbols: list[str]) -> dict:
@@ -413,10 +432,9 @@ class WebServices:
         now = time.time()
         # 缓存 key 包含策略+过滤参数，避免不同条件复用错误结果
         cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}"
-        from datetime import date
-        today = date.today().isoformat()
+        data_date = self._data_date()
         cached = self._decision_cache.get(cache_key)
-        if cached and cached[0].get("date") == today:
+        if cached and cached[0].get("data_date") == data_date:
             return cached[1]
         if strategy_keys is None:
             strategy_keys = list(STRATEGY_REGISTRY.keys())
@@ -470,7 +488,7 @@ class WebServices:
         result["strategies_run"] = {
             k: len(v) for k, v in strategy_results.items()
         }
-        self._decision_cache[cache_key] = ({"date": today}, result)
+        self._decision_cache[cache_key] = ({"data_date": data_date}, result)
         logging.getLogger(__name__).info('决策缓存写入 key=' + cache_key[:40])
         logging.getLogger(__name__).info(
             f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
