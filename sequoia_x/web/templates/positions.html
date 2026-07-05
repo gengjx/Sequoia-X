@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+{% block title %}持仓跟踪 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+        <h2 class="mb-1"><i class="bi bi-bag-check"></i> 持仓跟踪 · 移动止损</h2>
+        <p class="text-muted mb-0">决策买入 → 录入持仓 → 每日扫描止损/减仓/止盈信号，从选股工具升级为交易系统</p>
+    </div>
+    <div class="d-flex gap-2">
+        <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#addModal"><i class="bi bi-plus-lg"></i> 手动录入</button>
+        <button class="btn btn-warning btn-sm" onclick="scanPositions(false)"><i class="bi bi-radar"></i> 扫描信号</button>
+        <button class="btn btn-success btn-sm" onclick="scanPositions(true)"><i class="bi bi-arrow-up-circle"></i> 扫描并移止损</button>
+        <button class="btn btn-info btn-sm" onclick="pushFeishu()"><i class="bi bi-send"></i> 推飞书</button>
+    </div>
+</div>
+
+<!-- 组合摘要 -->
+<div class="row g-3 mb-3" id="summary-row"></div>
+
+<!-- 信号表格 -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-list-ul"></i> 持仓清单</span>
+        <div class="btn-group btn-group-sm">
+            <button class="btn btn-outline-secondary active" id="tab-open" onclick="switchTab('open')">持仓中</button>
+            <button class="btn btn-outline-secondary" id="tab-closed" onclick="switchTab('closed')">已平仓</button>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0" id="pos-table">
+                <thead class="table-light">
+                    <tr>
+                        <th>信号</th><th>代码/名称</th><th>评级</th>
+                        <th class="text-end">成本</th><th class="text-end">现价</th>
+                        <th class="text-end">持仓</th><th class="text-end">浮盈</th>
+                        <th class="text-end">R倍</th>
+                        <th>止损线</th><th>MA10/20</th>
+                        <th>建议操作</th><th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="pos-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- 录入弹窗 -->
+<div class="modal fade" id="addModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title"><i class="bi bi-plus-lg"></i> 录入持仓</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        <div class="row g-3">
+            <div class="col-5"><label class="form-label small">股票代码</label><input class="form-control" id="a-symbol" placeholder="600522"></div>
+            <div class="col-7"><label class="form-label small">名称</label><input class="form-control" id="a-name" placeholder="中天科技"></div>
+            <div class="col-4"><label class="form-label small">买入价</label><input type="number" step="0.01" class="form-control" id="a-price"></div>
+            <div class="col-4"><label class="form-label small">股数</label><input type="number" step="100" class="form-control" id="a-shares"></div>
+            <div class="col-4"><label class="form-label small">买入日期</label><input type="date" class="form-control" id="a-date"></div>
+            <div class="col-4"><label class="form-label small">止损价</label><input type="number" step="0.01" class="form-control" id="a-stop" placeholder="留空自动"></div>
+            <div class="col-4"><label class="form-label small">目标价</label><input type="number" step="0.01" class="form-control" id="a-target"></div>
+            <div class="col-4"><label class="form-label small">评级</label><select class="form-select" id="a-grade"><option value="">-</option><option>A</option><option>B</option><option>C</option></select></div>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="addHolding()"><i class="bi bi-check-lg"></i> 确认录入</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑弹窗 -->
+<div class="modal fade" id="editModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title"><i class="bi bi-pencil"></i> 编辑持仓</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        <input type="hidden" id="e-id">
+        <div class="row g-3">
+            <div class="col-6"><label class="form-label small">买入价</label><input type="number" step="0.01" class="form-control" id="e-price"></div>
+            <div class="col-6"><label class="form-label small">股数</label><input type="number" step="100" class="form-control" id="e-shares"></div>
+            <div class="col-6"><label class="form-label small">止损价</label><input type="number" step="0.01" class="form-control" id="e-stop"></div>
+            <div class="col-6"><label class="form-label small">目标价</label><input type="number" step="0.01" class="form-control" id="e-target"></div>
+            <div class="col-12"><label class="form-label small">备注</label><input class="form-control" id="e-notes"></div>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-primary" onclick="saveEdit()"><i class="bi bi-check-lg"></i> 保存</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- 平仓弹窗 -->
+<div class="modal fade" id="closeModal" tabindex="-1">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title"><i class="bi bi-box-arrow-right"></i> 平仓确认</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        <input type="hidden" id="c-id">
+        <p class="small text-muted mb-2" id="c-name"></p>
+        <label class="form-label small">平仓价</label><input type="number" step="0.01" class="form-control mb-2" id="c-price">
+        <label class="form-label small">原因</label><input class="form-control" id="c-reason" placeholder="止损/止盈/手动">
+      </div>
+      <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirmClose()">确认平仓</button></div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const LEVEL_BADGE = {danger:'bg-danger', warn:'bg-warning text-dark', success:'bg-success', info:'bg-secondary'};
+const LEVEL_ICON = {danger:'🔴', warn:'🟡', success:'🟢', info:'⚪'};
+const GRADE_BADGE = {A:'bg-danger', B:'bg-warning text-dark', C:'bg-info'};
+let currentTab = 'open';
+let lastSignals = {};  // id -> signal dict (缓存扫描结果)
+
+document.getElementById('a-date').value = new Date().toISOString().slice(0,10);
+
+async function loadList() {
+    try {
+        const d = await api('/api/positions?status=' + currentTab);
+        renderTable(d.holdings);
+    } catch(e) { showToast('加载失败: '+e.message, 'error'); }
+}
+
+function renderTable(items) {
+    const tb = document.getElementById('pos-body');
+    if (!items || items.length === 0) {
+        tb.innerHTML = '<tr><td colspan="12" class="text-center text-muted py-4">暂无数据</td></tr>';
+        return;
+    }
+    if (currentTab === 'open') {
+        tb.innerHTML = items.map(h => {
+            const sig = lastSignals[h.id] || {};
+            const lv = sig.signal_level || 'info';
+            const action = sig.action || '持有';
+            const pnl = sig.pnl_pct != null ? sig.pnl_pct : 0;
+            const pnlCls = pnl > 0 ? 'text-danger' : pnl < 0 ? 'text-success' : '';
+            const reasons = (sig.reasons||[]).join('；') || '未扫描';
+            const stopNow = sig.new_stop && sig.new_stop > (h.stop_loss||0) ? sig.new_stop : (h.stop_loss||0);
+            const stopMove = sig.new_stop && sig.new_stop > (h.stop_loss||0) ? `<span class="badge bg-success ms-1">↑${sig.new_stop}</span>` : '';
+            return `<tr>
+                <td>${LEVEL_ICON[lv]||'⚪'}</td>
+                <td><a href="/stock-analysis?symbol=${h.symbol}" class="text-decoration-none fw-bold">${h.symbol}</a><br><small class="text-muted">${h.name||''}</small></td>
+                <td>${h.grade?`<span class="badge ${GRADE_BADGE[h.grade]||'bg-secondary'}">${h.grade}</span>`:'-'}</td>
+                <td class="text-end">${h.entry_price?.toFixed(2)}<br><small class="text-muted">${h.entry_date}</small></td>
+                <td class="text-end fw-bold">${sig.price?sig.price.toFixed(2):'-'}</td>
+                <td class="text-end">${h.shares}<br><small class="text-muted">${((h.cost||0)/10000).toFixed(1)}万</small></td>
+                <td class="text-end ${pnlCls}">${sig.pnl!=null?(sig.pnl>0?'+':'')+sig.pnl.toLocaleString():'-'}<br><small>${pnl>0?'+':''}${pnl}%</small></td>
+                <td class="text-end">${sig.r_multiple!=null?sig.r_multiple.toFixed(1)+'R':'-'}</td>
+                <td>${stopNow?stopNow.toFixed(2):'-'}${stopMove}</td>
+                <td><small class="text-muted">M10:${sig.ma10?sig.ma10.toFixed(2):'-'}<br>M20:${sig.ma20?sig.ma20.toFixed(2):'-'}</small></td>
+                <td><span class="badge ${LEVEL_BADGE[lv]||'bg-secondary'}">${action}</span><br><small class="text-muted" style="max-width:180px;display:inline-block">${reasons}</small></td>
+                <td>
+                    <div class="btn-group-vertical btn-group-sm">
+                        <button class="btn btn-outline-primary btn-sm py-0" onclick="openEdit(${h.id})">改</button>
+                        <button class="btn btn-outline-danger btn-sm py-0" onclick="openClose(${h.id},'${h.symbol}','${h.name||''}')">平</button>
+                        <button class="btn btn-outline-secondary btn-sm py-0" onclick="delHolding(${h.id})">删</button>
+                    </div>
+                </td>
+            </tr>`;
+        }).join('');
+    } else {
+        // 已平仓
+        tb.innerHTML = items.map(h => {
+            const ret = h.closed_price && h.entry_price ? ((h.closed_price/h.entry_price-1)*100).toFixed(1) : '-';
+            const retCls = ret>0?'text-danger':ret<0?'text-success':'';
+            return `<tr>
+                <td>📊</td>
+                <td><b>${h.symbol}</b><br><small class="text-muted">${h.name||''}</small></td>
+                <td>${h.grade||'-'}</td>
+                <td class="text-end">${h.entry_price?.toFixed(2)}</td>
+                <td class="text-end">${h.closed_price?.toFixed(2)}</td>
+                <td class="text-end">${h.shares}</td>
+                <td class="text-end ${retCls}">${ret>0?'+':''}${ret}%</td>
+                <td>-</td><td>-</td><td><small>${h.close_reason||''}</small></td>
+                <td>${h.closed_date||''}</td>
+                <td>-</td>
+            </tr>`;
+        }).join('');
+    }
+}
+
+async function scanPositions(applyMove) {
+    showToast(applyMove ? '扫描中（移动止损写回）…' : '扫描中…');
+    try {
+        const d = await api('/api/positions/scan' + (applyMove?'?apply_stop_move=true':''), {method:'POST'});
+        lastSignals = {};
+        (d.signals||[]).forEach(s => lastSignals[s.id] = s);
+        renderSummary(d.summary);
+        loadList();  // 重新加载（止损价可能已更新）
+        const n = d.summary;
+        showToast(`扫描完成：${n.count}只 持仓，⚠️需处理 ${n.danger_count}/${n.warn_count}，浮盈 ${n.total_pnl_pct}%`, 'success');
+    } catch(e) { showToast('扫描失败: '+e.message, 'error'); }
+}
+
+function renderSummary(s) {
+    if (!s) return;
+    const cards = [
+        {t:'持仓数', v:s.count+'只', i:'bi-bag', c:'primary'},
+        {t:'总市值', v:(s.total_value/10000).toFixed(1)+'万', i:'bi-cash-stack', c:'info'},
+        {t:'浮动盈亏', v:(s.total_pnl>0?'+':'')+s.total_pnl.toLocaleString()+' ('+s.total_pnl_pct+'%)', i:'bi-graph-up', c: s.total_pnl>=0?'danger':'success'},
+        {t:'胜率', v:s.win_rate+'% ('+s.winners+'/'+s.count+')', i:'bi-trophy', c:'warning'},
+        {t:'需处理信号', v:'⚠️'+s.danger_count+' / 🟡'+s.warn_count, i:'bi-exclamation-triangle', c: s.danger_count>0?'danger':'secondary'},
+    ];
+    document.getElementById('summary-row').innerHTML = cards.map(c=>`
+        <div class="col"><div class="card border-start border-4 border-${c.c}">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div><div class="text-muted small">${c.t}</div><div class="fw-bold fs-5">${c.v}</div></div>
+                    <i class="bi ${c.i} fs-3 text-${c.c} opacity-50"></i>
+                </div>
+            </div>
+        </div></div>
+    `).join('');
+}
+
+async function addHolding() {
+    const data = {
+        symbol: document.getElementById('a-symbol').value.trim(),
+        name: document.getElementById('a-name').value.trim(),
+        entry_price: parseFloat(document.getElementById('a-price').value),
+        shares: parseInt(document.getElementById('a-shares').value),
+        entry_date: document.getElementById('a-date').value || null,
+        stop_loss: parseFloat(document.getElementById('a-stop').value)||0,
+        target: parseFloat(document.getElementById('a-target').value)||0,
+        grade: document.getElementById('a-grade').value,
+    };
+    if (!data.symbol || !data.entry_price || !data.shares) { showToast('代码/买入价/股数必填', 'error'); return; }
+    try {
+        await api('/api/positions', {method:'POST', body:JSON.stringify(data)});
+        bootstrap.Modal.getInstance(document.getElementById('addModal')).hide();
+        showToast('持仓已录入', 'success');
+        ['a-symbol','a-name','a-price','a-shares','a-stop','a-target'].forEach(i=>document.getElementById(i).value='');
+        loadList();
+    } catch(e) { showToast('录入失败: '+e.message, 'error'); }
+}
+
+function openEdit(id) {
+    const rows = document.querySelectorAll('#pos-body tr');
+    // 从已加载数据取，重新拉一次更稳妥
+    api('/api/positions').then(d => {
+        const h = d.holdings.find(x=>x.id===id);
+        if(!h) return;
+        document.getElementById('e-id').value = id;
+        document.getElementById('e-price').value = h.entry_price;
+        document.getElementById('e-shares').value = h.shares;
+        document.getElementById('e-stop').value = h.stop_loss||'';
+        document.getElementById('e-target').value = h.target||'';
+        document.getElementById('e-notes').value = h.notes||'';
+        new bootstrap.Modal(document.getElementById('editModal')).show();
+    });
+}
+
+async function saveEdit() {
+    const id = document.getElementById('e-id').value;
+    const fields = {};
+    ['price:entry_price','shares:shares','stop:stop_loss','target:target','notes:notes'].forEach(p=>{
+        const [el,f] = p.split(':');
+        const v = document.getElementById('e-'+el).value;
+        if(v !== '') fields[f] = f.includes('price')||f.includes('stop')||f.includes('target')?parseFloat(v):parseInt(v)||v;
+    });
+    try {
+        await api('/api/positions/'+id, {method:'PUT', body:JSON.stringify(fields)});
+        bootstrap.Modal.getInstance(document.getElementById('editModal')).hide();
+        showToast('已保存', 'success');
+        loadList();
+    } catch(e) { showToast('保存失败: '+e.message, 'error'); }
+}
+
+function openClose(id, symbol, name) {
+    document.getElementById('c-id').value = id;
+    document.getElementById('c-name').textContent = symbol+' '+name;
+    const sig = lastSignals[id];
+    document.getElementById('c-price').value = sig ? sig.price : '';
+    document.getElementById('c-reason').value = sig ? sig.action : '手动';
+    new bootstrap.Modal(document.getElementById('closeModal')).show();
+}
+
+async function confirmClose() {
+    const id = document.getElementById('c-id').value;
+    const price = parseFloat(document.getElementById('c-price').value);
+    const reason = document.getElementById('c-reason').value;
+    if (!price) { showToast('请填平仓价', 'error'); return; }
+    try {
+        await api('/api/positions/'+id+'/close', {method:'POST', body:JSON.stringify({close_price:price, reason})});
+        bootstrap.Modal.getInstance(document.getElementById('closeModal')).hide();
+        showToast('已平仓', 'success');
+        delete lastSignals[id];
+        loadList();
+    } catch(e) { showToast('平仓失败: '+e.message, 'error'); }
+}
+
+async function delHolding(id) {
+    if (!confirm('确认删除该持仓记录？（不可恢复）')) return;
+    try {
+        await api('/api/positions/'+id, {method:'DELETE'});
+        showToast('已删除', 'success');
+        delete lastSignals[id];
+        loadList();
+    } catch(e) { showToast('删除失败: '+e.message, 'error'); }
+}
+
+async function pushFeishu() {
+    showToast('推送中…');
+    try {
+        const d = await api('/api/positions/push-feishu', {method:'POST'});
+        d.success ? showToast(`飞书推送成功（${d.count}只持仓）`, 'success') : showToast('飞书推送失败', 'error');
+    } catch(e) { showToast('推送失败: '+e.message, 'error'); }
+}
+
+function switchTab(tab) {
+    currentTab = tab;
+    document.getElementById('tab-open').classList.toggle('active', tab==='open');
+    document.getElementById('tab-closed').classList.toggle('active', tab==='closed');
+    lastSignals = {};
+    loadList();
+}
+
+// 初始化
+loadList();
+</script>
+{% endblock %}

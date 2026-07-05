@@ -291,3 +291,94 @@ async def get_backtest_report(request: Request):
     if report is None:
         raise HTTPException(404, "暂无回测报告，请先运行回测")
     return report
+
+
+# ---------------------------------------------------------------------------
+# 持仓跟踪 Position Tracking endpoints
+# ---------------------------------------------------------------------------
+
+class HoldingCreate(BaseModel):
+    symbol: str
+    name: str = ""
+    entry_price: float
+    shares: int
+    entry_date: str | None = None
+    stop_loss: float = 0
+    target: float = 0
+    grade: str = ""
+    hit_strategies: str = ""
+    notes: str = ""
+
+
+class HoldingUpdate(BaseModel):
+    entry_price: float | None = None
+    shares: int | None = None
+    stop_loss: float | None = None
+    target: float | None = None
+    notes: str | None = None
+    name: str | None = None
+    entry_date: str | None = None
+
+
+class HoldingClose(BaseModel):
+    close_price: float
+    reason: str = ""
+
+
+class HoldingImport(BaseModel):
+    buy_list: list[dict]
+
+
+@router.get("/positions")
+async def list_positions(request: Request, status: str = "open"):
+    services = request.app.state.services
+    return {"holdings": services.list_holdings(status)}
+
+
+@router.post("/positions")
+async def create_position(body: HoldingCreate, request: Request):
+    services = request.app.state.services
+    hid = services.add_holding(body.model_dump())
+    return {"id": hid, "ok": True}
+
+
+@router.put("/positions/{hid}")
+async def update_position(hid: int, body: HoldingUpdate, request: Request):
+    services = request.app.state.services
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    ok = services.update_holding(hid, **fields)
+    return {"ok": ok}
+
+
+@router.post("/positions/{hid}/close")
+async def close_position(hid: int, body: HoldingClose, request: Request):
+    services = request.app.state.services
+    ok = services.close_holding(hid, body.close_price, body.reason)
+    return {"ok": ok}
+
+
+@router.delete("/positions/{hid}")
+async def delete_position(hid: int, request: Request):
+    services = request.app.state.services
+    ok = services.delete_holding(hid)
+    return {"ok": ok}
+
+
+@router.post("/positions/scan")
+async def scan_positions(request: Request, apply_stop_move: bool = False):
+    """扫描所有持仓，返回移动止损/减仓/止盈信号 + 组合摘要。"""
+    services = request.app.state.services
+    return services.scan_positions(apply_stop_move=apply_stop_move)
+
+
+@router.post("/positions/import-decision")
+async def import_decision_holdings(body: HoldingImport, request: Request):
+    """把决策买入清单批量导入持仓表。"""
+    services = request.app.state.services
+    return services.import_decision_to_holdings(body.buy_list)
+
+
+@router.post("/positions/push-feishu")
+async def push_positions_feishu(request: Request):
+    services = request.app.state.services
+    return services.push_positions_feishu()

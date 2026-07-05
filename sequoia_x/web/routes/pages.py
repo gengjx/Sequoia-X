@@ -104,3 +104,11 @@ async def decision_page(request: Request):
         request=request, name="decision.html",
         context={},
     )
+
+@router.get("/positions")
+async def positions_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="positions.html",
+        context={},
+    )

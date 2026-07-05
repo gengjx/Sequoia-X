@@ -68,7 +68,9 @@ class DecisionEngine:
         exclude_markets: list[str] | None = None,
         exclude_st: bool = False,
         market_fn: Callable[[], dict] | None = None,
+        max_industry_pct: float = 0.30,
     ) -> dict:
+        """max_industry_pct: 单行业最大资金占比（默认30%），超出降级观望。"""
         """生成买卖决策清单。
 
         Args:
@@ -176,14 +178,15 @@ class DecisionEngine:
         # 市场状态仓位缩放：熊市×0.5、震荡×0.8、牛市×1.0
         position_scale = {"bull": 1.0, "neutral": 0.8, "bear": 0.5}.get(market_state, 0.8)
         scaled_capital = capital * position_scale
-        self._allocate_capital(buy_list, scaled_capital)
+        self._allocate_capital(buy_list, scaled_capital, max_industry_pct)
 
         # 仓位 0%（ATR 约束下无法建整手）的降级为观望
         cannot_buy = [i for i in buy_list if i.shares == 0]
         for i in cannot_buy:
             i.grade = "观望"
             i.action = "观望"
-            i.reason = f"评分{i.score}但当前价位风险预算下无法建整手，建议观望等回调"
+            if not i.reason:
+                i.reason = f"评分{i.score}但当前价位风险预算下无法建整手，建议观望等回调"
         buy_list = [i for i in buy_list if i.shares > 0]
         reject_list = cannot_buy + reject_list
 
@@ -299,10 +302,18 @@ class DecisionEngine:
     # 资金分配
     # ------------------------------------------------------------------
     @staticmethod
-    def _allocate_capital(buy_list: list[DecisionItem], capital: float) -> None:
-        """按 ATR 风险预算分配仓位（单笔风险 1.5%），总量不超过总资金。"""
+    def _allocate_capital(buy_list: list[DecisionItem], capital: float,
+                          max_industry_pct: float = 0.30) -> None:
+        """按 ATR 风险预算分配仓位（单笔风险 1.5%），总量不超过总资金。
+
+        行业暴露控制：单行业累计资金 ≤ max_industry_pct × capital（默认30%），
+        超出则削减该票仓位；削减至0的由调用方降级为观望。A股单行业政策/黑天鹅
+        风险集中，硬约束避免组合被单一板块拖垮。
+        """
         used_capital = 0.0
         max_capital = capital * 0.8  # 最高占用 80%，留现金
+        industry_capital: dict[str, float] = {}
+        industry_limit = capital * max_industry_pct
         for item in buy_list:
             if used_capital >= max_capital or item.price <= 0:
                 continue
@@ -318,9 +329,21 @@ class DecisionEngine:
                 # 不超剩余可用资金
                 if shares * item.price > max_capital - used_capital:
                     shares = int((max_capital - used_capital) / item.price / 100) * 100
+                # 行业暴露硬约束：单行业 ≤ max_industry_pct
+                ind = item.industry or "其他"
+                ind_used = industry_capital.get(ind, 0)
+                if ind_used + shares * item.price > industry_limit:
+                    allowed = max(0, industry_limit - ind_used)
+                    shares = int(allowed / item.price / 100) * 100
+                    if shares == 0:
+                        item.reason = (
+                            f"{ind}行业已占用{ind_used / capital * 100:.0f}%≥"
+                            f"{max_industry_pct * 100:.0f}%上限，降级观望分散风险"
+                        )
                 item.shares = shares
                 item.capital = round(shares * item.price, 0)
                 used_capital += item.capital
+                industry_capital[ind] = ind_used + item.capital
             item.position_pct = round(item.capital / capital * 100, 1)
 
     # ------------------------------------------------------------------

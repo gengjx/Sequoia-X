@@ -227,6 +227,60 @@ class FeishuNotifier:
         }
         return self._post(payload, webhook_key)
 
+    def send_positions(self, signals: list[dict], summary: dict,
+                      webhook_key: str = "default") -> bool:
+        """推送持仓扫描报告到飞书（含移动止损/减仓/止盈信号）。"""
+        today = date.today().strftime("%Y-%m-%d")
+        head = (
+            f"**日期：** {today}\n"
+            f"**持仓：** {summary.get('count', 0)} 只 "
+            f"｜ 总市值 {summary.get('total_value', 0)/10000:.1f}万 "
+            f"｜ 浮盈 {summary.get('total_pnl', 0):+,.0f}({summary.get('total_pnl_pct', 0):+.1f}%)\n"
+            f"**信号：** ⚠️需处理 {summary.get('danger_count', 0)}/{summary.get('warn_count', 0)} "
+            f"｜ 胜率 {summary.get('win_rate', 0)}%({summary.get('winners', 0)}/{summary.get('count', 0)})"
+        )
+        # 按信号等级分组：danger/warn 优先，其余折叠
+        level_emoji = {"danger": "🔴", "warn": "🟡", "success": "🟢", "info": "⚪"}
+        urgent, normal = [], []
+        for s in signals:
+            lv = s.get("signal_level", "info")
+            sym = s.get("symbol", "")
+            xq = self._to_xueqiu_code(sym) if sym else ""
+            name = s.get("name", "") or sym
+            line = (
+                f"{level_emoji.get(lv, '⚪')}[{name}]"
+                f"(https://xueqiu.com/S/{xq})`{sym}` "
+                f"现价 {s.get('price', 0):.2f} 浮盈 {s.get('pnl_pct', 0):+.1f}%({s.get('r_multiple', 0):+.1f}R)\n"
+                f"▶ **{s.get('action', '持有')}**：{'；'.join(s.get('reasons', ['持有']))}"
+            )
+            if lv in ("danger", "warn"):
+                urgent.append(line)
+            else:
+                normal.append(line)
+        urgent_text = "\n".join(urgent) if urgent else "（无紧急信号）"
+        normal_text = "\n".join(normal[:8]) if normal else "（无）"
+        if len(normal) > 8:
+            normal_text += f"\n…等共 {len(normal)} 只正常持有"
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"📊 Sequoia-X 持仓扫描 | {today}"},
+                    "template": "orange",
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": head}},
+                    {"tag": "hr"},
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**⚠️ 需处理信号：**\n{urgent_text}"}},
+                    {"tag": "hr"},
+                    {"tag": "div", "text": {"tag": "lark_md", "content": f"**✅ 正常持有：**\n{normal_text}"}},
+                    {"tag": "note", "elements": [{"tag": "plain_text",
+                     "content": "移动止损规则：跌破止损/MA20清仓 ｜ 跌破MA10减半仓 ｜ 盈利1R保本 ｜ 2R锁利"}]},
+                ],
+            },
+        }
+        return self._post(payload, webhook_key)
+
     def _post(self, payload: dict, webhook_key: str = "default") -> bool:
         """底层 POST，复用于 send 和 send_decision。"""
         url = self.settings.get_webhook_url(webhook_key)

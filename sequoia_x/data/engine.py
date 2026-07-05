@@ -30,6 +30,29 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_HOLDING_SQL = """
+CREATE TABLE IF NOT EXISTS portfolio_holding (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT    NOT NULL,
+    name        TEXT    DEFAULT '',
+    entry_price REAL    NOT NULL,
+    shares      INTEGER NOT NULL,
+    entry_date  TEXT    NOT NULL,
+    stop_loss   REAL    DEFAULT 0,      -- 当前止损价（移动止损会更新）
+    initial_stop REAL   DEFAULT 0,      -- 初始止损（记录）
+    target      REAL    DEFAULT 0,
+    grade       TEXT    DEFAULT '',
+    hit_strategies TEXT DEFAULT '',
+    cost        REAL    DEFAULT 0,      -- 买入总成本
+    status      TEXT    DEFAULT 'open', -- open / closed
+    close_reason TEXT   DEFAULT '',
+    closed_price REAL   DEFAULT 0,
+    closed_date TEXT    DEFAULT '',
+    notes       TEXT    DEFAULT '',
+    UNIQUE (symbol, status)
+);
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
@@ -66,6 +89,7 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_HOLDING_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 

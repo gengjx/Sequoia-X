@@ -17,6 +17,7 @@ from sequoia_x.analysis.market import MarketAnalyzer
 from sequoia_x.analysis.backtest import SignalBacktester
 from sequoia_x.analysis.stock_analysis import StockAnalyzer
 from sequoia_x.analysis.decision import DecisionEngine
+from sequoia_x.analysis.position import PositionTracker
 from sequoia_x.analysis.combo_backtest import ComboBacktester, SIGNAL_FUNCS
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.data.engine import DataEngine
@@ -177,6 +178,7 @@ class WebServices:
         self._decision_cache: dict[str, tuple[float, dict]] = {}
         self._decision_cache_ts: float = 0.0
         self._backtest_cache: dict | None = None
+        self._position_tracker: PositionTracker | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
     # -- Strategy methods --
@@ -486,6 +488,78 @@ class WebServices:
         hold_days = hold_days or [5, 10, 20]
         bt = ComboBacktester(self.engine, self.settings)
         return bt.run_resonance(hold_days=hold_days)
+
+    # ------------------------------------------------------------------
+    # 持仓跟踪 PositionTracker
+    # ------------------------------------------------------------------
+    @property
+    def positions(self) -> PositionTracker:
+        """懒加载持仓跟踪器。"""
+        if self._position_tracker is None:
+            self._position_tracker = PositionTracker(self.engine, self.settings)
+        return self._position_tracker
+
+    def list_holdings(self, status: str = "open") -> list[dict]:
+        return self.positions.list_holdings(status)
+
+    def add_holding(self, data: dict) -> int:
+        """从决策 buy_list 条目或手动录入新增持仓。"""
+        return self.positions.add_holding(
+            symbol=data["symbol"], name=data.get("name", ""),
+            entry_price=float(data["entry_price"]), shares=int(data["shares"]),
+            entry_date=data.get("entry_date"), stop_loss=float(data.get("stop_loss", 0)),
+            target=float(data.get("target", 0)), grade=data.get("grade", ""),
+            hit_strategies=data.get("hit_strategies", ""), notes=data.get("notes", ""),
+        )
+
+    def update_holding(self, hid: int, **fields) -> bool:
+        return self.positions.update_holding(hid, **fields)
+
+    def close_holding(self, hid: int, close_price: float, reason: str = "") -> bool:
+        return self.positions.close_holding(hid, close_price, reason)
+
+    def delete_holding(self, hid: int) -> bool:
+        return self.positions.delete_holding(hid)
+
+    def scan_positions(self, apply_stop_move: bool = False) -> dict:
+        """扫描所有持仓，返回信号列表 + 组合摘要。"""
+        signals = self.positions.scan_all(apply_stop_move=apply_stop_move)
+        return {
+            "signals": [self.positions.signal_to_dict(s) for s in signals],
+            "summary": self.positions.summary(signals),
+        }
+
+    def import_decision_to_holdings(self, buy_list: list[dict]) -> dict:
+        """把决策买入清单批量导入持仓表（跳过已持仓的）。"""
+        added, skipped = 0, 0
+        for r in buy_list:
+            if r.get("shares", 0) <= 0 or r.get("price", 0) <= 0:
+                skipped += 1
+                continue
+            try:
+                self.positions.add_holding(
+                    symbol=r["symbol"], name=r.get("name", ""),
+                    entry_price=r["price"], shares=r["shares"],
+                    stop_loss=r.get("stop_loss", 0), target=r.get("target", 0),
+                    grade=r.get("grade", ""),
+                    hit_strategies=",".join(r.get("hit_strategies", [])),
+                )
+                added += 1
+            except Exception as e:
+                logger.warning(f"导入持仓 {r.get('symbol')} 失败：{e!r}")
+                skipped += 1
+        logger.info(f"决策导入持仓：新增 {added} 只，跳过 {skipped} 只")
+        return {"added": added, "skipped": skipped}
+
+    def push_positions_feishu(self) -> dict:
+        """推送持仓扫描报告到飞书。"""
+        signals = self.positions.scan_all()
+        summary = self.positions.summary(signals)
+        notifier = FeishuNotifier(self.settings)
+        ok = notifier.send_positions(
+            [self.positions.signal_to_dict(s) for s in signals], summary,
+        )
+        return {"success": ok, "count": summary["count"]}
 
     def push_decision_feishu(self, decision: dict | None = None,
                              strategy_keys: list[str] | None = None,
