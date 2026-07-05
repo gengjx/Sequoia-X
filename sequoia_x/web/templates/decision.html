@@ -25,13 +25,19 @@
                 <button class="btn btn-primary w-100" onclick="generateDecision()"><i class="bi bi-magic"></i></button>
             </div>
         </div>
-        <div class="mt-2">
-            <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(true)">全选</button>
-            <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">清空</button>
-            <button class="btn btn-outline-secondary btn-sm" onclick="quickPreset('突破组')">突破组</button>
-            <button class="btn btn-outline-secondary btn-sm" onclick="quickPreset('低吸组')">低吸组</button>
+        <div class="mt-3">
+            <label class="form-label fw-bold small mb-2">⚡ 快速组合（点击自动勾选策略+推荐评分）</label>
+            <div id="combo-box" class="row g-2"></div>
+            <div class="mt-2 d-flex gap-2">
+                <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(true)">全选策略</button>
+                <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">清空</button>
+            </div>
         </div>
     </div>
+</div>
+
+<div id="combo-tip" class="alert alert-light border d-none mb-3 small">
+    <i class="bi bi-lightbulb"></i> <span id="combo-tip-text"></span>
 </div>
 
 <div id="loading" class="text-center py-4" style="display:none;">
@@ -67,10 +73,59 @@ function initStrategies() {
 }
 
 function selectAll(checked) { document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = checked); }
-function quickPreset(group) {
-    const map = {'突破组':['ma_volume','turtle','rps'],'低吸组':['pullback','bottom']};
-    const keys = map[group]||[];
-    document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = keys.includes(cb.value));
+
+// 5种实战组合（基于策略互补性+实测数据设计）
+const COMBOS = [
+    {id:'breakout', icon:'🚀', name:'趋势突破', color:'primary',
+     strategies:['turtle','ma_volume','rps'], minScore:60,
+     market:'牛市/结构性行情主线，右侧追涨',
+     logic:'三者都是趋势启动信号，实测共振45只，共振确认度高，弹性最大'},
+    {id:'leader', icon:'🐉', name:'主线龙头', color:'danger',
+     strategies:['dragon','rps','turtle'], minScore:55,
+     market:'主线明确的行情，龙头接力战法',
+     logic:'板块龙头+RPS强势+突破三重验证，聚焦各板块最强标的'},
+    {id:'lowbuy', icon:'🛡️', name:'低吸埋伏', color:'success',
+     strategies:['pullback','bottom','limit_down'], minScore:45,
+     market:'震荡市/调整后布局，防守反击',
+     logic:'回踩+反转+恐慌跌停都是低位入场，评分天然偏低故门槛降至45'},
+    {id:'balanced', icon:'⚖️', name:'均衡全天候', color:'info',
+     strategies:['rps','dragon','turtle','pullback','bottom'], minScore:55,
+     market:'不确定市场环境，攻守兼备',
+     logic:'突破+龙头+低吸多风格覆盖，适应不同市场阶段'},
+    {id:'elite', icon:'💎', name:'高共振精选', color:'warning',
+     strategies:['turtle','ma_volume','rps','dragon','pullback','bottom','flag','shakeout','limit_down'], minScore:65,
+     market:'少而精，只买多维共振的最确定标的',
+     logic:'全策略扫描，依靠共振度≥3筛选极品，要求高评分'},
+];
+
+function initCombos() {
+    document.getElementById('combo-box').innerHTML = COMBOS.map(c => `
+        <div class="col" style="flex:0 0 20%;max-width:20%">
+            <div class="card h-100 combo-card border-${c.color}" style="cursor:pointer" onclick="applyCombo('${c.id}')">
+                <div class="card-body p-2 text-center">
+                    <div class="fs-4">${c.icon}</div>
+                    <div class="fw-bold small">${c.name}</div>
+                    <div class="text-muted" style="font-size:0.7rem">推荐评分 ≥${c.minScore}</div>
+                </div>
+            </div>
+        </div>`).join('');
+}
+
+function applyCombo(id) {
+    const c = COMBOS.find(x => x.id === id);
+    if (!c) return;
+    document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = c.strategies.includes(cb.value));
+    document.getElementById('min-score').value = c.minScore;
+    // 高亮选中卡片
+    document.querySelectorAll('.combo-card').forEach(card => card.classList.remove('border-primary','border-3'));
+    event.currentTarget.classList.add('border-3');
+    // 显示说明
+    const tip = document.getElementById('combo-tip');
+    tip.classList.remove('d-none');
+    document.getElementById('combo-tip-text').innerHTML =
+        `<strong>${c.icon} ${c.name}</strong> · ${c.strategies.length}个策略 · 推荐≥${c.minScore}分<br>` +
+        `<span class="text-muted">适用：${c.market}</span><br>` +
+        `<span class="text-muted">逻辑：${c.logic}</span>`;
 }
 
 async function generateDecision() {
@@ -190,5 +245,6 @@ function renderDecision(data) {
 }
 
 initStrategies();
+initCombos();
 </script>
 {% endblock %}
