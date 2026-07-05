@@ -172,7 +172,7 @@ class WebServices:
         self._market_analyzer: MarketAnalyzer | None = None
         self._stock_analyzer: StockAnalyzer | None = None
         self._stock_result_cache: dict[str, tuple[float, dict]] = {}
-        self._decision_cache: dict | None = None
+        self._decision_cache: dict[str, tuple[float, dict]] = {}
         self._decision_cache_ts: float = 0.0
         self._backtest_cache: dict | None = None
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -394,6 +394,7 @@ class WebServices:
     def generate_decision(
         self, strategy_keys: list[str] | None = None,
         capital: float = 100000.0, min_score: int = 50,
+        exclude_markets: list[str] | None = None, exclude_st: bool = False,
     ) -> dict:
         """交易决策中枢：多策略选股 → 质量过滤 → 共振定级 → 仓位分配。
 
@@ -401,8 +402,11 @@ class WebServices:
         """
         import time
         now = time.time()
-        if self._decision_cache and now - self._decision_cache_ts < 600:
-            return self._decision_cache
+        # 缓存 key 包含策略+过滤参数，避免不同条件复用错误结果
+        cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}"
+        cached = self._decision_cache.get(cache_key)
+        if cached and now - cached[0] < 600:
+            return cached[1]
         if strategy_keys is None:
             strategy_keys = list(STRATEGY_REGISTRY.keys())
 
@@ -442,12 +446,14 @@ class WebServices:
             analyze_fn=analyzer.analyze,
             capital=capital,
             min_score=min_score,
+            exclude_markets=exclude_markets,
+            exclude_st=exclude_st,
         )
         result["strategies_run"] = {
             k: len(v) for k, v in strategy_results.items()
         }
-        self._decision_cache = result
-        self._decision_cache_ts = time.time()
+        self._decision_cache[cache_key] = (time.time(), result)
+        logging.getLogger(__name__).info('决策缓存写入 key=' + cache_key[:40])
         logging.getLogger(__name__).info(
             f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
         )

@@ -107,6 +107,7 @@ async def generate_decision(body: DecisionRequest, request: Request):
     return await asyncio.to_thread(
         services.generate_decision,
         body.strategy_keys, body.capital, body.min_score,
+        body.exclude_markets, body.exclude_st,
     )
 
 
@@ -164,6 +165,8 @@ class DecisionRequest(BaseModel):
     strategy_keys: list[str] | None = None
     capital: float = 100000.0
     min_score: int = 50
+    exclude_markets: list[str] | None = None
+    exclude_st: bool = False
 
 
 class ConfigUpdate(BaseModel):

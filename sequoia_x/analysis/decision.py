@@ -65,6 +65,8 @@ class DecisionEngine:
         capital: float = 100000.0,
         min_score: int = 50,
         max_candidates: int = 40,
+        exclude_markets: list[str] | None = None,
+        exclude_st: bool = False,
     ) -> dict:
         """生成买卖决策清单。
 
@@ -73,6 +75,9 @@ class DecisionEngine:
             analyze_fn: 个股分析函数（StockAnalyzer.analyze 的引用），复用其 5min 缓存
             capital: 总资金（元）
             min_score: 综合评分下限，低于此值淘汰
+            exclude_markets: 剔除的市场板块，如 ['chinext','star','bse']
+                chinext=创业板(300) star=科创板(688) bse=北交所(8/4)
+            exclude_st: 是否剔除 ST/*ST 股票
 
         Returns:
             {buy_list, watch_list, reject_list, summary}
@@ -86,6 +91,11 @@ class DecisionEngine:
                 pool.setdefault(sym, []).append(sname)
 
         logger.info(f"决策中枢：候选池 {len(pool)} 只（来自 {len(strategy_results)} 个策略）")
+
+        # 市场板块 + ST 过滤（在分析前剔除，节省财报采集时间）
+        if exclude_markets or exclude_st:
+            pool = self._filter_pool(pool, exclude_markets or [], exclude_st)
+
         if not pool:
             return self._empty_result(capital)
 
@@ -107,6 +117,14 @@ class DecisionEngine:
             try:
                 report = analyze_fn(sym)
                 if report.get("error"):
+                    continue
+                # ST 过滤（分析后拿到股票名称才能判断）
+                if exclude_st and "ST" in report.get("name", "").upper():
+                    items.append(DecisionItem(
+                        symbol=sym, name=report.get("name", sym), grade="淘汰",
+                        reject_reason="ST/*ST股票已剔除",
+                        score=report.get("recommendation", {}).get("score", 0),
+                    ))
                     continue
                 rec = report.get("recommendation", {})
                 score = rec.get("score", 0)
@@ -168,6 +186,37 @@ class DecisionEngine:
             "strategy_count": len(strategy_results),
             "pool_size": len(pool),
         }
+
+    # ------------------------------------------------------------------
+    # 市场板块过滤
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _filter_pool(
+        pool: dict[str, list[str]], exclude_markets: list[str], exclude_st: bool,
+    ) -> dict[str, list[str]]:
+        """按市场板块过滤候选池（ST 过滤延迟到分析阶段，因需股票名称）。
+
+        exclude_markets 支持值：chinext(创业板300/301) star(科创板688/689) bse(北交所8/4)
+        """
+        def _market_of(symbol: str) -> str:
+            if symbol.startswith(("300", "301")):
+                return "chinext"
+            if symbol.startswith(("688", "689")):
+                return "star"
+            if symbol.startswith(("8", "4")):
+                return "bse"
+            return "main"
+
+        filtered = {}
+        excluded = 0
+        for sym, strats in pool.items():
+            if _market_of(sym) in exclude_markets:
+                excluded += 1
+                continue
+            filtered[sym] = strats
+        if excluded:
+            logger.info(f"市场板块过滤：剔除 {excluded} 只（{','.join(exclude_markets)}）")
+        return filtered
 
     # ------------------------------------------------------------------
     # 定级逻辑
