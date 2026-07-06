@@ -115,27 +115,29 @@ function initStrategies() {
 function selectAll(checked) { document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = checked); }
 
 // 5种实战组合（基于策略互补性+实测数据设计）
+// 数据驱动组合（基于策略评估引擎网格搜索218种子集 + 卡玛排序，497只×30月实测）
+// 替代主观预设——所有配置均来自回测数据，定期重跑评估自动刷新
 const COMBOS = [
-    {id:'breakout', icon:'🚀', name:'趋势突破', color:'primary',
-     strategies:['turtle','ma_volume','rps'], minScore:60,
-     market:'牛市/结构性行情主线，右侧追涨',
-     logic:'三者都是趋势启动信号，实测共振45只，共振确认度高，弹性最大'},
-    {id:'leader', icon:'🐉', name:'主线龙头', color:'danger',
-     strategies:['dragon','rps','turtle'], minScore:55,
-     market:'主线明确的行情，龙头接力战法',
-     logic:'板块龙头+RPS强势+突破三重验证，聚焦各板块最强标的'},
-    {id:'lowbuy', icon:'🛡️', name:'低吸埋伏', color:'success',
-     strategies:['pullback','bottom','limit_down'], minScore:45,
-     market:'震荡市/调整后布局，防守反击',
-     logic:'回踩+反转+恐慌跌停都是低位入场，评分天然偏低故门槛降至45'},
-    {id:'balanced', icon:'⚖️', name:'均衡全天候', color:'info',
-     strategies:['rps','dragon','turtle','pullback','bottom'], minScore:55,
-     market:'不确定市场环境，攻守兼备',
-     logic:'突破+龙头+低吸多风格覆盖，适应不同市场阶段'},
-    {id:'elite', icon:'💎', name:'高共振精选', color:'warning',
-     strategies:['turtle','ma_volume','rps','dragon','pullback','bottom','flag','shakeout','limit_down'], minScore:65,
-     market:'少而精，只买多维共振的最确定标的',
-     logic:'全策略扫描，依靠共振度≥3筛选极品，要求高评分'},
+    {id:'optimal', icon:'🥇', name:'数据最优', color:'success',
+     strategies:['pullback','bottom','flag'], minScore:55,
+     market:'全天候首选，回测卡玛1.08最高（年化12%回撤仅11%）',
+     logic:'缩量回踩+底部放量(减震器)+高位旗形(收益发动机)，风控最优组合'},
+    {id:'momentum', icon:'📈', name:'收益进攻', color:'danger',
+     strategies:['flag'], minScore:60,
+     market:'牛市/强结构行情，追求最高绝对收益',
+     logic:'高位旗形单策略，回测唯一跑赢基准(+0.87% alpha)，年化20.92%'},
+    {id:'balanced', icon:'⚖️', name:'均衡稳健', color:'primary',
+     strategies:['pullback','flag'], minScore:55,
+     market:'攻守兼备，收益与回撤平衡',
+     logic:'缩量回踩(风控)+高位旗形(收益)，回测年化16%回撤17%，卡玛0.95'},
+    {id:'growth', icon:'🌱', name:'成长突破', color:'info',
+     strategies:['bottom','flag','rps'], minScore:55,
+     market:'成长风格，底部反转+强势确认',
+     logic:'底部放量+高位旗形+RPS强势，回测卡玛1.00，三策略共振确认'},
+    {id:'custom', icon:'🎯', name:'自定义', color:'warning',
+     strategies:[], minScore:50,
+     market:'手动勾选下方策略自由组合',
+     logic:'点击后清空预设，自行勾选策略并调整评分门槛'},
 ];
 
 function initCombos() {
@@ -156,6 +158,14 @@ function applyCombo(id) {
     if (!c) return;
     document.querySelectorAll('.strat-cb').forEach(cb => cb.checked = c.strategies.includes(cb.value));
     document.getElementById('min-score').value = c.minScore;
+    // 自定义组合：清空后聚焦到策略选择区，不设门槛
+    if (id === 'custom') {
+        const tip = document.getElementById('combo-tip');
+        tip.classList.remove('d-none');
+        document.getElementById('combo-tip-text').innerHTML = '<strong>🎯 自定义模式</strong>：已清空预设，请在下方勾选策略并调整评分门槛';
+        document.querySelectorAll('.strat-cb')[0]?.focus();
+        return;
+    }
     // 高亮选中卡片
     document.querySelectorAll('.combo-card').forEach(card => card.classList.remove('border-primary','border-3'));
     event.currentTarget.classList.add('border-3');
