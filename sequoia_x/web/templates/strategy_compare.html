@@ -71,7 +71,7 @@ function renderEval(data) {
     // 1. 评分卡对比表
     html += '<div class="card mb-4"><div class="card-header fw-bold"><i class="bi bi-table"></i> 策略评分卡（按夏普降序）</div>';
     html += '<div class="card-body p-0"><div class="table-responsive"><table class="table table-sm table-hover mb-0 align-middle">';
-    html += '<thead class="table-dark"><tr><th>策略</th><th>年化收益</th><th>最大回撤</th><th>夏普</th><th>卡玛</th><th>月胜率</th><th>盈亏比</th><th>超额(vs基准)</th><th>样本</th></tr></thead><tbody>';
+    html += '<thead class="table-dark"><tr><th>策略</th><th>质量分</th><th>年化收益</th><th>最大回撤</th><th>夏普</th><th>卡玛</th><th>月胜率</th><th>盈亏比</th><th>超额(vs基准)</th><th>样本</th></tr></thead><tbody>';
 
     // 基准行
     html += `<tr class="table-secondary"><td><i class="bi bi-flag"></i> <strong>全市场基准</strong></td>`;
@@ -81,7 +81,10 @@ function renderEval(data) {
 
     strategies.forEach((s, i) => {
         const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '';
+        const qs = s.quality_score || 0;
+        const qt = qs>=80?'<span class="badge bg-success">S</span>':qs>=65?'<span class="badge bg-info">A</span>':qs>=45?'<span class="badge bg-primary">B</span>':qs>=30?'<span class="badge bg-secondary">C</span>':'<span class="badge bg-danger">D</span>';
         html += `<tr><td>${medal} <strong>${s.label}</strong></td>`;
+        html += `<td class="fw-bold">${qs} ${qt}</td>`;
         html += `<td class="${cellClass(s.annual_return)}">${fmt(s.annual_return)}</td>`;
         html += `<td class="${cellClass(s.max_drawdown, true)}">${fmt(s.max_drawdown)}</td>`;
         html += `<td class="${cellClass(s.sharpe)}">${s.sharpe.toFixed(2)}</td>`;
@@ -113,6 +116,8 @@ function renderEval(data) {
             html += `。<strong class="text-danger">无策略跑赢基准</strong>——选股alpha不足，需优化策略或降低换手。`;
         }
         html += '</div>';
+
+        html += `<div class="alert alert-success small"><i class="bi bi-check-circle"></i> 策略质量权重已自动刷新写入数据库，<strong>决策中枢将使用最新权重定级</strong>（下次决策生效）。</div>`;
     }
 
     document.getElementById('eval-result').innerHTML = html;

@@ -27,7 +27,9 @@ logger = get_logger(__name__)
 # 综合维度：夏普(风险调整) + 卡玛(回撤调整) + 选股IC(相对alpha) + 回撤控制
 # ⚠️ 阶段一硬编码，阶段二改为评估引擎定期重评估自动刷新（避免过拟合）
 # ------------------------------------------------------------------
-STRATEGY_QUALITY: dict[str, int] = {
+# 策略质量默认权重（DB无数据时的兜底值，基于一次评估快照）
+# 运行策略评估后会自动刷新写入DB，决策引擎启动时从DB加载最新值
+_DEFAULT_STRATEGY_QUALITY: dict[str, int] = {
     "flag": 85,        # S级 夏普0.68最高，唯一跑赢基准(+0.87% alpha)
     "pullback": 78,    # A级 IC0.061最强，回撤-19.99%最小，风控最优
     "bottom": 55,      # B级 样本不足保守中性（条件极严格）
@@ -38,6 +40,9 @@ STRATEGY_QUALITY: dict[str, int] = {
     "shakeout": 18,    # D级 夏普-0.59，年化-29.8%
     "limit_down": 10,  # D级 夏普-1.03，年化-34.8%（最差）
 }
+
+# 运行时动态权重（DecisionEngine.__init__ 从DB加载，覆盖默认值）
+STRATEGY_QUALITY: dict[str, int] = dict(_DEFAULT_STRATEGY_QUALITY)
 
 # 质量分 → 分层 → 定级加成
 _TIER_BONUS = {"S": 5, "A": 3, "B": 1, "C": 0, "D": -3}
@@ -115,6 +120,25 @@ class DecisionEngine:
     def __init__(self, engine: DataEngine, settings: Settings) -> None:
         self.engine = engine
         self.settings = settings
+        self._load_weights()
+
+    def _load_weights(self) -> None:
+        """从DB加载最新策略质量权重（覆盖默认值），DB空则用默认兜底。
+
+        策略评估引擎每次运行会写回DB，使决策中枢自适应最新市场数据。
+        """
+        global STRATEGY_QUALITY
+        try:
+            db_weights = self.engine.load_strategy_weights()
+            if db_weights:
+                for key, w in db_weights.items():
+                    STRATEGY_QUALITY[key] = w["quality_score"]
+                logger.info(
+                    f"策略权重已从DB加载（{len(db_weights)}个策略，"
+                    f"最近更新：{next(iter(db_weights.values())).get('updated_at', '?')}）"
+                )
+        except Exception as e:
+            logger.warning(f"加载策略权重失败，使用默认值：{e!r}")
 
     def generate(
         self,

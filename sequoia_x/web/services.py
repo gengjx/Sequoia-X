@@ -552,6 +552,10 @@ class WebServices:
         ev = StrategyEvaluator(self.engine, self.settings)
         return ev.evaluate(hold_days=hold_days, sample_size=sample_size)
 
+    def get_strategy_weights(self) -> dict:
+        """读取DB中的策略权重快照（前端展示当前权重+更新时间）。"""
+        return self.engine.load_strategy_weights()
+
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker
     # ------------------------------------------------------------------

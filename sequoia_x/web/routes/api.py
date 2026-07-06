@@ -135,6 +135,13 @@ async def strategy_evaluate(request: Request):
     return await asyncio.to_thread(services.evaluate_strategies)
 
 
+@router.get("/strategy/weights")
+async def strategy_weights(request: Request):
+    """读取当前策略质量权重快照（来自策略评估引擎最近一次刷新）。"""
+    services = request.app.state.services
+    return {"weights": services.get_strategy_weights()}
+
+
 @router.post("/decision/push-feishu")
 async def push_decision_feishu(body: DecisionRequest, request: Request):
     """推送交易决策清单到飞书。"""

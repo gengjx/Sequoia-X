@@ -142,8 +142,28 @@ class StrategyEvaluator:
                 curve=[round(v, 4) for v in curve],
             ).to_dict())
 
-        # 按夏普降序
-        strategies.sort(key=lambda x: x["sharpe"], reverse=True)
+        # 计算综合质量分（0-100）并写回DB
+        for strat in strategies:
+            strat["quality_score"] = self._quality_score(strat, bench_annual)
+
+        # 按质量分降序（质量分已融合夏普/回撤/alpha，比纯夏普更全面）
+        strategies.sort(key=lambda x: x["quality_score"], reverse=True)
+
+        # 写回DB（动态刷新决策权重）
+        try:
+            weights = [{
+                "strategy_key": s["key"],
+                "quality_score": s["quality_score"],
+                "sharpe": s["sharpe"], "max_dd": s["max_drawdown"],
+                "alpha": s["alpha"], "calmar": s["calmar"],
+                "win_rate": s["win_rate"], "pl_ratio": s["profit_loss_ratio"],
+                "annual_return": s["annual_return"],
+                "sample_trades": s["sample_trades"],
+            } for s in strategies]
+            self.engine.save_strategy_weights(weights)
+            logger.info(f"策略权重已刷新写入DB：{len(weights)}个策略")
+        except Exception as e:
+            logger.warning(f"策略权重写DB失败（不影响评估结果）：{e!r}")
 
         return {
             "strategies": strategies,
@@ -306,3 +326,29 @@ class StrategyEvaluator:
         if len(losses) == 0 or float(np.mean(losses)) == 0:
             return 0.0
         return float(np.mean(gains) / abs(np.mean(losses)))
+
+    @staticmethod
+    def _quality_score(strat: dict, bench_annual: float) -> int:
+        """综合质量分（0-100），融合收益/风险/alpha/稳定性。
+
+        评分维度（各0-100标准化后加权）：
+          - 风险调整 40%：夏普归一化（>1.0=100分，<-1.0=0分）
+          - 抗风险 25%：最大回撤归一化（回撤越小越好，0%=100，-70%=0）
+          - 超额alpha 20%：年化超额归一化（跑赢基准20%+=100，落后40%=0）
+          - 交易质量 15%：盈亏比归一化（>2.0=100，<0.5=0）
+        最终clamp到0-100整数，对齐决策中枢的S/A/B/C/D分层。
+        """
+        def _norm(v, hi, lo):
+            """线性归一化到0-100（hi=100分，lo=0分）。"""
+            if hi == lo:
+                return 50.0
+            return max(0.0, min(100.0, (v - lo) / (hi - lo) * 100))
+
+        s_sharpe = _norm(strat["sharpe"], 1.0, -1.0)
+        s_dd = _norm(strat["max_drawdown"], 0.0, -70.0)  # 0%回撤=100分
+        s_alpha = _norm(strat["alpha"] if "alpha" in strat else (strat["annual_return"] - bench_annual),
+                        20.0, -40.0)
+        s_pl = _norm(strat["profit_loss_ratio"], 2.0, 0.5)
+
+        score = (0.40 * s_sharpe + 0.25 * s_dd + 0.20 * s_alpha + 0.15 * s_pl)
+        return int(round(max(0, min(100, score))))

@@ -53,6 +53,22 @@ CREATE TABLE IF NOT EXISTS portfolio_holding (
 );
 """
 
+_CREATE_WEIGHTS_SQL = """
+CREATE TABLE IF NOT EXISTS strategy_weights (
+    strategy_key  TEXT PRIMARY KEY,
+    quality_score INTEGER NOT NULL,
+    sharpe        REAL DEFAULT 0,
+    max_dd        REAL DEFAULT 0,
+    alpha         REAL DEFAULT 0,
+    calmar        REAL DEFAULT 0,
+    win_rate      REAL DEFAULT 0,
+    pl_ratio      REAL DEFAULT 0,
+    annual_return REAL DEFAULT 0,
+    sample_trades INTEGER DEFAULT 0,
+    updated_at    TEXT NOT NULL
+);
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
@@ -90,8 +106,43 @@ class DataEngine:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute(_CREATE_HOLDING_SQL)
+            conn.execute(_CREATE_WEIGHTS_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
+
+    def save_strategy_weights(self, weights: list[dict]) -> None:
+        """批量写入策略评估权重（UPSERT）。"""
+        import time
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        sql = ("INSERT OR REPLACE INTO strategy_weights "
+               "(strategy_key, quality_score, sharpe, max_dd, alpha, calmar, "
+               "win_rate, pl_ratio, annual_return, sample_trades, updated_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        with sqlite3.connect(self.db_path) as conn:
+            for w in weights:
+                conn.execute(sql, (
+                    w["strategy_key"], w["quality_score"],
+                    w.get("sharpe", 0), w.get("max_dd", 0), w.get("alpha", 0),
+                    w.get("calmar", 0), w.get("win_rate", 0), w.get("pl_ratio", 0),
+                    w.get("annual_return", 0), w.get("sample_trades", 0), now,
+                ))
+            conn.commit()
+
+    def load_strategy_weights(self) -> dict[str, dict]:
+        """读取全部策略权重，返回 {strategy_key: {quality_score, ...}}。"""
+        sql = ("SELECT strategy_key, quality_score, sharpe, max_dd, alpha, "
+               "calmar, win_rate, pl_ratio, annual_return, sample_trades, updated_at "
+               "FROM strategy_weights")
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        return {
+            r[0]: {
+                "quality_score": r[1], "sharpe": r[2], "max_dd": r[3], "alpha": r[4],
+                "calmar": r[5], "win_rate": r[6], "pl_ratio": r[7],
+                "annual_return": r[8], "sample_trades": r[9], "updated_at": r[10],
+            }
+            for r in rows
+        }
 
     def _get_last_date(self, symbol: str) -> str | None:
         with sqlite3.connect(self.db_path) as conn:
