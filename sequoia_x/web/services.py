@@ -19,6 +19,7 @@ from sequoia_x.analysis.stock_analysis import StockAnalyzer
 from sequoia_x.analysis.decision import DecisionEngine
 from sequoia_x.analysis.position import PositionTracker
 from sequoia_x.analysis.combo_backtest import ComboBacktester, SIGNAL_FUNCS
+from sequoia_x.analysis.strategy_eval import StrategyEvaluator
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
@@ -545,6 +546,11 @@ class WebServices:
         hold_days = hold_days or [5, 10, 20]
         bt = ComboBacktester(self.engine, self.settings)
         return bt.run_resonance(hold_days=hold_days)
+
+    def evaluate_strategies(self, hold_days: int = 20, sample_size: int = 500) -> dict:
+        """策略评估：时间序列净值 + 全维度评分卡 + 基准对比。"""
+        ev = StrategyEvaluator(self.engine, self.settings)
+        return ev.evaluate(hold_days=hold_days, sample_size=sample_size)
 
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker

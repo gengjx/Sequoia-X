@@ -127,6 +127,14 @@ async def backtest_resonance(request: Request):
     return await asyncio.to_thread(services.backtest_resonance)
 
 
+@router.get("/strategy/evaluate")
+async def strategy_evaluate(request: Request):
+    """策略评估：全维度评分卡 + 净值曲线对比（约3-5秒）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.evaluate_strategies)
+
+
 @router.post("/decision/push-feishu")
 async def push_decision_feishu(body: DecisionRequest, request: Request):
     """推送交易决策清单到飞书。"""

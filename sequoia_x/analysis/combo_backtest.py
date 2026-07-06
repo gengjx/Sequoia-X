@@ -31,12 +31,14 @@ logger = get_logger(__name__)
 # 策略信号 → 计算函数名 映射
 SIGNAL_FUNCS = {
     "ma_volume", "turtle", "pullback", "bottom", "rps",
+    "flag", "shakeout", "limit_down",
 }
 
 # 策略显示名
 STRATEGY_LABELS = {
     "ma_volume": "均线放量", "turtle": "海龟突破", "pullback": "缩量回踩",
     "bottom": "底部放量", "rps": "RPS强势",
+    "flag": "高位旗形", "shakeout": "涨停洗盘", "limit_down": "上升趋势跌停",
 }
 
 
@@ -137,6 +139,39 @@ def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
         signals["rps"] = (ret_120 > 50) & (close > high_120 * 0.9)
     else:
         signals["rps"] = pd.Series(False, index=df.index)
+
+    # 高位旗形：40日强动量(涨幅>60%) + 10日收敛(振幅<15%) + 高位抗跌 + 缩量
+    if len(df) >= 40:
+        high40 = high.rolling(40).max()
+        low40 = low.rolling(40).min()
+        high10 = high.rolling(10).max()
+        low10 = low.rolling(10).min()
+        momentum = high40 / low40.replace(0, np.nan) > 1.6
+        consolidation = high10 / low10.replace(0, np.nan) < 1.15
+        high_level = low10 >= high40 * 0.8
+        shrink_flag = volume < vol_ma20 * 0.6
+        signals["flag"] = momentum & consolidation & high_level & shrink_flag
+    else:
+        signals["flag"] = pd.Series(False, index=df.index)
+
+    # 涨停洗盘：昨日涨停(>=前日*1.095) + 今日收阴 + 放量2倍 + 支撑不破
+    prev_close = close.shift(1)
+    prev2_close = close.shift(2)
+    limit_up_y = prev_close >= prev2_close * 1.095
+    bearish = close < df["open"]
+    vol_surge_shake = volume > volume.shift(1) * 2.0
+    support = low >= prev_close
+    signals["shakeout"] = limit_up_y & bearish & vol_surge_shake & support
+
+    # 上升趋势跌停：昨日MA20>MA60 + 今日跌停(<=昨日*0.905) + 放量2倍
+    if len(df) >= 60:
+        ma60 = close.rolling(60).mean()
+        uptrend_ld = ma20.shift(1) > ma60.shift(1)
+        limit_down = close <= prev_close * 0.905
+        vol_surge_ld = volume > vol_ma20 * 2.0
+        signals["limit_down"] = uptrend_ld & limit_down & vol_surge_ld
+    else:
+        signals["limit_down"] = pd.Series(False, index=df.index)
 
     return signals
 

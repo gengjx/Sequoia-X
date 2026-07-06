@@ -112,3 +112,11 @@ async def positions_page(request: Request):
         request=request, name="positions.html",
         context={},
     )
+
+@router.get("/strategy-compare")
+async def strategy_compare_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="strategy_compare.html",
+        context={},
+    )
