@@ -565,6 +565,11 @@ class WebServices:
             max_strategies=max_strategies, top_n=top_n,
         )
 
+    def compare_combos(self, hold_days: int = 20, sample_size: int = 500) -> dict:
+        """主观预设组合 vs 数据驱动最优组合 对比。"""
+        ev = StrategyEvaluator(self.engine, self.settings)
+        return ev.compare_combos(hold_days=hold_days, sample_size=sample_size)
+
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker
     # ------------------------------------------------------------------

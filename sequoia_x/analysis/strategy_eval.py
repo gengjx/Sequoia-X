@@ -355,6 +355,105 @@ class StrategyEvaluator:
 
 
     # ------------------------------------------------------------------
+    # 组合对比（主观预设 vs 数据驱动，同一把尺子）
+    # ------------------------------------------------------------------
+    def _eval_combo_metrics(
+        self, strat_keys: list[str], strat_series: dict[str, list[float]],
+        months: list[str], bench_annual: float,
+    ) -> dict:
+        """用统一的月度净值体系评估任意策略组合（可复用）。"""
+        valid = [s for s in strat_keys if s in strat_series]
+        combo_monthly = []
+        for i in range(len(months)):
+            vals = [strat_series[s][i] for s in valid if not np.isnan(strat_series[s][i])]
+            combo_monthly.append(float(np.mean(vals)) if vals else 0.0)
+        curve = self._cumulative_curve(combo_monthly)
+        annual = self._annualized(curve)
+        dd = self._max_drawdown(curve)
+        return {
+            "strategies": valid,
+            "labels": [STRATEGY_LABELS.get(s, s) for s in valid],
+            "size": len(valid),
+            "annual_return": round(annual, 2),
+            "max_drawdown": round(dd, 2),
+            "sharpe": round(self._sharpe(combo_monthly), 2),
+            "calmar": round(self._calmar(annual, dd), 2),
+            "win_rate": round(self._win_rate(combo_monthly), 1),
+            "alpha": round(annual - bench_annual, 2),
+            "curve": [round(v, 4) for v in curve],
+        }
+
+    # 主观预设组合（与 decision.html COMBOS 同步）
+    PRESET_COMBOS: dict[str, list[str]] = {
+        "趋势突破": ["turtle", "ma_volume", "rps"],
+        "主线龙头": ["dragon", "rps", "turtle"],
+        "低吸埋伏": ["pullback", "bottom", "limit_down"],
+        "均衡全天候": ["rps", "dragon", "turtle", "pullback", "bottom"],
+        "高共振精选": ["turtle", "ma_volume", "rps", "dragon", "pullback",
+                     "bottom", "flag", "shakeout", "limit_down"],
+    }
+
+    def compare_combos(
+        self, hold_days: int = DEFAULT_HOLD, sample_size: int = 500,
+        top_n: int = 3, seed: int = 42,
+    ) -> dict:
+        """主观预设组合 vs 数据驱动最优组合 对比（同一时间序列评估体系）。
+
+        一次采集数据，两组组合用同一把尺子评估，直接对比孰优孰劣。
+        """
+        from itertools import combinations
+        rtc = self.cost.round_trip_cost()
+        collected = self._collect(hold_days, sample_size, seed)
+        months = collected["months"]
+        strat_monthly = collected["strategy_monthly"]
+        bench_monthly = collected["benchmark_monthly"]
+        processed = collected["processed"]
+
+        strat_series: dict[str, list[float]] = {}
+        valid_strats = []
+        for skey in SIGNAL_FUNCS:
+            series = self._monthly_mean(strat_monthly.get(skey, {}), months)
+            if any(series):
+                strat_series[skey] = series
+                valid_strats.append(skey)
+
+        bench_series = self._monthly_mean(bench_monthly, months)
+        bench_curve = self._cumulative_curve(bench_series)
+        bench_annual = self._annualized(bench_curve)
+
+        # 1. 主观预设组合
+        presets = []
+        for name, keys in self.PRESET_COMBOS.items():
+            m = self._eval_combo_metrics(keys, strat_series, months, bench_annual)
+            m["name"] = name
+            m["source"] = "preset"
+            presets.append(m)
+
+        # 2. 数据驱动最优组合（网格搜索Top N）
+        all_combos = []
+        for size in range(1, min(5, len(valid_strats)) + 1):
+            for combo in combinations(valid_strats, size):
+                m = self._eval_combo_metrics(list(combo), strat_series, months, bench_annual)
+                all_combos.append(m)
+        all_combos.sort(key=lambda x: x["calmar"], reverse=True)
+        optimal = []
+        for i, m in enumerate(all_combos[:top_n]):
+            m["name"] = f"数据最优#{i+1}"
+            m["source"] = "optimal"
+            optimal.append(m)
+
+        return {
+            "presets": presets,
+            "optimal": optimal,
+            "months": months,
+            "hold_days": hold_days,
+            "sample_size": processed,
+            "round_trip_cost_pct": round(rtc * 100, 3),
+            "benchmark_annual": round(bench_annual, 2),
+            "benchmark_curve": [round(v, 4) for v in bench_curve],
+        }
+
+    # ------------------------------------------------------------------
     # 最优组合搜索（数据驱动，替代主观预设）
     # ------------------------------------------------------------------
     def find_optimal_combos(

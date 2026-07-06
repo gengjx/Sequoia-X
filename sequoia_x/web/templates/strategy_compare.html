@@ -13,6 +13,9 @@
         <button class="btn btn-success btn-sm" onclick="findOptimal()" id="btn-optimal">
             <i class="bi bi-stars"></i> 搜索最优组合
         </button>
+        <button class="btn btn-warning btn-sm" onclick="compareCombos()" id="btn-compare">
+            <i class="bi bi-arrow-left-right"></i> 预设 vs 最优对比
+        </button>
         <span class="text-muted small ms-3" id="eval-meta"></span>
     </div>
 
@@ -23,6 +26,7 @@
         基准=全市场等权月度收益。净值曲线叠加图可直观对比策略强弱，新策略上线后一目了然。
     </div>
 
+    <div id="compare-result" class="mb-4"></div>
     <div id="optimal-result" class="mb-4"></div>
 
     <div id="eval-result">
@@ -182,6 +186,109 @@ function drawCurve(strategies, bench, months) {
             interaction: { mode: 'index', intersect: false },
         },
     });
+}
+
+async function compareCombos() {
+    const btn = document.getElementById('btn-compare');
+    btn.disabled = true;
+    const el = document.getElementById('compare-result');
+    el.innerHTML = '<div class="text-center py-4"><div class="spinner-border text-warning"></div><p class="mt-3 mb-0">对比评估中（主观预设 vs 数据最优，同一体系，约5-10秒）...</p></div>';
+    try {
+        const data = await api('/api/strategy/compare-combos');
+        renderCompare(data);
+    } catch(e) {
+        el.innerHTML = `<div class="alert alert-danger">对比失败：${e.message}</div>`;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderCompare(data) {
+    const presets = data.presets || [];
+    const optimal = data.optimal || [];
+    const el = document.getElementById('compare-result');
+
+    let html = '<div class="card border-warning"><div class="card-header fw-bold text-warning"><i class="bi bi-arrow-left-right"></i> 主观预设 vs 数据驱动最优（同一时间序列评估 · 基准年化' + data.benchmark_annual + '% · 采样' + data.sample_size + '只）</div>';
+    html += '<div class="card-body">';
+    html += '<div class="alert alert-light border small mb-3"><i class="bi bi-info-circle"></i> 把<strong>5个主观预设组合</strong>和<strong>数据搜索的最优组合</strong>放进同一把尺子（月度净值×卡玛排序），客观对比孰优孰劣。<strong>卡玛=年化/|最大回撤|</strong>，越高越好；超额>0表示跑赢全市场基准。</div>';
+
+    html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0 align-middle">';
+    html += '<thead><tr class="table-light"><th>来源</th><th>组合</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>卡玛</th><th>超额</th></tr></thead><tbody>';
+
+    // 主观预设(灰色标记)
+    presets.forEach(c => {
+        const aCls = c.annual_return >= 0 ? 'text-success' : 'text-danger';
+        const ddCls = c.max_drawdown < -25 ? 'text-danger' : 'text-warning';
+        const aBadge = c.alpha > 0 ? 'text-success' : 'text-danger';
+        html += `<tr class="table-light"><td><span class="badge bg-secondary">主观</span></td>`;
+        html += `<td class="fw-bold">${c.name}<br><small class="text-muted">${c.labels.join('+')}</small></td>`;
+        html += `<td class="${aCls} fw-bold">${c.annual_return>0?'+':''}${c.annual_return}%</td>`;
+        html += `<td class="${ddCls}">${c.max_drawdown}%</td>`;
+        html += `<td>${c.sharpe}</td><td>${c.calmar}</td>`;
+        html += `<td class="${aBadge}">${c.alpha>0?'+':''}${c.alpha}%</td></tr>`;
+    });
+    // 分隔线
+    html += '<tr class="table-warning"><td colspan="7" class="text-center fw-bold text-warning small py-1">↑ 主观预设 ↑ 　 ↓ 数据驱动最优 ↓</td></tr>';
+    // 数据最优(绿色标记)
+    optimal.forEach(c => {
+        const aCls = c.annual_return >= 0 ? 'text-success' : 'text-danger';
+        const ddCls = c.max_drawdown < -25 ? 'text-danger' : 'text-warning';
+        const aBadge = c.alpha > 0 ? 'text-success' : 'text-danger';
+        html += `<tr class="table-success"><td><span class="badge bg-success">数据</span></td>`;
+        html += `<td class="fw-bold">${c.name}<br><small class="text-muted">${c.labels.join('+')}</small></td>`;
+        html += `<td class="${aCls} fw-bold">${c.annual_return>0?'+':''}${c.annual_return}%</td>`;
+        html += `<td class="${ddCls}">${c.max_drawdown}%</td>`;
+        html += `<td>${c.sharpe}</td><td class="fw-bold">${c.calmar}</td>`;
+        html += `<td class="${aBadge}">${c.alpha>0?'+':''}${c.alpha}%</td></tr>`;
+    });
+    // 基准行
+    html += `<tr class="table-secondary"><td><span class="badge bg-dark">基准</span></td><td class="fw-bold">全市场等权</td><td class="fw-bold">${data.benchmark_annual}%</td><td>-</td><td>-</td><td>-</td><td>—</td></tr>`;
+    html += '</tbody></table></div>';
+
+    // 净值曲线对比(主观最差vs数据最优vs基准)
+    const worst = presets.reduce((a,b) => a.calmar < b.calmar ? a : b, presets[0]);
+    const best = optimal[0];
+    if (best && worst) {
+        html += '<div class="mt-3"><div class="fw-bold small text-secondary mb-1"><i class="bi bi-graph-up"></i> 净值曲线：最差预设(' + worst.name + ') vs 最优数据 vs 基准</div>';
+        html += '<canvas id="compareCurve" height="80"></canvas></div>';
+    }
+
+    // 结论
+    const bestPreset = presets.reduce((a,b) => a.calmar > b.calmar ? a : b, presets[0]||{calmar:0,name:'-'});
+    html += `<div class="alert alert-warning small mt-3 mb-0"><i class="bi bi-lightbulb"></i> <strong>对比结论：</strong>数据最优组合卡玛 <strong>${best.calmar}</strong>，最优主观预设(${bestPreset.name})仅 <strong>${bestPreset.calmar}</strong>，提升 <strong>${(best.calmar - bestPreset.calmar).toFixed(2)}</strong>。`;
+    const allPresetNegative = presets.every(p => p.alpha < 0);
+    if (allPresetNegative) {
+        html += ` <strong class="text-danger">5个主观预设全部跑输基准</strong>（超额${Math.max(...presets.map(p=>p.alpha))}%），建议用数据驱动组合替代。`;
+    }
+    html += '</div>';
+
+    html += '</div></div>';
+    el.innerHTML = html;
+
+    // 画对比曲线
+    if (best && worst) {
+        const ctx = document.getElementById('compareCurve');
+        if (ctx) {
+            const datasets = [
+                {label: '基准', data: data.benchmark_curve, borderColor: '#6c757d', borderWidth: 2, borderDash: [5,5], pointRadius: 0, tension: 0.3},
+                {label: '数据最优('+best.labels.join('+')+')', data: best.curve, borderColor: '#198754', borderWidth: 2.5, pointRadius: 0, tension: 0.3},
+                {label: '最差预设('+worst.name+')', data: worst.curve, borderColor: '#dc3545', borderWidth: 2, pointRadius: 0, tension: 0.3},
+            ];
+            if (window._compareChart) window._compareChart.destroy();
+            window._compareChart = new Chart(ctx, {
+                type: 'line',
+                data: {labels: data.months, datasets},
+                options: {
+                    responsive: true,
+                    plugins: {legend: {position: 'bottom', labels: {boxWidth: 12, font: {size: 11}}}},
+                    scales: {
+                        y: {title: {display: true, text: '累计净值'}, ticks: {callback: v=>v.toFixed(2)}},
+                        x: {ticks: {maxTicksLimit: 12, font: {size: 10}}},
+                    },
+                },
+            });
+        }
+    }
 }
 
 async function findOptimal() {
