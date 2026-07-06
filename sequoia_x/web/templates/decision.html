@@ -90,6 +90,19 @@ const STRATEGIES = [
 ];
 const TYPE_COLORS = {'突破':'primary','强势':'danger','低吸':'success','特殊':'warning'};
 
+// 策略质量分层（与后端 STRATEGY_QUALITY 同步，S最优→D最差）
+const QUALITY_TIER = {
+    flag:'S', pullback:'A', bottom:'B', dragon:'B', ma_volume:'B',
+    rps:'C', turtle:'C', shakeout:'D', limit_down:'D'
+};
+const TIER_COLOR = {S:'success', A:'info', B:'primary', C:'secondary', D:'danger'};
+const STRAT_NAME = Object.fromEntries(STRATEGIES.map(s=>[s.key,s.name]));
+function stratBadge(key) {
+    const tier = QUALITY_TIER[key] || 'C';
+    const name = STRAT_NAME[key] || key;
+    return `<span class="badge bg-${TIER_COLOR[tier]} me-1" title="${tier}级策略">${name}</span>`;
+}
+
 function initStrategies() {
     const box = document.getElementById('strategy-box');
     box.innerHTML = STRATEGIES.map(s => `
@@ -455,7 +468,7 @@ function renderDecision(data) {
             <div class="table-responsive">
                 <table class="table table-sm table-hover align-middle mb-0">
                     <thead class="table-light small"><tr>
-                        <th>评级</th><th>股票</th><th>共振</th><th>命中策略</th><th>评分</th>
+                        <th>评级</th><th>股票</th><th>共振</th><th>命中策略(色=质量)</th><th>评分</th>
                         <th>现价</th><th>止损</th><th>目标</th><th>仓位</th><th>股数</th><th>资金</th>
                     </tr></thead>
                     <tbody class="small">
@@ -464,7 +477,7 @@ function renderDecision(data) {
                             <td>${GRADE_BADGE[r.grade]||'-'}</td>
                             <td><a href="/stock-analysis?symbol=${r.symbol}" class="text-decoration-none fw-semibold">${r.name}<br><small class="text-muted">${r.symbol}</small></a></td>
                             <td>${r.resonance>1?`<span class="badge bg-danger">${r.resonance}共振</span>`:r.resonance}</td>
-                            <td><small>${r.hit_strategies.map(s=>`<span class="badge bg-light text-dark me-1">${s}</span>`).join('')}</small></td>
+                            <td><small>${r.hit_strategies.map(stratBadge).join('')}</small></td>
                             <td class="fw-bold">${r.score}</td>
                             <td>${r.price!=null?r.price.toFixed(2):'-'}</td>
                             <td class="text-success">${r.stop_loss!=null?r.stop_loss.toFixed(2):'-'}</td>

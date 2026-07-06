@@ -22,6 +22,62 @@ from sequoia_x.data.engine import DataEngine
 logger = get_logger(__name__)
 
 
+# ------------------------------------------------------------------
+# 策略质量分层（基于 strategy_eval 评估引擎实测数据）
+# 综合维度：夏普(风险调整) + 卡玛(回撤调整) + 选股IC(相对alpha) + 回撤控制
+# ⚠️ 阶段一硬编码，阶段二改为评估引擎定期重评估自动刷新（避免过拟合）
+# ------------------------------------------------------------------
+STRATEGY_QUALITY: dict[str, int] = {
+    "flag": 85,        # S级 夏普0.68最高，唯一跑赢基准(+0.87% alpha)
+    "pullback": 78,    # A级 IC0.061最强，回撤-19.99%最小，风控最优
+    "bottom": 55,      # B级 样本不足保守中性（条件极严格）
+    "dragon": 50,      # B级 不支持向量化回测，板块维度有独立价值
+    "ma_volume": 48,   # B级 IC0.034正向选股力，但夏普偏低
+    "rps": 40,         # C级 夏普0.39，但IC-0.054追高风险
+    "turtle": 28,      # C级 夏普-0.37，IC-0.009，选股alpha不足
+    "shakeout": 18,    # D级 夏普-0.59，年化-29.8%
+    "limit_down": 10,  # D级 夏普-1.03，年化-34.8%（最差）
+}
+
+# 质量分 → 分层 → 定级加成
+_TIER_BONUS = {"S": 5, "A": 3, "B": 1, "C": 0, "D": -3}
+
+
+def quality_tier(score: int) -> str:
+    """质量分 → S/A/B/C/D 分层。"""
+    if score >= 80:
+        return "S"
+    if score >= 65:
+        return "A"
+    if score >= 45:
+        return "B"
+    if score >= 30:
+        return "C"
+    return "D"
+
+
+def quality_bonus(hit_strategies: list[str]) -> float:
+    """命中策略的质量加成分（用于定级矩阵）。
+
+    S级策略命中+5，A级+3，B级+1，C级0，D级-3。
+    让决策中枢区分"命中好策略"与"命中差策略"。
+    """
+    return sum(
+        _TIER_BONUS.get(quality_tier(STRATEGY_QUALITY.get(s, 40)), 0)
+        for s in hit_strategies
+    )
+
+
+def quality_label(hit_strategies: list[str]) -> str:
+    """命中策略中最高的质量分层（用于前端展示）。"""
+    if not hit_strategies:
+        return ""
+    tiers = [quality_tier(STRATEGY_QUALITY.get(s, 40)) for s in hit_strategies]
+    order = ["S", "A", "B", "C", "D"]
+    return min(tiers, key=lambda t: order.index(t))
+
+
+
 @dataclass
 class DecisionItem:
     """单只股票的决策条目。"""
@@ -30,6 +86,7 @@ class DecisionItem:
     grade: str = ""          # A / B / C / 淘汰
     resonance: int = 0       # 命中策略数
     hit_strategies: list[str] = field(default_factory=list)  # 命中策略中文名
+    strategy_quality: float = 0.0   # 命中策略平均质量分(0-100)
     score: int = 0           # 个股分析综合评分
     action: str = ""
     price: float = 0.0
@@ -170,6 +227,7 @@ class DecisionEngine:
                     name=report.get("name", sym),
                     resonance=len(strat_names),
                     hit_strategies=strat_names,
+                    strategy_quality=round(sum(STRATEGY_QUALITY.get(x, 40) for x in strat_names) / max(len(strat_names), 1), 1),
                     score=score,
                     action=rec.get("action", ""),
                     price=report.get("price", 0),
@@ -273,49 +331,54 @@ class DecisionEngine:
     # 定级逻辑
     # ------------------------------------------------------------------
     def _grade_item(self, item: DecisionItem, capital: float, market_state: str = "neutral") -> None:
-        """数据驱动定级矩阵（基于共振回测实测结论）。
+        """数据驱动定级矩阵（共振度 × 策略质量 × 综合评分）。
 
-        回测事实（497只×10天持有期）：
-          - 单策略(共振1): +1.22% 胜率47% ← 最稳健
-          - 2策略共振: +1.08% 胜率44%
-          - 3+共振: -2.07% 胜率27% ← 过热见顶，反而亏损
-        故：3+共振降级为风险预警（非重仓），单策略高评分提升。
+        回测事实（497只×30月）：
+          - 共振度：3+共振过热见顶（IC-0.0316有效负向），单策略最稳健
+          - 策略质量：高位旗形夏普0.68(唯一正超额) >> 上升趋势跌停-1.03
+        故：effective_score = 综合评分 + 策略质量加成，让决策中枢"识货"。
 
         market_state: bull/neutral/bear，影响评分门槛和仓位系数。
         """
-        r, s = item.resonance, item.score
+        r = item.resonance
+        # 策略质量加成：命中S级策略+5，D级-3
+        q_bonus = quality_bonus(item.hit_strategies)
+        es = item.score + q_bonus  # effective_score 有效评分
+
         # 市场状态调整评分门槛（牛市放宽、熊市收紧）
         threshold_map = {"bull": 60, "neutral": 50, "bear": 55}
         hi_threshold = {"bull": 72, "neutral": 65, "bear": 70}
         t_low = threshold_map.get(market_state, 50)
         t_hi = hi_threshold.get(market_state, 65)
 
+        q_str = f"（质量加成{q_bonus:+d}，有效{es}）" if q_bonus else ""
+
         # 3+共振：过热风险，降级处理
         if r >= 3:
             item.grade = "淘汰"
-            item.reject_reason = f"{r}策略共振→过热见顶风险（回测{r}共振10天-2.07%胜率27%）"
+            item.reject_reason = f"{r}策略共振→过热见顶风险（回测共振因子IC-0.0316有效负向）"
             return
 
-        # 单策略高评分：回测最稳健，提升评级
-        if r == 1 and s >= t_hi:
+        # 单策略高质量+高评分：回测最优组合，提升评级
+        if r == 1 and es >= t_hi:
             item.grade = "A"
-            item.reason = f"单策略+高评分{s}（回测单策略最稳健+1.22%），数据支持重点参与"
+            item.reason = f"单策略+有效评分{es}{q_str}，重点参与"
             item.position_pct = self.GRADE_POSITION["A"][0]
-        elif r == 2 and s >= t_hi:
+        elif r == 2 and es >= t_hi:
             item.grade = "B"
-            item.reason = f"{r}策略共振+高评分{s}，趋势确认"
+            item.reason = f"{r}策略共振+有效评分{es}{q_str}，趋势确认"
             item.position_pct = self.GRADE_POSITION["B"][0]
-        elif s >= t_hi:
+        elif es >= t_hi:
             item.grade = "B"
-            item.reason = f"评分{s}达标，可逢低建仓"
+            item.reason = f"有效评分{es}{q_str}达标，可逢低建仓"
             item.position_pct = self.GRADE_POSITION["B"][0]
-        elif s >= t_low:
+        elif es >= t_low:
             item.grade = "C"
-            item.reason = f"评分{s}中性，小仓试探"
+            item.reason = f"有效评分{es}{q_str}中性，小仓试探"
             item.position_pct = self.GRADE_POSITION["C"][0]
         else:
             item.grade = "淘汰"
-            item.reject_reason = f"评分{s}<{t_low}（{market_state}市场门槛）"
+            item.reject_reason = f"有效评分{es}<{t_low}（{market_state}市场门槛）{q_str}"
             return
         item.action = {"A": "重点买入", "B": "逢低建仓", "C": "小仓试探/观望"}.get(item.grade, "")
 
@@ -354,11 +417,12 @@ class DecisionEngine:
         return kept
 
     def _top_by_momentum_bonus(self, pool: dict[str, list[str]], n: int) -> dict[str, list[str]]:
-        """按"动量分位(0-100) + 共振bonus(每策略+10)"统一排序取前n。
+        """按"动量分位(0-100) + 策略质量bonus"统一排序取前n。
 
-        纯量价计算不依赖财报，毫秒级。动量分位用近20日涨幅在全市场排名，
-        让市场来决定谁先进分析池；共振只作确定性bonus（多策略确认），
-        但不足以压制高动量的单策略票（回测单策略收益&胜率双优）。
+        纯量价计算不依赖财报，毫秒级。动量分位用近20日涨幅在全市场排名；
+        策略质量bonus：高质量策略(>40分)正加权，低质量(<40分)负加权，
+        让高位旗形/缩量回踩等优质策略票更容易进分析池，
+        淘汰涨停洗盘/上升趋势跌停等劣质策略票（回测夏普-0.59/-1.03）。
         """
         import sqlite3
         from collections import defaultdict
@@ -386,7 +450,9 @@ class DecisionEngine:
 
             scored = {}
             for sym, strats in pool.items():
-                scored[sym] = _pctile(all_mom.get(sym, 0)) + (len(strats) - 1) * 10
+                # 策略质量bonus：(质量分-40)/3，高质量正加权，低质量负加权
+                q_bonus = sum((STRATEGY_QUALITY.get(st, 40) - 40) / 3 for st in strats)
+                scored[sym] = _pctile(all_mom.get(sym, 0)) + q_bonus
             ranked = sorted(pool.keys(), key=lambda x: -scored.get(x, -999))[:n]
             return {k: pool[k] for k in ranked}
         except Exception as e:
@@ -491,6 +557,7 @@ class DecisionEngine:
         return {
             "symbol": item.symbol, "name": item.name, "grade": item.grade,
             "resonance": item.resonance, "hit_strategies": item.hit_strategies,
+            "strategy_quality": item.strategy_quality,
             "score": item.score, "action": item.action, "price": item.price,
             "stop_loss": item.stop_loss, "target": item.target,
             "position_pct": item.position_pct, "shares": item.shares, "capital": item.capital,
