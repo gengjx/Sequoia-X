@@ -307,6 +307,46 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
     return series
 
 
+def compute_composite_score(
+    df: pd.DataFrame, weights: dict[str, float] | None = None,
+) -> pd.Series:
+    """计算多因子综合得分序列（每日一个分，用于回测信号）。
+
+    流程：compute_factor_series → 横截面排名(单股内时序百分位) → IC加权合成。
+    注意：严格横截面排名需要全市场快照，这里用单股时序百分位近似
+    （该股当前因子值在自身历史中的位置），回测信号够用。
+
+    Args:
+        df: OHLCV DataFrame
+        weights: 因子权重，None=默认IC权重
+
+    Returns:
+        pd.Series：每日综合因子分（0-100），越高越值得买
+    """
+    if len(df) < 60:
+        return pd.Series(0.0, index=df.index)
+
+    series = compute_factor_series(df)
+    if not series:
+        return pd.Series(0.0, index=df.index)
+
+    from sequoia_x.strategy.multi_factor import _DEFAULT_FACTOR_WEIGHTS
+    weights = weights or _DEFAULT_FACTOR_WEIGHTS
+    valid = {k: v for k, v in weights.items() if k in series}
+    if not valid:
+        return pd.Series(0.0, index=df.index)
+
+    # 单股时序百分位排名（rolling rank近似横截面）
+    total_w = sum(abs(v) for v in valid.values())
+    composite = pd.Series(0.0, index=df.index)
+    for fname, w in valid.items():
+        # 时序百分位：当前值在过去252日的排名位置(0-1)
+        pct = series[fname].rolling(252, min_periods=20).rank(pct=True) * 100
+        composite += pct.fillna(50) * (abs(w) / total_w)
+    return composite
+
+
+
 
 # ══════════════════════════════════════════════════════════════════
 # 因子IC评估引擎

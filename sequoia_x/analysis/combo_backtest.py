@@ -31,7 +31,7 @@ logger = get_logger(__name__)
 # 策略信号 → 计算函数名 映射
 SIGNAL_FUNCS = {
     "ma_volume", "turtle", "pullback", "bottom", "rps",
-    "flag", "shakeout", "limit_down",
+    "flag", "shakeout", "limit_down", "multi_factor",
 }
 
 # 策略显示名
@@ -39,6 +39,7 @@ STRATEGY_LABELS = {
     "ma_volume": "均线放量", "turtle": "海龟突破", "pullback": "缩量回踩",
     "bottom": "底部放量", "rps": "RPS强势",
     "flag": "高位旗形", "shakeout": "涨停洗盘", "limit_down": "上升趋势跌停",
+    "multi_factor": "多因子选股",
 }
 
 
@@ -172,6 +173,16 @@ def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
         signals["limit_down"] = uptrend_ld & limit_down & vol_surge_ld
     else:
         signals["limit_down"] = pd.Series(False, index=df.index)
+
+    # 多因子选股：综合因子分Top20%分位 = 触发信号
+    try:
+        from sequoia_x.analysis.factor import compute_composite_score
+        composite = compute_composite_score(df)
+        # 滚动分位：综合分进入自身历史前20%时触发
+        threshold = composite.rolling(120, min_periods=60).quantile(0.8)
+        signals["multi_factor"] = composite >= threshold
+    except Exception:
+        signals["multi_factor"] = pd.Series(False, index=df.index)
 
     return signals
 
