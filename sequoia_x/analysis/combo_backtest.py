@@ -1,14 +1,23 @@
-"""组合历史回测引擎：向量化解算策略信号 + 持有期收益对比。
+"""组合历史回测引擎：向量化解算策略信号 + 持有期收益对比（含A股交易成本）。
 
 核心思路：对每只股票预计算策略信号序列（布尔），统计信号触发后的持有期收益，
-横向对比各组合的实战效果（平均收益/胜率/夏普/样本数）。
+横向对比各组合的实战效果（净收益/毛收益/成本侵蚀/胜率/夏普/样本数）。
 
-为控制耗时，采用采样：随机抽取 N 只股票 × 多个持有期窗口。
+成本模型（A股标准，往返双边口径）：
+  往返成本 = 佣金(万2.5双边) + 印花税(千1卖出) + 过户费(万0.1双边) + 滑点(2bp双边)
+  约 0.35%。短线持有期(5日)成本侵蚀显著，裸价收益会严重高估策略表现。
+
+因子评价（Rank IC）：
+  - 共振度因子IC：把"多策略共振数"作为连续因子，算与持有期收益的Spearman秩相关，
+    验证决策中枢"共振→超额收益"的核心假设（IC>0.02且单调递增方为有效）。
+  - 策略独立IC：每个策略信号(布尔)与持有期收益的秩相关，衡量该策略相对其他策略
+    的选股预测力（IC>0表示选出的股票优于策略池平均）。
 """
 
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -24,6 +33,57 @@ SIGNAL_FUNCS = {
     "ma_volume", "turtle", "pullback", "bottom", "rps",
 }
 
+# 策略显示名
+STRATEGY_LABELS = {
+    "ma_volume": "均线放量", "turtle": "海龟突破", "pullback": "缩量回踩",
+    "bottom": "底部放量", "rps": "RPS强势",
+}
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """A股交易成本模型。
+
+    费率按单边定义，往返（买+卖）自动×2（佣金/过户费/滑点）；
+    印花税仅卖出单边（2023.8起调整为千1）。
+    默认券商主流费率，可经 UI 调整。
+
+    Attributes:
+        commission_rate: 佣金率，默认万2.5（双边）。
+        stamp_duty_rate: 印花税率，默认千1（仅卖出）。
+        transfer_fee_rate: 过户费率，默认万0.1（双边，沪市）。
+        slippage_rate: 滑点率，默认2bp（双边，保守估计）。
+    """
+
+    commission_rate: float = 0.00025
+    stamp_duty_rate: float = 0.001
+    transfer_fee_rate: float = 0.00001
+    slippage_rate: float = 0.0002
+
+    def round_trip_cost(self) -> float:
+        """单次往返（买+卖）总成本率。"""
+        return (
+            self.commission_rate * 2
+            + self.stamp_duty_rate
+            + self.transfer_fee_rate * 2
+            + self.slippage_rate * 2
+        )
+
+
+DEFAULT_COST = CostModel()
+
+
+def _ic_assessment(ic_mean: float) -> str:
+    """单值 IC 有效性评级（panel 整体秩相关口径）。"""
+    if ic_mean >= 0.05:
+        return "强正向"
+    if ic_mean >= 0.02:
+        return "有效正向"
+    if ic_mean <= -0.05:
+        return "强负向"
+    if ic_mean <= -0.02:
+        return "有效负向"
+    return "区分力不足"
 
 def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
     """计算所有策略的逐日信号序列（布尔，True=当天触发）。
@@ -82,39 +142,59 @@ def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
 
 
 class ComboBacktester:
-    """组合历史回测器。"""
+    """组合历史回测器（含A股交易成本）。
 
-    def __init__(self, engine: DataEngine, settings: Settings) -> None:
+    Attributes:
+        engine: DataEngine 实例。
+        settings: Settings 实例。
+        cost: CostModel，交易成本模型，默认 A股主流费率。
+    """
+
+    def __init__(self, engine: DataEngine, settings: Settings, cost: CostModel | None = None) -> None:
         self.engine = engine
         self.settings = settings
+        self.cost = cost or DEFAULT_COST
 
     def run(
         self, combos: dict[str, list[str]], hold_days: list[int] | None = None,
         sample_size: int = 500, seed: int = 42,
     ) -> dict:
-        """回测多个组合，返回横向对比报告。"""
+        """回测多个组合，返回横向对比报告（含净/毛收益与策略IC）。"""
         hold_days = hold_days or [5, 10, 20]
-        strategy_returns = self._collect_returns(hold_days, sample_size, seed)
-        processed = strategy_returns.pop("__processed__", 0)
+        collected = self._collect_returns(hold_days, sample_size, seed)
+        strategy_returns = collected["returns"]
+        processed = collected["processed"]
 
         results = []
         for combo_name, skeys in combos.items():
             valid_keys = [k for k in skeys if k in SIGNAL_FUNCS]
             for h in hold_days:
-                all_rets: list[float] = []
+                nets: list[float] = []
+                gross: list[float] = []
                 for k in valid_keys:
-                    all_rets.extend(strategy_returns.get(k, {}).get(h, []))
+                    pair = strategy_returns.get(k, {}).get(h, ([], []))
+                    nets.extend(pair[0])
+                    gross.extend(pair[1])
                 results.append({
                     "combo": combo_name, "hold_days": h,
-                    **self._stats(all_rets),
+                    **self._stats(nets, gross),
                 })
-        return {"combos": results, "sample_size": processed}
+
+        # 策略独立 IC（panel 整体秩相关：该策略触发 vs 其他策略触发的收益差异）
+        strategy_ic = self._strategy_panel_ic(strategy_returns, hold_days)
+
+        return {
+            "combos": results, "sample_size": processed,
+            "strategy_ic": strategy_ic,
+            "round_trip_cost_pct": round(self.cost.round_trip_cost() * 100, 3),
+        }
 
     def run_resonance(self, hold_days: list[int] | None = None,
                       sample_size: int = 500, seed: int = 42) -> dict:
         """共振度分档回测：统计不同共振度（1/2/3+）下的持有期收益。
 
         核心验证：多策略共振是否真能带来超额收益（决策中枢定级矩阵的基础假设）。
+        同时计算共振度因子 Rank IC（验证"共振度→收益"的单调有效性）。
         """
         hold_days = hold_days or [5, 10, 20]
         symbols = self.engine.get_local_symbols()
@@ -123,11 +203,13 @@ class ComboBacktester:
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"共振回测：采样 {len(symbols)} 只股票")
 
-        # {共振度档位: {hold: [收益率]}}
-        bands = {"1": {h: [] for h in hold_days},
-                 "2": {h: [] for h in hold_days},
-                 "3+": {h: [] for h in hold_days}}
+        bands = {"1": {h: ([], []) for h in hold_days},
+                 "2": {h: ([], []) for h in hold_days},
+                 "3+": {h: ([], []) for h in hold_days}}
+        # 共振因子 IC 采样：(共振度, 净收益)，按持有期分桶
+        factor_samples: dict[int, list[tuple[int, float]]] = {h: [] for h in hold_days}
         processed = 0
+        rtc = self.cost.round_trip_cost()
 
         for symbol in symbols:
             try:
@@ -138,22 +220,25 @@ class ComboBacktester:
                 signals = _compute_signals(df)
                 if not signals:
                     continue
-                # 计算每日共振度（同时命中几个策略）
                 sig_df = pd.DataFrame({k: v.fillna(False) for k, v in signals.items()})
-                resonance_count = sig_df.sum(axis=1)  # 每日共振数
+                resonance_count = sig_df.sum(axis=1)
+                close = df["close"]
                 for h in hold_days:
                     for idx in resonance_count.index:
-                        rc = resonance_count.iloc[idx]
+                        rc = int(resonance_count.iloc[idx])
                         if rc == 0 or idx >= len(df) - h - 1:
                             continue
-                        entry = df["close"].iloc[idx]
-                        exit_p = df["close"].iloc[idx + h]
+                        entry = close.iloc[idx]
+                        exit_p = close.iloc[idx + h]
                         if entry <= 0:
                             continue
-                        ret = exit_p / entry - 1
+                        gross = exit_p / entry - 1
+                        net = gross - rtc
                         band = "3+" if rc >= 3 else str(rc)
                         if band in bands:
-                            bands[band][h].append(ret)
+                            bands[band][h][0].append(net)
+                            bands[band][h][1].append(gross)
+                        factor_samples[h].append((rc, net))
                 processed += 1
             except Exception:
                 continue
@@ -162,20 +247,46 @@ class ComboBacktester:
         results = []
         for band in ["1", "2", "3+"]:
             for h in hold_days:
+                nets, gross = bands[band][h]
                 results.append({"resonance": band, "hold_days": h,
-                                **self._stats(bands[band][h])})
-        return {"resonance": results, "sample_size": processed}
+                                **self._stats(nets, gross)})
+
+        # 共振度因子 IC（每个持有期一组）
+        resonance_ic = []
+        for h in hold_days:
+            samples = factor_samples[h]
+            ic = self._panel_ic([s[0] for s in samples], [s[1] for s in samples])
+            ic["hold_days"] = h
+            resonance_ic.append(ic)
+
+        # 单调性检验：10日持有期下各档净收益是否随共振度递增
+        main = {r["resonance"]: r for r in results if r["hold_days"] == 10}
+        order = ["1", "2", "3+"]
+        rets_10 = [main[b]["avg_return"] for b in order if b in main]
+        monotonic = (
+            len(rets_10) >= 2 and
+            all(rets_10[i] <= rets_10[i + 1] for i in range(len(rets_10) - 1))
+        )
+
+        return {
+            "resonance": results, "sample_size": processed,
+            "resonance_ic": resonance_ic,
+            "monotonic_10d": monotonic,
+            "round_trip_cost_pct": round(rtc * 100, 3),
+        }
 
     def _collect_returns(self, hold_days: list[int], sample_size: int,
                          seed: int) -> dict:
-        """采集每个策略的触发点收益（共享数据采集循环）。"""
+        """采集每个策略的触发点收益（共享数据采集循环），含净/毛双口径。"""
         symbols = self.engine.get_local_symbols()
         if sample_size and len(symbols) > sample_size:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"组合回测：采样 {len(symbols)} 只股票，持有期 {hold_days}")
 
-        strategy_returns: dict = {skey: {h: [] for h in hold_days} for skey in SIGNAL_FUNCS}
+        strategy_returns: dict = {
+            skey: {h: ([], []) for h in hold_days} for skey in SIGNAL_FUNCS
+        }
         processed = 0
         for symbol in symbols:
             try:
@@ -188,44 +299,98 @@ class ComboBacktester:
                     continue
                 for skey, sig in signals.items():
                     for h in hold_days:
-                        rets = self._forward_returns(df, sig, h)
-                        strategy_returns[skey][h].extend(rets)
+                        nets, gross = self._forward_returns(df, sig, h)
+                        strategy_returns[skey][h][0].extend(nets)
+                        strategy_returns[skey][h][1].extend(gross)
                 processed += 1
             except Exception:
                 continue
         logger.info(f"组合回测：处理 {processed}/{len(symbols)} 只")
-        strategy_returns["__processed__"] = processed
-        return strategy_returns
+        return {"returns": strategy_returns, "processed": processed}
 
     @staticmethod
-    def _forward_returns(df: pd.DataFrame, signal: pd.Series, hold: int) -> list[float]:
-        """计算信号触发后的持有期前向收益。"""
+    def _forward_returns(df: pd.DataFrame, signal: pd.Series, hold: int) -> tuple[list[float], list[float]]:
+        """计算信号触发后的持有期收益（净/毛双口径）。
+
+        Returns:
+            (净收益列表, 毛收益列表)。净收益 = 毛收益 - 往返成本率。
+        """
         close = df["close"]
-        rets: list[float] = []
+        net_rets: list[float] = []
+        gross_rets: list[float] = []
         sig = signal.fillna(False)
         max_i = len(df) - hold - 1
-        # 遍历触发点，计算持有期收益
+        rtc = DEFAULT_COST.round_trip_cost()
         for i in sig.index[sig]:
             if i >= max_i:
                 continue
             entry = close.iloc[i]
             exit_p = close.iloc[i + hold]
             if entry > 0:
-                rets.append(exit_p / entry - 1)
-        return rets
+                gross = exit_p / entry - 1
+                gross_rets.append(gross)
+                net_rets.append(gross - rtc)
+        return net_rets, gross_rets
 
     @staticmethod
-    def _stats(returns: list[float]) -> dict:
-        if not returns:
-            return {"avg_return": 0, "win_rate": 0, "count": 0, "sharpe": 0}
-        arr = np.array(returns)
-        avg = float(arr.mean()) * 100
-        win = float((arr > 0).mean()) * 100
-        std = float(arr.std())
+    def _stats(net_returns: list[float], gross_returns: list[float]) -> dict:
+        """统计净/毛收益、成本侵蚀、胜率、夏普。"""
+        if not net_returns:
+            return {"avg_return": 0, "gross_return": 0, "cost_drag": 0,
+                    "win_rate": 0, "count": 0, "sharpe": 0}
+        n = np.array(net_returns)
+        g = np.array(gross_returns) if gross_returns else n
+        avg = float(n.mean()) * 100          # 净收益
+        gavg = float(g.mean()) * 100         # 毛收益
+        win = float((n > 0).mean()) * 100
+        std = float(n.std())
         sharpe = float(avg / std) if std > 0 else 0
         return {
-            "avg_return": round(avg, 2),
+            "avg_return": round(avg, 2),       # 净收益（扣成本后）
+            "gross_return": round(gavg, 2),    # 毛收益（裸价）
+            "cost_drag": round(gavg - avg, 2), # 成本侵蚀
             "win_rate": round(win, 1),
-            "count": len(arr),
+            "count": len(n),
             "sharpe": round(sharpe, 2),
         }
+
+    @staticmethod
+    def _panel_ic(factor: list, target: list) -> dict:
+        """整体 Spearman 秩相关 IC（panel 口径，所有样本合并）。"""
+        f = pd.Series(factor)
+        t = pd.Series(target)
+        valid = pd.concat([f, t], axis=1).dropna()
+        if len(valid) < 30:
+            return {"ic_mean": 0.0, "n": int(len(valid)), "assessment": "样本不足"}
+        ic = float(valid.iloc[:, 0].rank().corr(valid.iloc[:, 1].rank()))
+        return {
+            "ic_mean": round(ic, 4),
+            "n": int(len(valid)),
+            "assessment": _ic_assessment(ic),
+        }
+
+    def _strategy_panel_ic(self, strategy_returns: dict, hold_days: list[int]) -> list[dict]:
+        """每个策略的独立 IC：该策略触发样本 vs 全策略池样本的收益秩相关。
+
+        构造方式：对每个持有期，把所有策略触发点合并，标记"是否本策略触发"(0/1)，
+        与净收益做 Spearman 秩相关。IC>0 表示该策略选出的股票优于策略池平均。
+        """
+        out = []
+        for h in hold_days:
+            for skey in SIGNAL_FUNCS:
+                nets = strategy_returns.get(skey, {}).get(h, ([], []))[0]
+                if len(nets) < 30:
+                    continue
+                # 构造：本策略触发=1，其余策略触发=0，与净收益做秩相关
+                others = [r for sk in SIGNAL_FUNCS if sk != skey
+                          for r in strategy_returns.get(sk, {}).get(h, ([], []))[0]]
+                factor = [1] * len(nets) + [0] * len(others)
+                target = nets + others
+                ic = self._panel_ic(factor, target)
+                out.append({
+                    "strategy": skey,
+                    "label": STRATEGY_LABELS.get(skey, skey),
+                    "hold_days": h,
+                    **ic,
+                })
+        return out

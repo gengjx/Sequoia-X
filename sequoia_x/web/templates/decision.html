@@ -170,11 +170,11 @@ function renderResonance(data) {
     items.forEach(c => { (bands[c.resonance] = bands[c.resonance] || []).push(c); });
     const holdDays = [...new Set(items.map(c=>c.hold_days))].sort((a,b)=>a-b);
     const bandOrder = ['1','2','3+'];
+    const rtc = data.round_trip_cost_pct || 0.19;
 
-    let html = '<div class="card mb-4 border-warning"><div class="card-header fw-bold text-warning"><i class="bi bi-diagram-2"></i> 共振度分档回测（采样'+data.sample_size+'只）</div><div class="card-body">';
-    html += '<div class="alert alert-light border small mb-3"><i class="bi bi-lightbulb"></i> 验证决策中枢核心假设：<strong>多策略共振是否真能带来超额收益？</strong></div>';
+    let html = '<div class="card mb-4 border-warning"><div class="card-header fw-bold text-warning"><i class="bi bi-diagram-2"></i> 共振度分档回测（采样'+data.sample_size+'只 · 扣成本'+rtc+'%/笔）</div><div class="card-body">';
+    html += '<div class="alert alert-light border small mb-3"><i class="bi bi-lightbulb"></i> 验证决策中枢核心假设：<strong>多策略共振是否真能带来超额收益？</strong> 净收益已扣A股往返交易成本。</div>';
 
-    // 柱状图：取10天持有期对比
     const main10 = bandOrder.map(b => bands[b]?.find(i=>i.hold_days===10)).filter(Boolean);
     const maxRet = Math.max(...main10.map(c=>Math.abs(c.avg_return)), 1);
     html += '<div class="mb-3">';
@@ -186,18 +186,17 @@ function renderResonance(data) {
             <span style="width:90px" class="text-end me-2">${label}</span>
             <div class="flex-grow-1 bg-light rounded" style="height:22px;position:relative">
                 <div class="rounded d-flex align-items-center justify-content-end ${pos?'bg-danger':'bg-success'}" style="width:${Math.max(w,5)}%;height:22px">
-                    <span class="text-white small px-1">${c.avg_return>=0?'+':''}${c.avg_return}%</span>
+                    <span class="text-white small px-1">净${c.avg_return>=0?'+':''}${c.avg_return}%</span>
                 </div>
             </div>
-            <span class="ms-2 text-muted" style="width:60px">胜率${c.win_rate}%</span>
-            <span class="text-muted" style="width:60px">样本${c.count}</span>
+            <span class="ms-2 text-muted" style="width:75px" title="毛收益">毛${c.gross_return}%</span>
+            <span class="text-muted" style="width:55px">胜率${c.win_rate}%</span>
         </div>`;
     });
     html += '</div>';
 
-    // 详细表
     html += '<div class="table-responsive"><table class="table table-sm table-hover small mb-0"><thead class="table-light"><tr><th>共振度</th>';
-    holdDays.forEach(h => html += `<th>${h}天收益</th><th>胜率</th><th>样本</th>`);
+    holdDays.forEach(h => html += `<th>${h}天净收益</th><th>毛收益</th><th>成本</th><th>胜率</th><th>样本</th>`);
     html += '</tr></thead><tbody>';
     bandOrder.forEach(b => {
         if (!bands[b]) return;
@@ -206,12 +205,20 @@ function renderResonance(data) {
         holdDays.forEach(h => {
             const it = bands[b].find(i=>i.hold_days===h) || {};
             const cls = (it.avg_return||0)>=0?'text-danger':'text-success';
-            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
+            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td class="text-muted">${it.gross_return||0}%</td><td class="text-warning">${it.cost_drag||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
         });
         html += '</tr>';
     });
     html += '</tbody></table></div>';
-    html += '<div class="alert alert-warning small mt-2 mb-0"><i class="bi bi-exclamation-triangle"></i> <strong>关键发现：</strong>若3+共振收益转负/胜率下降，说明多重信号共振在A股常为过热见顶信号（非越共振越好），决策定级需警惕"共振陷阱"。基于历史回测，不代表未来。</div>';
+
+    if (data.resonance_ic && data.resonance_ic.length) {
+        const ic10 = data.resonance_ic.find(i=>i.hold_days===10) || data.resonance_ic[0];
+        const mono = data.monotonic_10d;
+        const col = ic10.ic_mean > 0.02 ? 'success' : (ic10.ic_mean < -0.02 ? 'danger' : 'secondary');
+        html += `<div class="alert alert-${col} small mt-2 mb-1"><i class="bi bi-activity"></i> <strong>共振度因子IC（10日）= ${ic10.ic_mean}</strong>（n=${ic10.n}，${ic10.assessment}）。单调性：<strong>${mono?'成立（共振越多收益越高）':'不成立（高共振≠高收益，警惕过热见顶）'}</strong>。</div>`;
+    }
+
+    html += '<div class="alert alert-warning small mt-1 mb-0"><i class="bi bi-exclamation-triangle"></i> <strong>关键发现：</strong>若3+共振收益转负/胜率下降，说明多重信号共振在A股常为过热见顶信号（非越共振越好），决策定级需警惕"共振陷阱"。基于历史回测，不代表未来。</div>';
     html += '</div></div>';
     document.getElementById('backtest-result').innerHTML = html;
 }
@@ -227,19 +234,17 @@ async function backtestCombos() {
 
 function renderBacktest(data) {
     const combos = data.combos || [];
-    // 按组合分组
     const groups = {};
     combos.forEach(c => { (groups[c.combo] = groups[c.combo] || []).push(c); });
     const holdDays = [...new Set(combos.map(c=>c.hold_days))].sort((a,b)=>a-b);
     const names = Object.keys(groups);
+    const rtc = data.round_trip_cost_pct || 0.19;
     const maxRet = Math.max(...combos.map(c=>Math.abs(c.avg_return)), 1);
 
-    let html = '<div class="card mb-4 border-info"><div class="card-header fw-bold text-info"><i class="bi bi-graph-up-arrow"></i> 组合历史回测对比（采样'+data.sample_size+'只）</div><div class="card-body">';
-    // 柱状图（纯CSS）
+    let html = '<div class="card mb-4 border-info"><div class="card-header fw-bold text-info"><i class="bi bi-graph-up-arrow"></i> 组合历史回测对比（采样'+data.sample_size+'只 · 扣成本'+rtc+'%/笔）</div><div class="card-body">';
     html += '<div class="mb-3">';
     names.forEach(name => {
         const items = groups[name];
-        // 取10天持有期做主对比
         const main = items.find(i=>i.hold_days===10) || items[0];
         const w = Math.abs(main.avg_return) / maxRet * 100;
         const pos = main.avg_return >= 0;
@@ -248,26 +253,39 @@ function renderBacktest(data) {
             <div class="flex-grow-1 bg-light rounded" style="height:18px;position:relative">
                 <div class="rounded ${pos?'bg-danger':'bg-success'}" style="width:${w}%;height:18px"></div>
             </div>
-            <span class="ms-2 fw-bold ${pos?'text-danger':'text-success'}" style="width:80px">${main.avg_return>=0?'+':''}${main.avg_return}%</span>
-            <span class="text-muted ms-1" style="width:55px">胜率${main.win_rate}%</span>
+            <span class="ms-2 fw-bold ${pos?'text-danger':'text-success'}" style="width:80px">净${main.avg_return>=0?'+':''}${main.avg_return}%</span>
+            <span class="text-muted ms-1" style="width:70px" title="毛收益${main.gross_return}%">毛${main.gross_return}%</span>
         </div>`;
     });
     html += '</div>';
-    // 详细表格
     html += '<div class="table-responsive"><table class="table table-sm table-hover small mb-0"><thead class="table-light"><tr><th>组合</th>';
-    holdDays.forEach(h => html += `<th>${h}天收益</th><th>胜率</th><th>样本</th>`);
+    holdDays.forEach(h => html += `<th>${h}天净收益</th><th>毛收益</th><th>成本</th><th>胜率</th><th>样本</th>`);
     html += '</tr></thead><tbody>';
     names.forEach(name => {
         html += `<tr><td class="fw-bold">${name}</td>`;
         holdDays.forEach(h => {
             const it = groups[name].find(i=>i.hold_days===h) || {};
             const cls = it.avg_return>=0?'text-danger':'text-success';
-            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
+            html += `<td class="${cls} fw-bold">${(it.avg_return||0)>=0?'+':''}${it.avg_return||0}%</td><td class="text-muted">${it.gross_return||0}%</td><td class="text-warning">${it.cost_drag||0}%</td><td>${it.win_rate||0}%</td><td class="text-muted">${it.count||0}</td>`;
         });
         html += '</tr>';
     });
     html += '</tbody></table></div>';
-    html += '<p class="text-muted small mt-2 mb-0"><i class="bi bi-info-circle"></i> 收益=持有期正收益(红正绿负)；胜率=盈利交易占比；夏普越高风险调整后收益越好。基于历史数据回测，不代表未来收益。</p>';
+
+    if (data.strategy_ic && data.strategy_ic.length) {
+        const sic = data.strategy_ic.filter(i=>i.hold_days===10);
+        if (sic.length) {
+            html += '<div class="mt-3"><div class="fw-bold small text-secondary mb-1"><i class="bi bi-award"></i> 策略独立选股IC（10日持有 · IC>0.02为有效alpha）</div>';
+            html += '<table class="table table-sm table-hover small mb-0"><thead class="table-light"><tr><th>策略</th><th>IC</th><th>样本</th><th>评价</th></tr></thead><tbody>';
+            sic.sort((a,b)=>b.ic_mean-a.ic_mean).forEach(s => {
+                const col = s.ic_mean>0.02?'success':(s.ic_mean<-0.02?'danger':'muted');
+                html += `<tr><td class="fw-bold">${s.label}</td><td class="text-${col} fw-bold">${s.ic_mean}</td><td class="text-muted">${s.n}</td><td>${s.assessment}</td></tr>`;
+            });
+            html += '</tbody></table></div>';
+        }
+    }
+
+    html += '<p class="text-muted small mt-2 mb-0"><i class="bi bi-info-circle"></i> 净收益=持有期收益扣A股往返成本；毛收益=裸价收益；IC=Spearman秩相关(>0.02有效)。基于历史数据回测，不代表未来收益。</p>';
     html += '</div></div>';
     document.getElementById('backtest-result').innerHTML = html;
 }
