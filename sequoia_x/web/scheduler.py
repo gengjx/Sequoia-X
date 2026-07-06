@@ -27,6 +27,7 @@ class AuctionScheduler:
     # 定时任务表：(hour, minute, task_name)
     SCHEDULE = [
         (9, 25, "auction_scan"),
+        (9, 30, "intraday_scan_start"),  # 启动盘中轮询
         (18, 0, "sync_daily"),
         (18, 30, "auction_verify"),
     ]
@@ -83,6 +84,8 @@ class AuctionScheduler:
             self._sync_daily()
         elif task == "auction_verify":
             self._auction_verify()
+        elif task == "intraday_scan_start":
+            self._intraday_loop()
 
     def _auction_scan(self) -> None:
         """竞价扫描 + 飞书推送。"""
@@ -121,3 +124,31 @@ class AuctionScheduler:
                 logger.info(f"竞价验证跳过：{result.get('msg', '无新数据')}")
         except Exception as e:
             logger.warning(f"竞价T+1验证失败：{e!r}")
+
+    def _intraday_loop(self) -> None:
+        """盘中信号轮询：9:30-15:00 每60秒扫描关注池。"""
+        from sequoia_x.analysis.intraday_scanner import IntradayScanner
+        from sequoia_x.notify.feishu import FeishuNotifier
+        try:
+            scanner = IntradayScanner(self.db_path)
+            notifier = FeishuNotifier(self.settings)
+            count = 0
+            while not self._stop.is_set():
+                now = datetime.now()
+                # 仅交易时段 9:30-11:30 / 13:00-15:00
+                hour_min = now.hour * 100 + now.minute
+                in_session = (930 <= hour_min <= 1130) or (1300 <= hour_min <= 1500)
+                if not in_session:
+                    if hour_min > 1500:
+                        break  # 收盘退出
+                    self._stop.wait(60)
+                    continue
+                try:
+                    signals = scanner.scan_once(notifier=notifier)
+                    count += len(signals)
+                except Exception as e:
+                    logger.warning(f"盘中扫描异常：{e!r}")
+                self._stop.wait(60)  # 每60秒一轮
+            logger.info(f"盘中轮询结束，累计推送信号 {count} 个")
+        except Exception as e:
+            logger.warning(f"盘中轮询启动失败：{e!r}")

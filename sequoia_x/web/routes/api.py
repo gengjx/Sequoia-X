@@ -460,6 +460,28 @@ async def minute_data(request: Request, symbol: str, date: str | None = None):
     return {"symbol": symbol, "count": len(df), "rows": df.to_dict("records") if not df.empty else []}
 
 
+# ---------------------------------------------------------------------------
+# 盘中实时信号
+# ---------------------------------------------------------------------------
+
+@router.post("/intraday/scan")
+async def intraday_scan(request: Request, push: bool = False):
+    """手动触发一次盘中信号扫描（9:30-15:00有效）。"""
+    from sequoia_x.analysis.intraday_scanner import IntradayScanner
+    from sequoia_x.notify.feishu import FeishuNotifier
+    engine = request.app.state.engine
+    settings = request.app.state.settings
+    scanner = IntradayScanner(engine.db_path)
+    notifier = FeishuNotifier(settings) if push else None
+    signals = scanner.scan_once(notifier=notifier)
+    return {"count": len(signals), "signals": [
+        {"symbol": s.symbol, "name": s.name, "type": s.signal_type,
+         "price": s.price, "detail": s.detail, "severity": s.severity, "ts": s.ts}
+        for s in signals
+    ]}
+
+
+
 
 # ---------------------------------------------------------------------------
 # 集合竞价
