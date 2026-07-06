@@ -445,6 +445,25 @@ async def auction_history(request: Request, date: str | None = None, limit: int 
     return {"rows": rows, "count": len(rows)}
 
 
+@router.post("/auction/verify")
+async def auction_verify(request: Request, auction_date: str | None = None):
+    """触发竞价T+1命中验证。"""
+    from sequoia_x.analysis.auction import AuctionScanner
+    engine = request.app.state.engine
+    scanner = AuctionScanner(engine.db_path)
+    return scanner.verify_t1(auction_date=auction_date)
+
+
+@router.get("/auction/verify/detail")
+async def auction_verify_detail(request: Request, limit: int = 100):
+    """查询验证明细。"""
+    from sequoia_x.analysis.auction import AuctionScanner
+    engine = request.app.state.engine
+    scanner = AuctionScanner(engine.db_path)
+    rows = scanner.get_verify_detail(limit=limit)
+    return {"rows": rows, "count": len(rows)}
+
+
 @router.post("/auction/scan")
 async def auction_scan(request: Request, top_n: int = 50, push: bool = False):
     """手动触发竞价扫描（竞价时段9:25后有效，非竞价时段返回实时行情近似）。"""

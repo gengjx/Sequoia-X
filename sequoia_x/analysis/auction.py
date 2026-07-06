@@ -45,6 +45,22 @@ CREATE TABLE IF NOT EXISTS auction_snap (
 );
 """
 
+_CREATE_VERIFY_SQL = """
+CREATE TABLE IF NOT EXISTS auction_verify (
+    verify_date      TEXT    NOT NULL,
+    auction_date     TEXT    NOT NULL,
+    grade            TEXT    NOT NULL,
+    symbol           TEXT    NOT NULL,
+    name             TEXT,
+    score            REAL,
+    t1_return        REAL,    -- T+1 涨跌幅%
+    t5_return        REAL,    -- T+5 累计涨跌幅%
+    is_win           INTEGER, -- T+1 是否盈利
+    created_at       TEXT,
+    PRIMARY KEY (verify_date, symbol)
+);
+"""
+
 
 @dataclass
 class AuctionItem:
@@ -80,7 +96,9 @@ class AuctionScanner:
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_AUCTION_SQL)
+            conn.execute(_CREATE_VERIFY_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_auction_date ON auction_snap(date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_verify_auction ON auction_verify(auction_date)")
             conn.commit()
 
     def _fetch_spot(self) -> list[dict]:
@@ -361,6 +379,141 @@ class AuctionScanner:
         except Exception as e:
             logger.warning(f"竞价推送失败：{e!r}")
             return {"status": "error", "msg": str(e)}
+
+    def verify_t1(self, auction_date: str | None = None) -> dict:
+        """验证竞价命中率：算竞价日次日的收益（T+1）及5日收益（T+5）。
+
+        用日K相邻close比算涨跌幅（后复权相邻日比值=真实涨跌，口径一致）。
+        竞价价是真实价，但验证不看绝对价格，只看次日方向，故用涨跌幅避免复权口径问题。
+
+        Args:
+            auction_date: 指定竞价日验证；None=验证所有未验证的竞价日
+        Returns:
+            {verified, summary: {grade: {count, win_rate, avg_t1, avg_t5}}}
+        """
+        import pandas as pd
+
+        # 找需验证的竞价日
+        with sqlite3.connect(self.db_path) as conn:
+            if auction_date:
+                auctions = conn.execute(
+                    "SELECT date, symbol, name, grade, score FROM auction_snap WHERE date=?",
+                    (auction_date,),
+                ).fetchall()
+                dates_to_verify = [auction_date]
+            else:
+                # 所有竞价日，排除已验证的
+                all_dates = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT date FROM auction_snap ORDER BY date"
+                ).fetchall()]
+                verified = set(r[0] for r in conn.execute(
+                    "SELECT DISTINCT auction_date FROM auction_verify"
+                ).fetchall())
+                dates_to_verify = [d for d in all_dates if d not in verified]
+                if not dates_to_verify:
+                    return {"verified": 0, "summary": {}, "msg": "所有竞价日已验证"}
+                auctions = conn.execute(
+                    f"SELECT date, symbol, name, grade, score FROM auction_snap "
+                    f"WHERE date IN ({','.join('?'*len(dates_to_verify))})",
+                    dates_to_verify,
+                ).fetchall()
+
+        if not auctions:
+            return {"verified": 0, "summary": {}, "msg": "无竞价记录可验证"}
+
+        # 取日K，按symbol分组找竞价日后N日的收盘价
+        verified_rows: list[tuple] = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with sqlite3.connect(self.db_path) as conn:
+            # 全市场交易日后序列（用于找T+1/T+5）
+            trade_dates = [r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM stock_daily ORDER BY date"
+            ).fetchall()]
+
+            for a_date, symbol, name, grade, score in auctions:
+                if a_date not in trade_dates:
+                    continue  # 竞价日无日K数据（可能未同步）
+                idx = trade_dates.index(a_date)
+                # T+1 = 竞价日的次日
+                if idx + 1 >= len(trade_dates):
+                    continue  # 次日还没数据，跳过
+                next_date = trade_dates[idx + 1]
+                row_cur = conn.execute(
+                    "SELECT close FROM stock_daily WHERE symbol=? AND date=?",
+                    (symbol, a_date),
+                ).fetchone()
+                row_next = conn.execute(
+                    "SELECT close FROM stock_daily WHERE symbol=? AND date=?",
+                    (symbol, next_date),
+                ).fetchone()
+                if not row_cur or not row_next or not row_cur[0]:
+                    continue
+                t1_ret = round((row_next[0] / row_cur[0] - 1) * 100, 2)
+                # T+5
+                t5_ret = None
+                if idx + 6 < len(trade_dates):
+                    t5_date = trade_dates[idx + 5]
+                    row_t5 = conn.execute(
+                        "SELECT close FROM stock_daily WHERE symbol=? AND date=?",
+                        (symbol, t5_date),
+                    ).fetchone()
+                    if row_t5 and row_t5[0]:
+                        t5_ret = round((row_t5[0] / row_cur[0] - 1) * 100, 2)
+
+                verified_rows.append((
+                    next_date, a_date, grade, symbol, name, score,
+                    t1_ret, t5_ret, int(t1_ret > 0), now,
+                ))
+
+        if not verified_rows:
+            return {"verified": 0, "summary": {},
+                    "msg": f"竞价日 {dates_to_verify} 次日日K尚未就绪，需数据同步后验证"}
+
+        # 落库
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO auction_verify "
+                "(verify_date, auction_date, grade, symbol, name, score, "
+                "t1_return, t5_return, is_win, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                verified_rows,
+            )
+            conn.commit()
+
+        summary = self._verify_summary()
+        logger.info(f"竞价T+1验证完成：{len(verified_rows)}条，竞价日{dates_to_verify}")
+        return {"verified": len(verified_rows), "dates": dates_to_verify, "summary": summary}
+
+    def _verify_summary(self) -> dict:
+        """汇总各分级命中率统计。"""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT grade, COUNT(*), SUM(is_win), AVG(t1_return), AVG(t5_return) "
+                "FROM auction_verify GROUP BY grade"
+            ).fetchall()
+        result = {}
+        for grade, cnt, wins, avg_t1, avg_t5 in rows:
+            result[grade] = {
+                "count": cnt,
+                "win_rate": round(wins / cnt * 100, 1) if cnt else 0,
+                "avg_t1": round(avg_t1 or 0, 2),
+                "avg_t5": round(avg_t5 or 0, 2),
+            }
+        return result
+
+    def get_verify_detail(self, limit: int = 100) -> list[dict]:
+        """查询验证明细记录。"""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT verify_date, auction_date, grade, symbol, name, score, "
+                "t1_return, t5_return, is_win FROM auction_verify "
+                "ORDER BY verify_date DESC, score DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        cols = ["verify_date", "auction_date", "grade", "symbol", "name", "score",
+                "t1", "t5", "win"]
+        return [dict(zip(cols, r)) for r in rows]
 
     def get_history(self, date: str | None = None, limit: int = 50) -> list[dict]:
         """查询历史竞价记录。"""

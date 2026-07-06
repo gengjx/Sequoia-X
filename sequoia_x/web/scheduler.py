@@ -28,6 +28,7 @@ class AuctionScheduler:
     SCHEDULE = [
         (9, 25, "auction_scan"),
         (18, 0, "sync_daily"),
+        (18, 30, "auction_verify"),
     ]
 
     def __init__(self, settings: Settings, db_path: str) -> None:
@@ -80,6 +81,8 @@ class AuctionScheduler:
             self._auction_scan()
         elif task == "sync_daily":
             self._sync_daily()
+        elif task == "auction_verify":
+            self._auction_verify()
 
     def _auction_scan(self) -> None:
         """竞价扫描 + 飞书推送。"""
@@ -103,3 +106,18 @@ class AuctionScheduler:
             logger.info(f"定时数据同步完成：写入 {n} 只")
         except Exception as e:
             logger.warning(f"定时数据同步失败：{e!r}")
+
+    def _auction_verify(self) -> None:
+        """竞价T+1命中验证（数据同步后执行）。"""
+        from sequoia_x.analysis.auction import AuctionScanner
+        try:
+            scanner = AuctionScanner(self.db_path)
+            result = scanner.verify_t1()
+            verified = result.get("verified", 0)
+            summary = result.get("summary", {})
+            if verified:
+                logger.info(f"竞价T+1验证完成：{verified}条，命中率 {summary}")
+            else:
+                logger.info(f"竞价验证跳过：{result.get('msg', '无新数据')}")
+        except Exception as e:
+            logger.warning(f"竞价T+1验证失败：{e!r}")

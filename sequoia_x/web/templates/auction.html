@@ -16,6 +16,9 @@
         <option value="50" selected>Top50</option>
         <option value="100">Top100</option>
     </select>
+    <button class="btn btn-outline-info" onclick="doVerify()">
+        <i class="bi bi-check2-circle"></i> T+1验证
+    </button>
     <span class="text-muted small ms-2" id="scan-status"></span>
 </div>
 
@@ -76,6 +79,40 @@
                         </tr>
                     </thead>
                     <tbody id="auction-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-3" id="verify-card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-graph-up-arrow"></i> 竞价命中回测（T+1/T+5）</span>
+        <span class="text-muted small" id="verify-info"></span>
+    </div>
+    <div class="card-body">
+        <div id="verify-empty" class="text-center text-muted py-4">
+            <i class="bi bi-clipboard-data" style="font-size:2rem"></i>
+            <p class="mt-2">暂无验证数据。盘后18:30自动验证，或点击「T+1验证」手动触发。</p>
+        </div>
+        <div id="verify-summary" class="row g-3 mb-3" style="display:none"></div>
+        <div id="verify-detail-wrapper" style="display:none">
+            <div class="table-responsive">
+                <table class="table table-sm table-hover">
+                    <thead class="table-light">
+                        <tr>
+                            <th>竞价日</th>
+                            <th>验证日</th>
+                            <th>评级</th>
+                            <th>代码</th>
+                            <th>名称</th>
+                            <th class="text-end">评分</th>
+                            <th class="text-end">T+1%</th>
+                            <th class="text-end">T+5%</th>
+                            <th>结果</th>
+                        </tr>
+                    </thead>
+                    <tbody id="verify-detail-body"></tbody>
                 </table>
             </div>
         </div>
@@ -143,6 +180,68 @@ function renderAuction(data) {
     }).join('');
     document.getElementById('auction-empty').style.display = 'none';
     document.getElementById('auction-table-wrapper').style.display = 'block';
+}
+
+async function doVerify() {
+    const status = document.getElementById('scan-status');
+    status.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 验证中...';
+    try {
+        const r = await fetch('/api/auction/verify', {method:'POST'});
+        const data = await r.json();
+        renderVerify(data);
+        status.textContent = data.verified ? `验证${data.verified}条` : (data.msg || '无需验证');
+    } catch (e) {
+        showToast('验证失败: ' + e.message, 'error');
+        status.textContent = '';
+    }
+}
+
+function renderVerify(data) {
+    const summary = data.summary || {};
+    if (!Object.keys(summary).length) {
+        document.getElementById('verify-empty').style.display = 'block';
+        return;
+    }
+    document.getElementById('verify-empty').style.display = 'none';
+    document.getElementById('verify-info').textContent = `已验证 ${data.verified || ''} 条`;
+
+    const gc = {'A':'success', 'B':'info', '风险':'danger'};
+    const html = Object.entries(summary).map(([grade, s]) => {
+        const winColor = s.win_rate >= 50 ? 'text-success' : 'text-danger';
+        return `<div class="col-md-4">
+            <div class="card"><div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <span class="badge bg-${gc[grade]||'secondary'}">${grade}级</span>
+                    <span class="small text-muted">${s.count}条</span>
+                </div>
+                <div class="fs-4 fw-bold ${winColor} mt-1">${s.win_rate}%</div>
+                <div class="small text-muted">胜率 | 均T+1 ${s.avg_t1>0?'+':''}${s.avg_t1}% | T+5 ${s.avg_t5>0?'+':''}${s.avg_t5}%</div>
+            </div></div>
+        </div>`;
+    }).join('');
+    document.getElementById('verify-summary').innerHTML = html;
+    document.getElementById('verify-summary').style.display = 'flex';
+    loadVerifyDetail();
+}
+
+async function loadVerifyDetail() {
+    try {
+        const { rows } = await api('/api/auction/verify/detail?limit=50');
+        if (!rows.length) return;
+        const tbody = document.getElementById('verify-detail-body');
+        tbody.innerHTML = rows.map(r => `<tr>
+            <td>${r.auction_date}</td>
+            <td>${r.verify_date}</td>
+            <td><span class="badge bg-${r.grade==='A'?'success':(r.grade==='B'?'info':'danger')}">${r.grade}</span></td>
+            <td><code>${r.symbol}</code></td>
+            <td>${r.name}</td>
+            <td class="text-end">${r.score}</td>
+            <td class="text-end ${r.t1>=0?'text-danger':'text-success'}">${r.t1>0?'+':''}${r.t1}%</td>
+            <td class="text-end ${r.t5>=0?'text-danger':'text-success'}">${r.t5!==null?(r.t5>0?'+':'')+r.t5+'%':'-'}</td>
+            <td>${r.win ? '<span class="text-danger">盈</span>' : '<span class="text-success">亏</span>'}</td>
+        </tr>`).join('');
+        document.getElementById('verify-detail-wrapper').style.display = 'block';
+    } catch(e) { /* 忽略 */ }
 }
 
 async function loadHistory() {
