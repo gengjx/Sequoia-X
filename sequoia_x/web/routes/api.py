@@ -135,6 +135,14 @@ async def strategy_evaluate(request: Request):
     return await asyncio.to_thread(services.evaluate_strategies)
 
 
+@router.get("/strategy/optimal-combos")
+async def optimal_combos(request: Request):
+    """网格搜索最优策略组合（数据驱动，约5-10秒）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.find_optimal_combos)
+
+
 @router.get("/strategy/weights")
 async def strategy_weights(request: Request):
     """读取当前策略质量权重快照（来自策略评估引擎最近一次刷新）。"""

@@ -556,6 +556,15 @@ class WebServices:
         """读取DB中的策略权重快照（前端展示当前权重+更新时间）。"""
         return self.engine.load_strategy_weights()
 
+    def find_optimal_combos(self, hold_days: int = 20, sample_size: int = 500,
+                            max_strategies: int = 5, top_n: int = 10) -> dict:
+        """网格搜索最优策略组合（数据驱动，替代主观预设）。"""
+        ev = StrategyEvaluator(self.engine, self.settings)
+        return ev.find_optimal_combos(
+            hold_days=hold_days, sample_size=sample_size,
+            max_strategies=max_strategies, top_n=top_n,
+        )
+
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker
     # ------------------------------------------------------------------

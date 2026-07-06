@@ -352,3 +352,97 @@ class StrategyEvaluator:
 
         score = (0.40 * s_sharpe + 0.25 * s_dd + 0.20 * s_alpha + 0.15 * s_pl)
         return int(round(max(0, min(100, score))))
+
+
+    # ------------------------------------------------------------------
+    # 最优组合搜索（数据驱动，替代主观预设）
+    # ------------------------------------------------------------------
+    def find_optimal_combos(
+        self, hold_days: int = DEFAULT_HOLD, sample_size: int = 500,
+        max_strategies: int = 5, top_n: int = 10, seed: int = 42,
+    ) -> dict:
+        """网格搜索最优策略组合（数据驱动，替代主观预设）。
+
+        遍历所有策略子集（C(8,1)~C(8,max_strategies)），对每个组合：
+          - 把子集策略的月度信号收益按月聚合为组合净值
+          - 计算年化收益、最大回撤、夏普、卡玛比率
+          - 按卡玛比率排序（兼顾收益与抗风险，比纯年化更实战）
+
+        一次采集N种组合复用，不重复计算I/O。
+
+        Args:
+            hold_days: 持有期（天），默认20（约月频）。
+            sample_size: 采样股票数。
+            max_strategies: 单组合最多策略数（限制复杂度，防过拟合）。
+            top_n: 返回前N个最优组合。
+            seed: 随机种子（可复现）。
+        """
+        from itertools import combinations
+
+        rtc = self.cost.round_trip_cost()
+        collected = self._collect(hold_days, sample_size, seed)
+        months = collected["months"]
+        strat_monthly = collected["strategy_monthly"]
+        bench_monthly = collected["benchmark_monthly"]
+        processed = collected["processed"]
+
+        # 各策略月度平均收益序列（对齐months）
+        strat_series: dict[str, list[float]] = {}
+        valid_strats = []
+        for skey in SIGNAL_FUNCS:
+            series = self._monthly_mean(strat_monthly.get(skey, {}), months)
+            if any(series):  # 有触发的策略才参与搜索
+                strat_series[skey] = series
+                valid_strats.append(skey)
+
+        # 基准
+        bench_series = self._monthly_mean(bench_monthly, months)
+        bench_curve = self._cumulative_curve(bench_series)
+        bench_annual = self._annualized(bench_curve)
+
+        # 网格搜索所有子集
+        all_combos = []
+        for size in range(1, min(max_strategies, len(valid_strats)) + 1):
+            for combo in combinations(valid_strats, size):
+                # 组合月度收益 = 子集策略等权平均（去重后，同一只票同月多策略只算一份均权）
+                combo_monthly = []
+                for i in range(len(months)):
+                    vals = [strat_series[s][i] for s in combo if not np.isnan(strat_series[s][i])]
+                    combo_monthly.append(float(np.mean(vals)) if vals else 0.0)
+
+                curve = self._cumulative_curve(combo_monthly)
+                annual = self._annualized(curve)
+                dd = self._max_drawdown(curve)
+                sharpe = self._sharpe(combo_monthly)
+                calmar = self._calmar(annual, dd)
+                win_rate = self._win_rate(combo_monthly)
+
+                all_combos.append({
+                    "strategies": list(combo),
+                    "labels": [STRATEGY_LABELS.get(s, s) for s in combo],
+                    "size": size,
+                    "annual_return": round(annual, 2),
+                    "max_drawdown": round(dd, 2),
+                    "sharpe": round(sharpe, 2),
+                    "calmar": round(calmar, 2),
+                    "win_rate": round(win_rate, 1),
+                    "alpha": round(annual - bench_annual, 2),
+                    "curve": [round(v, 4) for v in curve],
+                })
+
+        # 按卡玛排序（卡玛=年化/|回撤|，兼顾收益与抗风险）
+        all_combos.sort(key=lambda x: x["calmar"], reverse=True)
+        top = all_combos[:top_n]
+
+        logger.info(f"组合搜索：{len(all_combos)}种组合 → Top{top_n}（卡玛最优）")
+
+        return {
+            "combos": top,
+            "total_searched": len(all_combos),
+            "months": months,
+            "hold_days": hold_days,
+            "sample_size": processed,
+            "round_trip_cost_pct": round(rtc * 100, 3),
+            "benchmark_annual": round(bench_annual, 2),
+            "benchmark_curve": [round(v, 4) for v in bench_curve],
+        }
