@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+{% block title %}集合竞价 - Sequoia-X{% endblock %}
+{% block content %}
+<h2 class="mb-3"><i class="bi bi-alarm"></i> 集合竞价选股</h2>
+<p class="text-muted">9:25竞价撮合后自动扫描全市场，5维评分（涨幅30%/量比25%/成交额20%/昨封板15%/板块共振10%）。调度器每日09:25自动触发，飞书推送A级标的。</p>
+
+<div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
+    <button class="btn btn-primary" id="btn-scan" onclick="doScan(false)">
+        <i class="bi bi-search"></i> 手动扫描
+    </button>
+    <button class="btn btn-success" onclick="doScan(true)">
+        <i class="bi bi-send"></i> 扫描+飞书推送
+    </button>
+    <select class="form-select form-select-sm" style="width:auto" id="topn-select">
+        <option value="30">Top30</option>
+        <option value="50" selected>Top50</option>
+        <option value="100">Top100</option>
+    </select>
+    <span class="text-muted small ms-2" id="scan-status"></span>
+</div>
+
+<div class="row g-3 mb-3" id="summary-cards" style="display:none">
+    <div class="col-md-3">
+        <div class="card text-white bg-success"><div class="card-body py-2">
+            <div class="small">A级 强势竞价</div>
+            <div class="fs-3 fw-bold" id="cnt-a">0</div>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-white bg-info"><div class="card-body py-2">
+            <div class="small">B级 标准竞价</div>
+            <div class="fs-3 fw-bold" id="cnt-b">0</div>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-white bg-danger"><div class="card-body py-2">
+            <div class="small">风险竞价</div>
+            <div class="fs-3 fw-bold" id="cnt-risk">0</div>
+        </div></div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-light"><div class="card-body py-2">
+            <div class="small text-muted">扫描日期</div>
+            <div class="fs-4" id="cnt-date">-</div>
+        </div></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-trophy"></i> 竞价强度榜</span>
+        <button class="btn btn-outline-secondary btn-sm" onclick="loadHistory()">
+            <i class="bi bi-clock-history"></i> 历史记录
+        </button>
+    </div>
+    <div class="card-body">
+        <div id="auction-empty" class="text-center text-muted py-5">
+            <i class="bi bi-alarm" style="font-size:2.5rem"></i>
+            <p class="mt-2">暂无竞价数据。点击「手动扫描」或在交易时段09:25后自动生成。</p>
+        </div>
+        <div id="auction-table-wrapper" style="display:none">
+            <div class="table-responsive">
+                <table class="table table-sm table-hover">
+                    <thead class="table-light">
+                        <tr>
+                            <th>评级</th>
+                            <th>代码</th>
+                            <th>名称</th>
+                            <th class="text-end">评分</th>
+                            <th class="text-end">高开%</th>
+                            <th class="text-end">量比</th>
+                            <th class="text-end">成交额(亿)</th>
+                            <th>昨涨停</th>
+                            <th>板块</th>
+                            <th>信号</th>
+                        </tr>
+                    </thead>
+                    <tbody id="auction-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function doScan(push) {
+    const topn = document.getElementById('topn-select').value;
+    const status = document.getElementById('scan-status');
+    const btn = document.getElementById('btn-scan');
+    status.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 扫描中...';
+    btn.disabled = true;
+    try {
+        const r = await fetch(`/api/auction/scan?top_n=${topn}&push=${push}`, {method:'POST'});
+        const data = await r.json();
+        if (data.error) {
+            showToast('扫描失败: ' + data.error, 'error');
+            status.textContent = '';
+            return;
+        }
+        renderAuction(data);
+        status.textContent = `完成 ${data.count}只`;
+        if (push && data.push && data.push.status === 'ok') {
+            showToast('已推送飞书', 'success');
+        }
+    } catch (e) {
+        showToast('扫描失败: ' + e.message, 'error');
+        status.textContent = '';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderAuction(data) {
+    document.getElementById('cnt-a').textContent = data.grade_a || 0;
+    document.getElementById('cnt-b').textContent = data.grade_b || 0;
+    document.getElementById('cnt-risk').textContent = data.grade_risk || 0;
+    document.getElementById('cnt-date').textContent = data.date || '-';
+    document.getElementById('summary-cards').style.display = 'flex';
+
+    const tbody = document.getElementById('auction-body');
+    if (!data.items || data.items.length === 0) {
+        document.getElementById('auction-empty').style.display = 'block';
+        document.getElementById('auction-table-wrapper').style.display = 'none';
+        return;
+    }
+    tbody.innerHTML = data.items.map(i => {
+        const gc = i.grade === 'A' ? 'success' : (i.grade === 'B' ? 'info' : 'danger');
+        const lim = i.y_limit ? '<span class="badge bg-warning text-dark">涨停</span>' : '';
+        return `<tr>
+            <td><span class="badge bg-${gc}">${i.grade}</span></td>
+            <td><a href="/stock-analysis?code=${i.symbol}" class="text-decoration-none"><code>${i.symbol}</code></a></td>
+            <td>${i.name}</td>
+            <td class="text-end fw-bold">${i.score}</td>
+            <td class="text-end ${i.pct > 9.5 ? 'text-danger' : (i.pct >= 5 ? 'text-warning' : 'text-success')}">${i.pct > 0 ? '+' : ''}${i.pct}%</td>
+            <td class="text-end">${i.vr}</td>
+            <td class="text-end">${i.amount_yi}</td>
+            <td>${lim}</td>
+            <td class="small text-muted">${i.board || '-'}</td>
+            <td class="small">${i.signal}</td>
+        </tr>`;
+    }).join('');
+    document.getElementById('auction-empty').style.display = 'none';
+    document.getElementById('auction-table-wrapper').style.display = 'block';
+}
+
+async function loadHistory() {
+    try {
+        const { rows } = await api('/api/auction/history?limit=50');
+        if (rows.length === 0) {
+            showToast('暂无历史竞价记录', 'info');
+            return;
+        }
+        renderHistory(rows);
+    } catch (e) {
+        showToast('加载历史失败', 'error');
+    }
+}
+
+function renderHistory(rows) {
+    document.getElementById('cnt-a').textContent = rows.filter(r => r.grade === 'A').length;
+    document.getElementById('cnt-b').textContent = rows.filter(r => r.grade === 'B').length;
+    document.getElementById('cnt-risk').textContent = rows.filter(r => r.grade === '风险').length;
+    document.getElementById('cnt-date').textContent = rows[0]?.date || '-';
+    document.getElementById('summary-cards').style.display = 'flex';
+    const tbody = document.getElementById('auction-body');
+    tbody.innerHTML = rows.map(i => {
+        const gc = i.grade === 'A' ? 'success' : (i.grade === 'B' ? 'info' : 'danger');
+        return `<tr>
+            <td><span class="badge bg-${gc}">${i.grade}</span></td>
+            <td><code>${i.symbol}</code></td>
+            <td>${i.name}</td>
+            <td class="text-end fw-bold">${i.score}</td>
+            <td class="text-end">${i.pct > 0 ? '+' : ''}${i.pct}%</td>
+            <td class="text-end">${i.vr}</td>
+            <td class="text-end">${i.amt}</td>
+            <td>${i.y_lim ? '<span class="badge bg-warning text-dark">涨停</span>' : ''}</td>
+            <td class="small text-muted">${i.board || '-'}</td>
+            <td class="small">${i.signal}</td>
+        </tr>`;
+    }).join('');
+    document.getElementById('auction-empty').style.display = 'none';
+    document.getElementById('auction-table-wrapper').style.display = 'block';
+}
+</script>
+{% endblock %}

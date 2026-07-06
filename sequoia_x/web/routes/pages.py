@@ -56,6 +56,15 @@ async def stocks_page(request: Request):
     )
 
 
+@router.get("/auction")
+async def auction_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="auction.html",
+        context={},
+    )
+
+
 @router.get("/system")
 async def system_page(request: Request):
     templates = request.app.state.templates

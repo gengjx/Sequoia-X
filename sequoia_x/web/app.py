@@ -50,4 +50,10 @@ def create_app() -> FastAPI:
         logging.getLogger("sequoia_x").addHandler(handler)
         app.state.log_handler = handler
 
+        # 启动后台调度器（竞价扫描 09:25 / 数据同步 18:00）
+        from sequoia_x.web.scheduler import AuctionScheduler
+        scheduler = AuctionScheduler(settings, engine.db_path)
+        scheduler.start()
+        app.state.scheduler = scheduler
+
     return app

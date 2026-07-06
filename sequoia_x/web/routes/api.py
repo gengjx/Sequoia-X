@@ -429,3 +429,30 @@ async def import_decision_holdings(body: HoldingImport, request: Request):
 async def push_positions_feishu(request: Request):
     services = request.app.state.services
     return services.push_positions_feishu()
+
+
+# ---------------------------------------------------------------------------
+# 集合竞价
+# ---------------------------------------------------------------------------
+
+@router.get("/auction/history")
+async def auction_history(request: Request, date: str | None = None, limit: int = 50):
+    """查询历史竞价记录。"""
+    from sequoia_x.analysis.auction import AuctionScanner
+    engine = request.app.state.engine
+    scanner = AuctionScanner(engine.db_path)
+    rows = scanner.get_history(date=date, limit=limit)
+    return {"rows": rows, "count": len(rows)}
+
+
+@router.post("/auction/scan")
+async def auction_scan(request: Request, top_n: int = 50, push: bool = False):
+    """手动触发竞价扫描（竞价时段9:25后有效，非竞价时段返回实时行情近似）。"""
+    from sequoia_x.analysis.auction import AuctionScanner
+    from sequoia_x.notify.feishu import FeishuNotifier
+    engine = request.app.state.engine
+    settings = request.app.state.settings
+    scanner = AuctionScanner(engine.db_path)
+    notifier = FeishuNotifier(settings) if push else None
+    result = scanner.scan(top_n=top_n, push=push, notifier=notifier)
+    return result
