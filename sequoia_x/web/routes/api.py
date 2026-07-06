@@ -432,6 +432,36 @@ async def push_positions_feishu(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# 分钟K线
+# ---------------------------------------------------------------------------
+
+@router.get("/minute/watchlist")
+async def minute_watchlist(request: Request):
+    """查询关注池（竞价A+持仓）。"""
+    from sequoia_x.analysis.minute import build_watchlist
+    engine = request.app.state.engine
+    return {"symbols": build_watchlist(engine.db_path)}
+
+
+@router.post("/minute/collect")
+async def minute_collect(request: Request, klt: int = 1, days: int = 1):
+    """采集关注池全量分钟K线并落库。"""
+    from sequoia_x.analysis.minute import MinuteCollector
+    engine = request.app.state.engine
+    collector = MinuteCollector(engine.db_path)
+    return collector.collect_watchlist(klt=klt, days=days)
+
+
+@router.get("/minute/{symbol}")
+async def minute_data(request: Request, symbol: str, date: str | None = None):
+    """查询单只股票分钟K线。"""
+    engine = request.app.state.engine
+    df = engine.get_minute_klines(symbol, date=date)
+    return {"symbol": symbol, "count": len(df), "rows": df.to_dict("records") if not df.empty else []}
+
+
+
+# ---------------------------------------------------------------------------
 # 集合竞价
 # ---------------------------------------------------------------------------
 

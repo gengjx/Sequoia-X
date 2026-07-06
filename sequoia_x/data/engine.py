@@ -30,6 +30,21 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_MINUTE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_minute (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol   TEXT    NOT NULL,
+    datetime TEXT    NOT NULL,
+    open     REAL,
+    high     REAL,
+    low      REAL,
+    close    REAL,
+    volume   REAL,
+    amount   REAL,
+    UNIQUE (symbol, datetime)
+);
+"""
+
 _CREATE_HOLDING_SQL = """
 CREATE TABLE IF NOT EXISTS portfolio_holding (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +135,8 @@ class DataEngine:
             conn.execute(_CREATE_HOLDING_SQL)
             conn.execute(_CREATE_WEIGHTS_SQL)
             conn.execute(_CREATE_FACTOR_WEIGHTS_SQL)
+            conn.execute(_CREATE_MINUTE_SQL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_sym_dt ON stock_minute(symbol, datetime)")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -513,3 +530,39 @@ class DataEngine:
             except (ValueError, TypeError):
                 continue
         return out
+
+    def save_minute_klines(self, rows: list[dict]) -> int:
+        """批量写入分钟K线（UPSERT）。"""
+        if not rows:
+            return 0
+        sql = ("INSERT OR REPLACE INTO stock_minute "
+               "(symbol, datetime, open, high, low, close, volume, amount) "
+               "VALUES (?,?,?,?,?,?,?,?)")
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(sql, [(
+                r["symbol"], r["datetime"], r["open"], r["high"],
+                r["low"], r["close"], r["volume"], r["amount"],
+            ) for r in rows])
+            conn.commit()
+        return len(rows)
+
+    def get_minute_klines(self, symbol: str, date: str | None = None) -> pd.DataFrame:
+        """读取分钟K线。date=None 取最新一天。"""
+        with sqlite3.connect(self.db_path) as conn:
+            if date:
+                df = pd.read_sql_query(
+                    "SELECT * FROM stock_minute WHERE symbol=? AND datetime LIKE ? ORDER BY datetime",
+                    conn, params=(symbol, f"{date}%"),
+                )
+            else:
+                df = pd.read_sql_query(
+                    "SELECT * FROM stock_minute WHERE symbol=? ORDER BY datetime DESC LIMIT 240",
+                    conn, params=(symbol,),
+                )
+                if not df.empty:
+                    latest_date = str(df.iloc[0]["datetime"])[:10]
+                    df = pd.read_sql_query(
+                        "SELECT * FROM stock_minute WHERE symbol=? AND datetime LIKE ? ORDER BY datetime",
+                        conn, params=(symbol, f"{latest_date}%"),
+                    )
+        return df
