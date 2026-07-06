@@ -3,7 +3,7 @@
 {% block content %}
 <div class="mb-3">
     <h2 class="mb-1"><i class="bi bi-list-check"></i> 交易决策中枢</h2>
-    <p class="text-muted mb-0">勾选策略 → 多策略选股汇总 → 六层评分过滤 → 共振定级 → 仓位分配，输出可执行买卖清单</p>
+    <p class="text-muted mb-0">多策略选股 → 六层评分 → 因子质量定级 → ATR仓位分配，输出可执行买卖清单（含30因子IC加权量化选股）</p>
 </div>
 
 <div class="card mb-4">
@@ -118,23 +118,24 @@ function selectAll(checked) { document.querySelectorAll('.strat-cb').forEach(cb 
 // 5种实战组合（基于策略互补性+实测数据设计）
 // 数据驱动组合（基于策略评估引擎网格搜索218种子集 + 卡玛排序，497只×30月实测）
 // 替代主观预设——所有配置均来自回测数据，定期重跑评估自动刷新
+// 数据驱动组合（基于策略评估引擎497只×30月实测，卡玛排序）
 const COMBOS = [
+    {id:'multifactor', icon:'🧠', name:'量化优选', color:'dark',
+     strategies:['multi_factor'], minScore:50,
+     market:'全天候首选，回测卡玛1.20全场最高（年化19%回撤仅16%）',
+     logic:'30因子IC加权选股，夏普0.83全场最高，因子分散化降风险，量化核心组合'},
     {id:'optimal', icon:'🥇', name:'数据最优', color:'success',
      strategies:['pullback','bottom','flag'], minScore:55,
-     market:'全天候首选，回测卡玛1.08最高（年化12%回撤仅11%）',
-     logic:'缩量回踩+底部放量(减震器)+高位旗形(收益发动机)，风控最优组合'},
+     market:'规则式最优组合，卡玛1.08（年化12%回撤仅11%）',
+     logic:'缩量回踩+底部放量(减震器)+高位旗形(收益发动机)，规则式风控最优'},
     {id:'momentum', icon:'📈', name:'收益进攻', color:'danger',
      strategies:['flag'], minScore:60,
      market:'牛市/强结构行情，追求最高绝对收益',
      logic:'高位旗形单策略，回测唯一跑赢基准(+0.87% alpha)，年化20.92%'},
-    {id:'balanced', icon:'⚖️', name:'均衡稳健', color:'primary',
-     strategies:['pullback','flag'], minScore:55,
-     market:'攻守兼备，收益与回撤平衡',
-     logic:'缩量回踩(风控)+高位旗形(收益)，回测年化16%回撤17%，卡玛0.95'},
-    {id:'growth', icon:'🌱', name:'成长突破', color:'info',
-     strategies:['bottom','flag','rps'], minScore:55,
-     market:'成长风格，底部反转+强势确认',
-     logic:'底部放量+高位旗形+RPS强势，回测卡玛1.00，三策略共振确认'},
+    {id:'combined', icon:'🔀', name:'量化+规则', color:'primary',
+     strategies:['multi_factor','flag','pullback'], minScore:55,
+     market:'多因子选股+规则式确认双重过滤',
+     logic:'量化优选(卡玛1.20)+高位旗形(alpha)+缩量回踩(风控)，共振叠加'},
     {id:'custom', icon:'🎯', name:'自定义', color:'warning',
      strategies:[], minScore:50,
      market:'手动勾选下方策略自由组合',
