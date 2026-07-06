@@ -78,6 +78,7 @@
 {% block scripts %}
 <script>
 const STRATEGIES = [
+    {key:'multi_factor', name:'多因子选股', type:'量化'},
     {key:'ma_volume', name:'均线放量', type:'突破'},
     {key:'turtle', name:'海龟突破', type:'突破'},
     {key:'rps', name:'RPS强势', type:'突破'},
@@ -88,10 +89,10 @@ const STRATEGIES = [
     {key:'shakeout', name:'涨停洗盘', type:'特殊'},
     {key:'limit_down', name:'上升趋势跌停', type:'特殊'},
 ];
-const TYPE_COLORS = {'突破':'primary','强势':'danger','低吸':'success','特殊':'warning'};
+const TYPE_COLORS = {'量化':'dark','突破':'primary','强势':'danger','低吸':'success','特殊':'warning'};
 
 // 策略质量分层（与后端 STRATEGY_QUALITY 同步，S最优→D最差）
-const QUALITY_TIER = {
+const QUALITY_TIER = {multi_factor:'S',
     flag:'S', pullback:'A', bottom:'B', dragon:'B', ma_volume:'B',
     rps:'C', turtle:'C', shakeout:'D', limit_down:'D'
 };

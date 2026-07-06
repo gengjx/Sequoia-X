@@ -33,6 +33,7 @@ from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
 from sequoia_x.strategy.dragon_head import DragonHeadStrategy
 from sequoia_x.strategy.bottom_volume import BottomVolumeStrategy
+from sequoia_x.strategy.multi_factor import MultiFactorStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +52,18 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
         ShrinkPullbackStrategy,
         DragonHeadStrategy,
         BottomVolumeStrategy,
+        MultiFactorStrategy,
     ]
 }
 
 STRATEGY_META: dict[str, dict] = {
+    "multi_factor": {
+        "name": "MultiFactor",
+        "name_cn": "多因子选股",
+        "description": "30因子IC加权合成综合分，选全市场Top50（数据驱动，非规则式）",
+        "min_bars": 60,
+        "category": "量化因子",
+    },
     "ma_volume": {
         "name": "MaVolume",
         "name_cn": "均线放量",
