@@ -992,30 +992,35 @@ class MarketAnalyzer:
         }
 
     def _sentiment_score(self, b: dict, sb: dict) -> tuple[int, str]:
-        """恐贪指数：加权 5 个子指标合成 0-100 分。返回 (score, label)。"""
-        # 子指标分项（各自映射到 0-100）
-        # 1. 涨跌停比（20%）
-        lim = b["limit_up"] + b["limit_down"]
-        s1 = (b["limit_up"] / lim * 100) if lim else 50.0
+        """恐贪指数：融合趋势强度 + 短期情绪极端 + 中期结构，合成 0-100 反向情绪分。
 
-        # 2. 涨跌家数比（25%）
-        s2 = b["up_ratio"]
+        与 signal_score（纯盘面顺势强度）的区别：
+          - signal_score 测"今天多强"（顺势，越高越该进攻）
+          - fear_greed 测"情绪温度"（>75极度贪婪=见顶警告，<25极度恐惧=见底机会）
+        故加入逆向成分（短期超买超卖）+ 独立维度（ADL中期趋势），降低与signal_score的共线。
+        """
+        # 1. 趋势成分（20%）：MA20占比，市场中线趋势
+        s_trend = sb.get("ma20_pct", 50.0) if sb else 50.0
 
-        # 3. NH-NL 分位（20%）：净新高占比，-10%~+10% 映射到 0~100
+        # 2. 短期情绪极端（35%，逆向核心）：平均涨跌幅非线性映射
+        # avg_change > +2.5% = 极度贪婪（超买风险），< -2.5% = 极度恐惧（超卖机会）
+        avg_chg = b.get("avg_change", 0)
+        s_extreme = max(0.0, min(100.0, 50.0 + avg_chg * 10.0))
+
+        # 3. NH-NL 结构（20%）：净新高占比，反映突破/破位结构
         if sb and sb.get("nh_nl") is not None:
             decided = b["up"] + b["down"]
             nhnl_pct = sb["nh_nl"] / decided * 100 if decided else 0
-            s3 = max(0.0, min(100.0, (nhnl_pct + 10) / 20 * 100))
+            s_nhnl = max(0.0, min(100.0, (nhnl_pct + 10) / 20 * 100))
         else:
-            s3 = 50.0
+            s_nhnl = 50.0
 
-        # 4. MA20 占比（20%）：直接用百分比
-        s4 = sb.get("ma20_pct", 50.0) if sb else 50.0
+        # 4. ADL 中期趋势（25%）：累积涨跌线近5日变化，独立于当日breadth
+        # adl_recent5 > 0 = 中期资金净流入偏贪婪，< 0 = 中期流出偏恐惧
+        adl_r5 = sb.get("adl_recent5", 0) if sb else 0
+        s_adl = max(0.0, min(100.0, 50.0 + adl_r5 * 0.1))
 
-        # 5. MA60 占比（15%）
-        s5 = sb.get("ma60_pct", 50.0) if sb else 50.0
-
-        score = round(0.20 * s1 + 0.25 * s2 + 0.20 * s3 + 0.20 * s4 + 0.15 * s5)
+        score = round(0.20 * s_trend + 0.35 * s_extreme + 0.20 * s_nhnl + 0.25 * s_adl)
         if score >= 75:
             label = "极度贪婪"
         elif score >= 60:

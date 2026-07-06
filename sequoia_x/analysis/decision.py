@@ -23,22 +23,21 @@ logger = get_logger(__name__)
 
 
 # ------------------------------------------------------------------
-# 策略质量分层（基于 strategy_eval 评估引擎实测数据）
-# 综合维度：夏普(风险调整) + 卡玛(回撤调整) + 选股IC(相对alpha) + 回撤控制
-# ⚠️ 阶段一硬编码，阶段二改为评估引擎定期重评估自动刷新（避免过拟合）
+# 策略质量分层（基于 strategy_eval 评估引擎实测数据，定期刷新写入DB）
+# 综合维度：夏普40%(风险调整) + 回撤25% + alpha20% + 盈亏比15%
+# ⚠️ 评分公式见 strategy_eval._quality_score，不含IC（IC用于因子层评估）
 # ------------------------------------------------------------------
-# 策略质量默认权重（DB无数据时的兜底值，基于一次评估快照）
-# 运行策略评估后会自动刷新写入DB，决策引擎启动时从DB加载最新值
+# 默认权重（DB无数据时的兜底值）；运行策略评估后自动刷新写入DB
 _DEFAULT_STRATEGY_QUALITY: dict[str, int] = {
-    "flag": 85,        # S级 夏普0.68最高，唯一跑赢基准(+0.87% alpha)
-    "pullback": 78,    # A级 IC0.061最强，回撤-19.99%最小，风控最优
+    "flag": 85,        # S级 夏普最高，唯一正alpha
+    "pullback": 78,    # A级 回撤控制最优
     "bottom": 55,      # B级 样本不足保守中性（条件极严格）
     "dragon": 50,      # B级 不支持向量化回测，板块维度有独立价值
-    "ma_volume": 48,   # B级 IC0.034正向选股力，但夏普偏低
-    "rps": 40,         # C级 夏普0.39，但IC-0.054追高风险
-    "turtle": 28,      # C级 夏普-0.37，IC-0.009，选股alpha不足
-    "shakeout": 18,    # D级 夏普-0.59，年化-29.8%
-    "limit_down": 10,  # D级 夏普-1.03，年化-34.8%（最差）
+    "ma_volume": 48,   # B级 夏普偏低但正向选股力
+    "rps": 40,         # C级 追高风险，夏普中等
+    "turtle": 28,      # C级 alpha不足
+    "shakeout": 18,    # D级 夏普为负
+    "limit_down": 10,  # D级 最差
 }
 
 # 运行时动态权重（DecisionEngine.__init__ 从DB加载，覆盖默认值）
@@ -87,6 +86,25 @@ def quality_label(hit_strategies: list[str]) -> str:
     order = ["S", "A", "B", "C", "D"]
     return min(tiers, key=lambda t: order.index(t))
 
+
+
+# 策略互斥组：同组内多个策略同时命中数学上不该发生（若发生说明数据异常或策略边界模糊）
+_STRATEGY_CONFLICTS: list[tuple[str, str, str]] = [
+    ("bottom", "flag", "底部放量(超跌)与高位旗形(新高)走势对立"),
+    ("bottom", "rps", "底部放量(超跌)与RPS强势(新高)走势对立"),
+    ("bottom", "turtle", "底部放量(超跌)与海龟突破(新高)走势对立"),
+    ("pullback", "ma_volume", "缩量回踩(缩量)与均线放量(放量)量能对立"),
+]
+
+
+def detect_strategy_conflicts(strat_keys: list[str]) -> list[str]:
+    """检测命中策略中是否存在互斥组合，返回冲突提示列表。"""
+    key_set = set(strat_keys)
+    conflicts = []
+    for a, b, desc in _STRATEGY_CONFLICTS:
+        if a in key_set and b in key_set:
+            conflicts.append(desc)
+    return conflicts
 
 
 @dataclass
@@ -264,7 +282,7 @@ class DecisionEngine:
                     target=rec.get("target", 0),
                     sub_scores=rec.get("sub_scores", {}),
                     industry=report.get("fundamental", {}).get("industry", ""),
-                    risks=risks_real,
+                    risks=risks_real + detect_strategy_conflicts(strat_names),
                 )
 
                 # 质量过滤

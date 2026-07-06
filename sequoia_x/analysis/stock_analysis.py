@@ -657,10 +657,18 @@ class StockAnalyzer:
         # 子评分（0-100）
         tech_score = tech.get("trend_strength", 50)
 
-        rs_score = 50
-        pct = rs.get("today_percentile")
-        if pct is not None:
-            rs_score = pct
+        # 相对强度：多周期 RPS（120/60/20日涨幅）映射到0-100，反映中长期强度而非单日暴涨
+        # 120日:满分门槛+80%，60日:+50%，20日:+25%（逐级递减权重，重长周期）
+        rs_score = 50.0
+        r120 = rs.get("rps_120_ret")
+        r60 = rs.get("rps_60_ret")
+        r20 = rs.get("rps_20_ret")
+        components = []
+        for ret, ceiling, w in [(r120, 80, 0.5), (r60, 50, 0.3), (r20, 25, 0.2)]:
+            if ret is not None:
+                components.append(min(100, max(0, ret / ceiling * 100)) * w)
+        if components:
+            rs_score = round(sum(components))
 
         market_score = mc.get("market_score", 50)
 

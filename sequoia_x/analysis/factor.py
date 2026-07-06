@@ -98,7 +98,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     factors["mom_52w"] = _ret(close, 250) if len(df) >= 250 else np.nan
     recent_mom = _ret(close, 5)
     prior_mom = (close.iloc[-6] / close.iloc[-11] - 1) * 100 if len(df) >= 11 else np.nan
-    factors["mom_accel"] = recent_mom - prior_mom if prior_mom is not np.nan else np.nan
+    factors["mom_accel"] = (recent_mom - prior_mom) if pd.notna(prior_mom) and pd.notna(recent_mom) else np.nan
 
     # ════════ 反转(4)（取负）════════
     factors["rev_5"] = -factors["mom_5"]
@@ -120,7 +120,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     factors["atr_pct"] = -(atr.iloc[-1] / close.iloc[-1] * 100) if pd.notna(atr.iloc[-1]) and close.iloc[-1] else np.nan
     vol_recent = rets.tail(5).std()
     vol_prior = rets.iloc[-25:-5].std() if len(rets) >= 25 else 0
-    factors["vol_shrink"] = float((vol_prior - vol_recent) / vol_prior * 100) if vol_prior else 0
+    factors["vol_shrink"] = float((vol_prior - vol_recent) / vol_prior * 100) if vol_prior and pd.notna(vol_prior) and pd.notna(vol_recent) else np.nan
     factors["skew"] = -float(rets.tail(20).skew()) if len(rets) >= 20 else np.nan
 
     # ════════ 流动性(4) ════════
@@ -149,9 +149,11 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     factors["vol_shrink_p"] = -float(recent_vol / vol_ma20.iloc[-1]) if pd.notna(vol_ma20.iloc[-1]) and vol_ma20.iloc[-1] else np.nan
     # 旗形收敛：10日振幅/40日振幅（越小越收敛，取负让收敛=高分）
     if len(df) >= 40:
-        range_10 = (high.tail(10).max() - low.tail(10).min()) / low.tail(10).min()
-        range_40 = (high.tail(40).max() - low.tail(40).min()) / low.tail(40).min()
-        factors["flag_tight"] = -float(range_10 / range_40) if range_40 else np.nan
+        lo10 = low.tail(10).min()
+        lo40 = low.tail(40).min()
+        range_10 = (high.tail(10).max() - lo10) / lo10 if lo10 else np.nan
+        range_40 = (high.tail(40).max() - lo40) / lo40 if lo40 else np.nan
+        factors["flag_tight"] = -float(range_10 / range_40) if range_40 and range_40 != 0 and pd.notna(range_40) and pd.notna(range_10) else np.nan
     else:
         factors["flag_tight"] = np.nan
     # 量价共振：涨+放量 = 正，跌+放量=负（简化）
