@@ -231,7 +231,7 @@ class WebServices:
             results = strategy.run()
             record.results = results
             record.status = TaskStatus.DONE
-            self._result_cache[key] = results
+            self._result_cache[key] = (self._data_date(), results)
         except Exception as e:
             record.status = TaskStatus.ERROR
             record.error = str(e)
