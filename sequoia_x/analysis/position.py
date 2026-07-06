@@ -180,27 +180,15 @@ class PositionTracker:
         return {"price": price, "ma10": ma10, "ma20": ma20, "atr": atr, "kline_date": last_date}
 
     @staticmethod
-    def _fetch_real_price(symbol: str) -> float | None:
-        """从东财延迟行情获取真实（不复权）最新价，用于把后复权MA/价格转回真实价空间。
+    def _fetch_quote(symbol: str) -> tuple[float | None, float | None]:
+        """复用 StockAnalyzer 的行情接口，返回 (最新价, 昨收)。"""
+        from sequoia_x.analysis.stock_analysis import StockAnalyzer
+        return StockAnalyzer._fetch_price_quote(symbol)
 
-        持仓跟踪的价格必须用真实价：用户录入的买入价/止损/目标都是真实价，
-        若直接与后复权K线收盘价比较会导致信号误判（如中天科技后复权342 vs 真实50）。
-        """
-        import requests
-        prefix = "1" if symbol.startswith(("6", "5", "9")) else "0"
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
-        try:
-            r = requests.get(
-                "https://push2delay.eastmoney.com/api/qt/stock/get",
-                params={"secid": f"{prefix}.{symbol}", "fields": "f43"},
-                headers=headers, timeout=5,
-            )
-            raw = r.json().get("data", {}).get("f43")
-            if raw:
-                return raw / 100.0
-        except Exception:
-            pass
-        return None
+    def _fetch_real_price(symbol: str) -> float | None:
+        """从东财延迟行情获取真实（不复权）最新价。"""
+        info = PositionTracker._fetch_quote(symbol)
+        return info[0] if info else None
 
     # ------------------------------------------------------------------
     # 核心：单只持仓信号扫描
@@ -223,12 +211,13 @@ class PositionTracker:
             return sig
 
         # 后复权K线价 → 真实价转换（entry/stop/target 均为真实价，须统一空间）
+        # 复权系数用 prev_close(与DB同日真实价) / hfq_price(后复权)，纯系数不混入当日涨跌幅
         hfq_price = q["price"]
-        real_price = self._fetch_real_price(h["symbol"])
+        latest_price, prev_close = self._fetch_quote(h["symbol"])
         price_source = "hfq"
-        if real_price and hfq_price and real_price > 0:
-            ratio = real_price / hfq_price
-            price = round(real_price, 3)
+        if prev_close and hfq_price and prev_close > 0:
+            ratio = prev_close / hfq_price  # 纯复权系数（同日）
+            price = round(latest_price if latest_price else prev_close, 3)  # 展示用实时价
             ma10 = round(q["ma10"] * ratio, 3) if q["ma10"] else 0
             ma20 = round(q["ma20"] * ratio, 3) if q["ma20"] else 0
             atr = round((q["atr"] or h["entry_price"] * 0.03) * ratio, 3)
@@ -267,14 +256,22 @@ class PositionTracker:
             return sig
 
         # ── 规则3：MA防守（跌破MA20清仓）──
+        # 盈利中(r_mult≥1)：优先移动止损锁利，MA20破位降级为减仓，不直接清仓
+        # 浮亏或微利：MA20破位即清仓（趋势反转风控）
         if ma20 > 0 and price < ma20:
-            sig.action = "减仓/清仓"
-            sig.signal_level = "danger"
-            sig.reasons.append(f"现价{price}跌破MA20({ma20})，趋势破位")
-            return sig
+            if r_mult >= 1.0:
+                # 盈利单回踩：仅减仓，继续评估移动止损（不 return）
+                sig.action = "减仓半仓"
+                sig.signal_level = "warn"
+                sig.reasons.append(f"盈利中回踩MA20({ma20})，减仓防守待移动止损确认")
+            else:
+                sig.action = "减仓/清仓"
+                sig.signal_level = "danger"
+                sig.reasons.append(f"现价{price}跌破MA20({ma20})，趋势破位")
+                return sig
 
         # ── 规则4：MA减仓（跌破MA10半仓）──
-        if ma10 > 0 and price < ma10:
+        elif ma10 > 0 and price < ma10:
             sig.action = "减仓半仓"
             sig.signal_level = "warn"
             sig.reasons.append(f"现价{price}跌破MA10({ma10})，短线走弱")

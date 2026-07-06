@@ -134,13 +134,17 @@ class StockAnalyzer:
         report.summary = self._build_summary(report)
 
         # 展示层价格转换：后复权 → 真实市价（技术指标内部不受影响）
+        # 复权系数必须同日口径：用 昨收(f60,与DB最新日同日) / DB后复权收盘
+        # 避免旧bug: 用今日实时价(f43)/昨日复权价 混入当日涨跌幅导致价格失真
         result = report.to_dict()
-        real_price = self._fetch_real_price(symbol)
-        if real_price and report.price > 0:
-            ratio = real_price / report.price
-            if abs(ratio - 1.0) > 0.005:  # 差异 >0.5% 才转换（避免无除权的股票多余请求）
+        latest_price, prev_close = self._fetch_price_quote(symbol)
+        if prev_close and report.price > 0:
+            ratio = prev_close / report.price  # 纯复权系数（同日）
+            if abs(ratio - 1.0) > 0.005:  # 有除权才转换
                 result = self._convert_prices(result, ratio)
-                result["price"] = round(real_price, 2)
+                # 展示价用实时最新价（盘中看盘需要），技术位用复权系数转换
+                display = latest_price if latest_price else prev_close
+                result["price"] = round(display, 2)
                 result["price_source"] = "real"
             else:
                 result["price_source"] = "hfq(无除权)"
@@ -155,11 +159,16 @@ class StockAnalyzer:
     # ------------------------------------------------------------------
     @staticmethod
     def _fetch_real_price(symbol: str) -> float | None:
-        """从东财延迟行情查最新交易日真实（不复权）收盘价，用于展示层。
+        """从东财延迟行情查最新真实（不复权）价，用于展示层。"""
+        info = StockAnalyzer._fetch_price_quote(symbol)
+        return info[0] if info else None
 
-        返回的是最新交易日的真实价格（延迟约15分钟），与后复权数据可能不同日，
-        故复权系数 = real_price / hfq_price（后复权最新日收盘）会存在轻微日期错位，
-        但对上市已久的股票（后复权远高于真实价）这是最接近用户所见行情的方案。
+    @staticmethod
+    def _fetch_price_quote(symbol: str) -> tuple[float | None, float | None]:
+        """查东财延迟行情，返回 (最新价f43, 昨收f60)，均为不复权真实价。
+
+        f43=最新成交价（盘中实时/收盘价），f60=昨收（与DB后复权最新日同日）。
+        复权系数必须用 f60/DB后复权收盘（同日口径），避免混入当日涨跌幅。
         """
         import requests
 
@@ -168,15 +177,17 @@ class StockAnalyzer:
         try:
             r = requests.get(
                 "https://push2delay.eastmoney.com/api/qt/stock/get",
-                params={"secid": f"{prefix}.{symbol}", "fields": "f43"},
+                params={"secid": f"{prefix}.{symbol}", "fields": "f43,f60"},
                 headers=headers, timeout=5,
             )
-            raw = r.json().get("data", {}).get("f43")
-            if raw:
-                return raw / 100.0
+            d = r.json().get("data", {})
+            latest = d.get("f43")
+            prev = d.get("f60")
+            latest = latest / 100.0 if latest else None
+            prev = prev / 100.0 if prev else None
+            return (latest, prev)
         except Exception:
-            pass
-        return None
+            return (None, None)
 
     def _load_ohlcv(self, symbol: str) -> pd.DataFrame:
         with sqlite3.connect(self.db_path) as conn:

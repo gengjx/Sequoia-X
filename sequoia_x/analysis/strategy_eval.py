@@ -224,13 +224,14 @@ class StrategyEvaluator:
                 dts = dates.values
                 months_arr = np.array([str(d)[:7] for d in dts])
 
-                # 基准：全市场每个有效交易日的净收益
+                # 基准：全市场每个有效交易日的毛收益（被动持有，不扣换手成本）
+                # 策略收益扣 rtc、基准不扣 → alpha = 策略净 - 基准毛，反映真实扣费后超额
                 for i in range(len(fwd)):
                     if not valid_mask[i]:
                         continue
                     m = months_arr[i]
                     all_months.add(m)
-                    bench_monthly.setdefault(m, []).append(fwd[i] - rtc)
+                    bench_monthly.setdefault(m, []).append(fwd[i])
 
                 # 策略信号
                 signals = _compute_signals(df)
