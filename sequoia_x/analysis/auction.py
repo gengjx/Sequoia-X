@@ -338,15 +338,15 @@ class AuctionScanner:
             for i in grade_a[:10]:
                 lim = " 昨涨停" if i.yesterday_limit else ""
                 lines.append(
-                    f"  {i.symbol} {i.name} | 评分{i.score} | 高开{i.pct}% | "
-                    f"量比{i.vr} | 额{i.amount_yi}亿{lim}"
+                    f"  {i.symbol} {i.name} | 评分{i.score} | 高开{i.auction_pct}% | "
+                    f"量比{i.volume_ratio} | 额{i.auction_amount}亿{lim}"
                 )
             lines.append("")
 
         if grade_b:
             lines.append("🅱️ **标准竞价（备选池）**")
             for i in grade_b[:8]:
-                lines.append(f"  {i.symbol} {i.name} | 评分{i.score} | 高开{i.pct}% | 量比{i.vr}")
+                lines.append(f"  {i.symbol} {i.name} | 评分{i.score} | 高开{i.auction_pct}% | 量比{i.volume_ratio}")
             lines.append("")
 
         if risks:
