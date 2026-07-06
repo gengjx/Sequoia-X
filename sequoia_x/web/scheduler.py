@@ -28,8 +28,8 @@ class AuctionScheduler:
     SCHEDULE = [
         (9, 25, "auction_scan"),
         (9, 30, "intraday_scan_start"),  # 启动盘中轮询
-        (18, 0, "sync_daily"),
-        (18, 30, "auction_verify"),
+        (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
+        (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
     ]
 
     def __init__(self, settings: Settings, db_path: str) -> None:
