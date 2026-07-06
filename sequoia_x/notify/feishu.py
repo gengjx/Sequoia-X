@@ -139,6 +139,42 @@ class FeishuNotifier:
         except requests.RequestException as exc:
             logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
 
+    def send_text(self, title: str, content: str, webhook_key: str = "default") -> bool:
+        """发送任意文本卡片到飞书（通用方法，供竞价/验证等新模块复用）。
+
+        Returns:
+            True=成功 False=失败
+        """
+        url = self.settings.get_webhook_url(webhook_key)
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": title},
+                    "template": "blue",
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                ],
+            },
+        }
+        try:
+            resp = requests.post(
+                url, data=json.dumps(payload),
+                headers={"Content-Type": "application/json"}, timeout=10,
+            )
+            resp_json = resp.json()
+            if resp.status_code != 200 or resp_json.get("code") != 0:
+                logger.error(
+                    f"飞书推送失败 [{webhook_key}] HTTP={resp.status_code} 响应={resp.text}"
+                )
+                return False
+            logger.info(f"飞书推送成功 [{webhook_key}] {title}")
+            return True
+        except requests.RequestException as exc:
+            logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+            return False
+
     def send_decision(self, decision: dict, webhook_key: str = "default") -> bool:
         """推送交易决策清单到飞书。
 

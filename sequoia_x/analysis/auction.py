@@ -374,8 +374,8 @@ class AuctionScanner:
 
         text = "\n".join(lines)
         try:
-            notifier.send(title=f"{date}竞价榜", content=text, webhook_key="auction")
-            return {"status": "ok", "pushed": len(items)}
+            ok = notifier.send_text(title=f"Sequoia-X | {date}竞价榜", content=text, webhook_key="auction")
+            return {"status": "ok" if ok else "error", "pushed": len(items) if ok else 0}
         except Exception as e:
             logger.warning(f"竞价推送失败：{e!r}")
             return {"status": "error", "msg": str(e)}
