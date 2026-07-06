@@ -332,13 +332,17 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
+        # UPSERT累加写入：只更新本轮实际拉到的(symbol,date)，不DELETE已有数据
+        # 避免多次同步时本轮拉取不完整覆盖掉上轮已成功的票
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            conn.executemany(
+                "INSERT OR REPLACE INTO stock_daily (symbol, date, open, high, low, close, volume, turnover) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]].values.tolist(),
+            )
             conn.commit()
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条（{df['symbol'].nunique()}只×{df['date'].nunique()}日）")
+        logger.info(f"sync_today_bulk: UPSERT {count} 条（{df['symbol'].nunique()}只×{df['date'].nunique()}日）")
         return count
 
     def backfill(self, symbols: list[str]) -> None:
