@@ -98,23 +98,39 @@ CREATE TABLE IF NOT EXISTS factor_weights (
 
 
 def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    """多进程 worker：独立 login，批量拉取 baostock 数据（含单只重试）。"""
+    import time
     import baostock as bs
     bs.login()
     results = []
     for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
+        fetched = False
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    bs.logout()
+                    time.sleep(2 * attempt)
+                    bs.login()
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag="1",  # 后复权
+                )
+                if rs.error_code != "0":
+                    continue
+                while rs.next():
+                    results.append([symbol] + rs.get_row_data())
+                fetched = True
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                continue
+        if not fetched:
+            logger.warning(f"worker: {symbol} 拉取失败（重试3次）")
     bs.logout()
     return results
 
@@ -294,16 +310,19 @@ class DataEngine:
 
         n_workers = min(8, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        logger.info(f"sync_today_bulk: {len(tasks)}只 分{n_workers}worker 每worker~{len(chunks[0])}只")
 
+        # 多进程并行拉取（baostock盘后高峰单login需8s，必须并行加速）
         with Pool(n_workers) as pool:
             batch_results = pool.map(_bs_fetch_batch, chunks)
 
+        # 拉取结果合并后一次性落库（Pool.map全部完成才返回，无中途丢数据风险）
         all_rows = []
         for batch in batch_results:
             all_rows.extend(batch)
 
         if not all_rows:
-            logger.info("无新数据（可能非交易日）")
+            logger.info("无新数据（可能非交易日或baostock超时）")
             return 0
 
         df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
@@ -319,7 +338,7 @@ class DataEngine:
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
             conn.commit()
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
+        logger.info(f"sync_today_bulk: 写入 {count} 条（{df['symbol'].nunique()}只×{df['date'].nunique()}日）")
         return count
 
     def backfill(self, symbols: list[str]) -> None:
