@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}盘中信号 - Sequoia-X{% endblock %}
+{% block content %}
+<h2 class="mb-3"><i class="bi bi-lightning-charge"></i> 盘中实时信号</h2>
+<p class="text-muted">9:30-15:00 每60秒自动扫描关注池（竞价A级+持仓），突破/涨停/异动实时触发。调度器交易时段自动轮询。</p>
+
+<div class="d-flex gap-2 mb-3 flex-wrap align-items-center">
+    <button class="btn btn-primary" id="btn-scan" onclick="doScan(false)">
+        <i class="bi bi-search"></i> 扫描信号
+    </button>
+    <button class="btn btn-success" onclick="doScan(true)">
+        <i class="bi bi-send"></i> 扫描+飞书推送
+    </button>
+    <div class="form-check form-switch ms-2">
+        <input class="form-check-input" type="checkbox" id="auto-refresh" onchange="toggleAutoRefresh()">
+        <label class="form-check-label small" for="auto-refresh">自动刷新(60秒)</label>
+    </div>
+    <span class="text-muted small ms-2" id="scan-status"></span>
+    <span class="text-muted small" id="last-update"></span>
+</div>
+
+<div class="row g-3 mb-3" id="signal-cards" style="display:none">
+    <div class="col-md-3"><div class="card text-white bg-success"><div class="card-body py-2">
+        <div class="small">突破新高</div><div class="fs-3 fw-bold" id="cnt-breakout">0</div>
+    </div></div></div>
+    <div class="col-md-3"><div class="card text-white bg-primary"><div class="card-body py-2">
+        <div class="small">均线金叉</div><div class="fs-3 fw-bold" id="cnt-ma">0</div>
+    </div></div></div>
+    <div class="col-md-3"><div class="card text-white bg-danger"><div class="card-body py-2">
+        <div class="small">涨停/跌停</div><div class="fs-3 fw-bold" id="cnt-limit">0</div>
+    </div></div></div>
+    <div class="col-md-3"><div class="card text-white bg-warning"><div class="card-body py-2">
+        <div class="small">急拉急跌</div><div class="fs-3 fw-bold" id="cnt-spike">0</div>
+    </div></div></div>
+</div>
+
+<div class="card">
+    <div class="card-header"><span><i class="bi bi-bell"></i> 实时信号列表</span></div>
+    <div class="card-body">
+        <div id="intraday-empty" class="text-center text-muted py-5">
+            <i class="bi bi-bell-slash" style="font-size:2.5rem"></i>
+            <p class="mt-2">暂无信号。交易时段9:30后自动扫描，或点击「扫描信号」。</p>
+        </div>
+        <div id="intraday-table-wrapper" style="display:none">
+            <div class="table-responsive">
+                <table class="table table-sm table-hover">
+                    <thead class="table-light"><tr>
+                        <th>时间</th><th>类型</th><th>代码</th><th>名称</th>
+                        <th class="text-end">价格</th><th>信号详情</th>
+                    </tr></thead>
+                    <tbody id="intraday-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let allSignals = [];
+let refreshTimer = null;
+const typeMeta = {
+    breakout: {label:'突破新高', cls:'success', icon:'🟢'},
+    ma_cross: {label:'均线金叉', cls:'primary', icon:'🔵'},
+    limit_up: {label:'涨停', cls:'danger', icon:'🔴'},
+    limit_down: {label:'跌停', cls:'danger', icon:'🔴'},
+    spike: {label:'急拉急跌', cls:'warning', icon:'🟡'},
+};
+
+async function doScan(push) {
+    const status = document.getElementById('scan-status');
+    const btn = document.getElementById('btn-scan');
+    status.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 扫描中...';
+    btn.disabled = true;
+    try {
+        const r = await fetch('/api/intraday/scan?push=' + push, {method:'POST'});
+        const data = await r.json();
+        allSignals = data.signals || [];
+        renderSignals(data);
+        const now = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+        document.getElementById('last-update').textContent = '更新于 ' + now;
+        status.textContent = allSignals.length + '个信号';
+        if (push && allSignals.length > 0) showToast('已推送' + allSignals.length + '个信号到飞书', 'success');
+    } catch (e) {
+        showToast('扫描失败: ' + e.message, 'error');
+        status.textContent = '';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderSignals(data) {
+    document.getElementById('cnt-breakout').textContent = allSignals.filter(s=>s.type==='breakout').length;
+    document.getElementById('cnt-ma').textContent = allSignals.filter(s=>s.type==='ma_cross').length;
+    document.getElementById('cnt-limit').textContent = allSignals.filter(s=>s.type==='limit_up'||s.type==='limit_down').length;
+    document.getElementById('cnt-spike').textContent = allSignals.filter(s=>s.type==='spike').length;
+    document.getElementById('signal-cards').style.display = 'flex';
+
+    const tbody = document.getElementById('intraday-body');
+    if (allSignals.length === 0) {
+        document.getElementById('intraday-empty').style.display = 'block';
+        document.getElementById('intraday-table-wrapper').style.display = 'none';
+        return;
+    }
+    // 新信号置顶（allSignals已是最新，合并去重后按时间倒序）
+    tbody.innerHTML = allSignals.map(s => {
+        const m = typeMeta[s.type] || {label:s.type, cls:'secondary', icon:'⚪'};
+        return `<tr>
+            <td>${s.ts}</td>
+            <td><span class="badge bg-${m.cls}">${m.icon} ${m.label}</span></td>
+            <td><a href="/stock-analysis?code=${s.symbol}" class="text-decoration-none"><code>${s.symbol}</code></a></td>
+            <td>${s.name}</td>
+            <td class="text-end fw-bold">${s.price.toFixed(2)}</td>
+            <td class="small">${s.detail}</td>
+        </tr>`;
+    }).join('');
+    document.getElementById('intraday-empty').style.display = 'none';
+    document.getElementById('intraday-table-wrapper').style.display = 'block';
+}
+
+function toggleAutoRefresh() {
+    if (document.getElementById('auto-refresh').checked) {
+        refreshTimer = setInterval(() => doScan(false), 60000);
+    } else {
+        clearInterval(refreshTimer);
+    }
+}
+</script>
+{% endblock %}

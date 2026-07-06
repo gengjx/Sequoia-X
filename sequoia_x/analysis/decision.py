@@ -38,6 +38,7 @@ _DEFAULT_STRATEGY_QUALITY: dict[str, int] = {
     "turtle": 28,      # C级 alpha不足
     "shakeout": 18,    # D级 夏普为负
     "limit_down": 10,  # D级 最差
+    "auction": 85,     # 集合竞价A级（实时资金意图，高开+放量+量比大）
 }
 
 # 运行时动态权重（DecisionEngine.__init__ 从DB加载，覆盖默认值）

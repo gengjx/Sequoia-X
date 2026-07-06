@@ -455,6 +455,7 @@ class WebServices:
         capital: float = 100000.0, min_score: int = 50,
         exclude_markets: list[str] | None = None, exclude_st: bool = False,
         max_candidates: int | None = None,
+        include_auction: bool = False,
     ) -> dict:
         """交易决策中枢：多策略选股 → 质量过滤 → 共振定级 → 仓位分配。
 
@@ -466,7 +467,7 @@ class WebServices:
         # 缓存key含全部决策参数：不同分析池上限(60/120/不限)选出的股票集合不同，
         # 必须独立缓存，否则选60分析后选120会错误命中返回60的结果
         mc = max_candidates or 60
-        cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}|mc{mc}"
+        cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}|mc{mc}|au{int(include_auction)}"
         data_date = self._data_date()
         cached = self._decision_cache.get(cache_key)
         if cached and cached[0].get("data_date") == data_date:
@@ -518,6 +519,13 @@ class WebServices:
                 self._market_report_cache[report["date"]] = report
                 logging.getLogger(__name__).info("大盘分析已完成并缓存，后续决策复用")
             return report
+        # 竞价→决策联动：纳入今日竞价A级票作为盘中候选（竞价定方向+技术面确认）
+        if include_auction:
+            auction_syms = self._get_auction_a_grade()
+            if auction_syms:
+                strategy_results["auction"] = auction_syms
+                logging.getLogger(__name__).info(f"竞价联动：注入{len(auction_syms)}只A级票到决策池")
+
         result = engine.generate(
             strategy_results=strategy_results,
             analyze_fn=self.analyze_stock,
@@ -627,6 +635,18 @@ class WebServices:
             "signals": [self.positions.signal_to_dict(s) for s in signals],
             "summary": self.positions.summary(signals),
         }
+
+    def _get_auction_a_grade(self) -> list[str]:
+        """取今日竞价A级票代码列表。"""
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol FROM auction_snap WHERE grade='A' "
+                    "AND date=(SELECT MAX(date) FROM auction_snap)"
+                ).fetchall()
+            return [r[0] for r in rows if r[0]]
+        except sqlite3.OperationalError:
+            return []
 
     def import_decision_to_holdings(self, buy_list: list[dict]) -> dict:
         """把决策买入清单批量导入持仓表（跳过已持仓的）。"""

@@ -65,6 +65,15 @@ async def auction_page(request: Request):
     )
 
 
+@router.get("/intraday")
+async def intraday_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="intraday.html",
+        context={},
+    )
+
+
 @router.get("/system")
 async def system_page(request: Request):
     templates = request.app.state.templates

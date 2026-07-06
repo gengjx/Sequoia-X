@@ -108,6 +108,7 @@ async def generate_decision(body: DecisionRequest, request: Request):
         services.generate_decision,
         body.strategy_keys, body.capital, body.min_score,
         body.exclude_markets, body.exclude_st, body.max_candidates,
+        body.include_auction,
     )
 
 
@@ -242,6 +243,7 @@ class DecisionRequest(BaseModel):
     exclude_markets: list[str] | None = None
     exclude_st: bool = False
     max_candidates: int | None = None  # 分析池上限，None=60（个股并行后可放宽）
+    include_auction: bool = False  # 纳入今日竞价A级票到决策池
 
 
 class ConfigUpdate(BaseModel):
