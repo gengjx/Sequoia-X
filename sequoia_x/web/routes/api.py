@@ -135,6 +135,13 @@ async def strategy_evaluate(request: Request):
     return await asyncio.to_thread(services.evaluate_strategies)
 
 
+@router.get("/factor/weights")
+async def factor_weights(request: Request):
+    """读取当前因子IC权重快照。"""
+    services = request.app.state.services
+    return {"weights": services.get_factor_weights()}
+
+
 @router.get("/factor/evaluate")
 async def factor_evaluate(request: Request):
     """因子IC评估（30因子预测力，约5-10秒）。"""

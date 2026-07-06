@@ -584,6 +584,10 @@ class WebServices:
         """因子IC评估：30个因子的预测力评估（Rank IC/ICIR/分层）。"""
         return evaluate_factor_ic(self.engine, hold_days=hold_days, sample_size=sample_size)
 
+    def get_factor_weights(self) -> dict:
+        """读取DB中的因子权重快照。"""
+        return self.engine.load_factor_weights()
+
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker
     # ------------------------------------------------------------------

@@ -104,6 +104,10 @@ function renderFactorEval(data) {
         html += '</div>';
     }
 
+        // 权重已自动刷新写DB提示
+        html += `<div class="alert alert-success small"><i class="bi bi-check-circle"></i> 因子IC权重已自动刷新写入数据库（${effective.length}个有效因子），<strong>多因子选股策略将使用最新权重</strong>（下次选股生效）。</div>`;
+    }
+
     document.getElementById('factor-result').innerHTML = html;
 
     // 画IC衰减曲线

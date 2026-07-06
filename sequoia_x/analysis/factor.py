@@ -448,6 +448,24 @@ def evaluate_factor_ic(
     # 按IC绝对值降序
     factor_reports.sort(key=lambda x: abs(x["ic_mean"]), reverse=True)
 
+    # 写回DB：有效因子(|IC|>0.015)按IC归一化为权重，自动刷新多因子策略
+    try:
+        effective = [f for f in factor_reports if abs(f["ic_mean"]) > 0.015]
+        total_ic = sum(abs(f["ic_mean"]) for f in effective)
+        if total_ic > 0:
+            weights = [{
+                "factor_name": f["name"],
+                "category": f.get("category", ""),
+                "ic_mean": f["ic_mean"],
+                "icir": f.get("icir", 0),
+                "win_rate": f.get("win_rate", 0),
+                "weight": round(abs(f["ic_mean"]) / total_ic, 4),
+            } for f in effective]
+            engine.save_factor_weights(weights)
+            logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子")
+    except Exception as e:
+        logger.warning(f"因子权重写DB失败（不影响评估结果）：{e!r}")
+
     return {
         "factors": factor_reports,
         "hold_days": hold_days,

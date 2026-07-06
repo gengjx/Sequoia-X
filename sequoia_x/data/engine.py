@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS strategy_weights (
 );
 """
 
+_CREATE_FACTOR_WEIGHTS_SQL = """
+CREATE TABLE IF NOT EXISTS factor_weights (
+    factor_name TEXT PRIMARY KEY,
+    category    TEXT DEFAULT '',
+    ic_mean     REAL NOT NULL,
+    icir        REAL DEFAULT 0,
+    win_rate    REAL DEFAULT 0,
+    weight      REAL NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
@@ -107,8 +119,43 @@ class DataEngine:
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute(_CREATE_HOLDING_SQL)
             conn.execute(_CREATE_WEIGHTS_SQL)
+            conn.execute(_CREATE_FACTOR_WEIGHTS_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
+
+    def save_factor_weights(self, weights: list[dict]) -> None:
+        """批量写入因子IC权重（UPSERT）。
+
+        Args:
+            weights: [{factor_name, category, ic_mean, icir, win_rate, weight}, ...]
+        """
+        import time
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        sql = ("INSERT OR REPLACE INTO factor_weights "
+               "(factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
+               "VALUES (?,?,?,?,?,?,?)")
+        with sqlite3.connect(self.db_path) as conn:
+            for w in weights:
+                conn.execute(sql, (
+                    w["factor_name"], w.get("category", ""),
+                    w["ic_mean"], w.get("icir", 0), w.get("win_rate", 0),
+                    w["weight"], now,
+                ))
+            conn.commit()
+
+    def load_factor_weights(self) -> dict[str, dict]:
+        """读取全部因子权重，返回 {factor_name: {weight, ic_mean, ...}}。"""
+        sql = ("SELECT factor_name, category, ic_mean, icir, win_rate, weight, updated_at "
+               "FROM factor_weights")
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        return {
+            r[0]: {
+                "category": r[1], "ic_mean": r[2], "icir": r[3],
+                "win_rate": r[4], "weight": r[5], "updated_at": r[6],
+            }
+            for r in rows
+        }
 
     def save_strategy_weights(self, weights: list[dict]) -> None:
         """批量写入策略评估权重（UPSERT）。"""

@@ -60,8 +60,29 @@ class MultiFactorStrategy(BaseStrategy):
     def __init__(self, engine: DataEngine, settings: Settings,
                  factor_weights: dict[str, float] | None = None) -> None:
         super().__init__(engine, settings)
-        # 权重可外部注入（如从DB动态加载），否则用默认IC权重
-        self._weights = factor_weights or dict(_DEFAULT_FACTOR_WEIGHTS)
+        # 权重优先级：外部注入 > DB动态加载 > 默认硬编码兜底
+        if factor_weights:
+            self._weights = factor_weights
+        else:
+            self._weights = self._load_db_weights()
+
+    def _load_db_weights(self) -> dict[str, float]:
+        """从DB加载最新因子IC权重，DB空则用默认值兜底。
+
+        IC评估引擎每次运行会写回DB，使选股自适应最新市场数据。
+        """
+        try:
+            db_weights = self.engine.load_factor_weights()
+            if db_weights:
+                weights = {k: v["weight"] for k, v in db_weights.items()}
+                logger.info(
+                    f"因子权重已从DB加载（{len(weights)}个因子，"
+                    f"最近更新：{next(iter(db_weights.values())).get('updated_at', '?')}）"
+                )
+                return weights
+        except Exception as e:
+            logger.warning(f"加载因子权重失败，使用默认值：{e!r}")
+        return dict(_DEFAULT_FACTOR_WEIGHTS)
 
     def run(self) -> list[str]:
         """执行多因子选股，返回综合因子分Top N的股票代码。"""
