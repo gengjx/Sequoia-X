@@ -25,7 +25,11 @@
                     <dt class="col-5">代码</dt>
                     <dd class="col-7" id="sum-symbol"></dd>
                     <dt class="col-5">最新收盘</dt>
-                    <dd class="col-7" id="sum-close"></dd>
+                    <dd class="col-7" id="sum-close">
+                        <span class="text-muted small">(后复权)</span>
+                    </dd>
+                    <dt class="col-5">真实价</dt>
+                    <dd class="col-7 fw-bold text-danger" id="sum-real"></dd>
                     <dt class="col-5">涨跌幅</dt>
                     <dd class="col-7" id="sum-change"></dd>
                     <dt class="col-5">数据范围</dt>
@@ -33,6 +37,9 @@
                     <dt class="col-5">数据条数</dt>
                     <dd class="col-7" id="sum-rows"></dd>
                 </dl>
+                <div class="alert alert-info small py-1 px-2 mt-2 mb-0" id="adjust-hint" style="display:none;">
+                    <i class="bi bi-info-circle"></i> DB存<span class="fw-bold">后复权</span>数据（量化运算正确口径），真实价由东财昨收盘折算。
+                </div>
                 <a id="sum-xueqiu" href="#" target="_blank" class="btn btn-outline-primary btn-sm w-100 mt-2">
                     <i class="bi bi-box-arrow-up-right"></i> 在雪球查看
                 </a>
@@ -42,14 +49,20 @@
 
     <div class="col-lg-8">
         <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <span><i class="bi bi-table"></i> K线数据</span>
-                <select class="form-select form-select-sm" style="width: auto;" id="days-select" onchange="loadStockData()">
-                    <option value="30">近30天</option>
-                    <option value="60">近60天</option>
-                    <option value="120" selected>近120天</option>
-                    <option value="250">近250天</option>
-                </select>
+            <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <span><i class="bi bi-table"></i> K线数据 <span class="badge bg-warning text-dark" id="price-badge">后复权</span></span>
+                <div class="d-flex align-items-center gap-2">
+                    <div class="btn-group btn-group-sm" role="group">
+                        <button type="button" class="btn btn-outline-secondary active" id="btn-hfq" onclick="switchPrice('hfq')">后复权</button>
+                        <button type="button" class="btn btn-outline-secondary" id="btn-real" onclick="switchPrice('real')">真实价</button>
+                    </div>
+                    <select class="form-select form-select-sm" style="width: auto;" id="days-select" onchange="loadStockData()">
+                        <option value="30">近30天</option>
+                        <option value="60">近60天</option>
+                        <option value="120" selected>近120天</option>
+                        <option value="250">近250天</option>
+                    </select>
+                </div>
             </div>
             <div class="card-body">
                 <div id="data-empty" class="text-center text-muted py-5">
@@ -124,7 +137,16 @@ async function loadSummary() {
     try {
         const s = await api(`/api/stocks/${currentSymbol}/summary`);
         document.getElementById('sum-symbol').textContent = s.symbol;
-        document.getElementById('sum-close').textContent = s.latest_close;
+        document.getElementById('sum-close').innerHTML = s.latest_close + ' <span class="text-muted small">(后复权)</span>';
+        const realEl = document.getElementById('sum-real');
+        if (s.real_price) {
+            realEl.textContent = s.real_price + ' 元';
+            document.getElementById('adjust-hint').style.display = 'block';
+        } else {
+            realEl.textContent = '—';
+            realEl.className = 'col-7 text-muted';
+            document.getElementById('adjust-hint').style.display = 'none';
+        }
         const changeEl = document.getElementById('sum-change');
         changeEl.textContent = s.change_pct + '%';
         changeEl.className = 'col-7 ' + (s.change_pct >= 0 ? 'text-danger' : 'text-success');
@@ -137,37 +159,60 @@ async function loadSummary() {
     }
 }
 
+let currentRows = null;   // 缓存后端返回的后复权K线
+let currentRatio = null;  // 后复权→真实价系数
+let priceMode = 'hfq';    // 当前展示口径
+
 async function loadStockData() {
     if (!currentSymbol) return;
     const days = document.getElementById('days-select').value;
 
     try {
-        const { data } = await api(`/api/stocks/${currentSymbol}?days=${days}`);
-        const tbody = document.getElementById('data-body');
-
-        if (data.length === 0) {
-            document.getElementById('data-empty').style.display = 'block';
-            document.getElementById('data-table-wrapper').style.display = 'none';
-            return;
-        }
-
-        tbody.innerHTML = data.reverse().map(d => `
-            <tr>
-                <td>${d.date}</td>
-                <td class="text-end">${d.open.toFixed(2)}</td>
-                <td class="text-end">${d.high.toFixed(2)}</td>
-                <td class="text-end">${d.low.toFixed(2)}</td>
-                <td class="text-end">${d.close.toFixed(2)}</td>
-                <td class="text-end">${(d.volume / 10000).toFixed(0)}万</td>
-                <td class="text-end">${(d.turnover / 100000000).toFixed(2)}亿</td>
-            </tr>
-        `).join('');
-
-        document.getElementById('data-empty').style.display = 'none';
-        document.getElementById('data-table-wrapper').style.display = 'block';
+        const resp = await api(`/api/stocks/${currentSymbol}?days=${days}`);
+        currentRows = resp.rows;
+        currentRatio = resp.adjust_ratio;
+        // 若无真实价，强制后复权模式
+        if (!currentRatio) priceMode = 'hfq';
+        // 默认展示真实价（如可获取），更贴近用户认知
+        priceMode = currentRatio ? 'real' : 'hfq';
+        renderTable();
     } catch (e) {
         showToast('加载数据失败: ' + e.message, 'error');
     }
+}
+
+function switchPrice(mode) {
+    priceMode = mode;
+    renderTable();
+}
+
+function renderTable() {
+    const tbody = document.getElementById('data-body');
+    if (!currentRows || currentRows.length === 0) {
+        document.getElementById('data-empty').style.display = 'block';
+        document.getElementById('data-table-wrapper').style.display = 'none';
+        return;
+    }
+    const ratio = (priceMode === 'real' && currentRatio) ? currentRatio : 1.0;
+    // 更新badge和按钮状态
+    document.getElementById('price-badge').textContent = priceMode === 'real' ? '真实价' : '后复权';
+    document.getElementById('btn-hfq').classList.toggle('active', priceMode === 'hfq');
+    document.getElementById('btn-real').classList.toggle('active', priceMode === 'real');
+    document.getElementById('btn-real').disabled = !currentRatio;
+
+    tbody.innerHTML = currentRows.slice().reverse().map(d => `
+        <tr>
+            <td>${d.date}</td>
+            <td class="text-end">${(d.open * ratio).toFixed(2)}</td>
+            <td class="text-end">${(d.high * ratio).toFixed(2)}</td>
+            <td class="text-end">${(d.low * ratio).toFixed(2)}</td>
+            <td class="text-end">${(d.close * ratio).toFixed(2)}</td>
+            <td class="text-end">${(d.volume / 10000).toFixed(0)}万</td>
+            <td class="text-end">${(d.turnover / 100000000).toFixed(2)}亿</td>
+        </tr>
+    `).join('');
+    document.getElementById('data-empty').style.display = 'none';
+    document.getElementById('data-table-wrapper').style.display = 'block';
 }
 </script>
 {% endblock %}
