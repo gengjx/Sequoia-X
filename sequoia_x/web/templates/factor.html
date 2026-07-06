@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}因子分析 - Sequoia-X{% endblock %}
+{% block content %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<div class="container-fluid py-3">
+    <div class="d-flex align-items-center mb-3">
+        <h4 class="mb-0 me-3"><i class="bi bi-graph-down-arrow"></i> 多因子IC分析</h4>
+        <button class="btn btn-primary btn-sm" onclick="runFactorEval()" id="btn-factor">
+            <i class="bi bi-play-fill"></i> 运行因子评估
+        </button>
+        <span class="text-muted small ms-3" id="factor-meta"></span>
+    </div>
+    <div class="alert alert-info small mb-3">
+        <i class="bi bi-info-circle"></i>
+        <strong>方法论：</strong>从日K提取30个因子（动量/反转/波动/流动性/量价/质量6大类），
+        计算每月截面因子值与未来20日收益的<strong>Rank IC</strong>（Spearman秩相关）。
+        <strong>IC>0.02且ICIR>0.3为有效因子</strong>。IC衰减曲线展示因子预测力随时间变化。
+    </div>
+    <div id="factor-result">
+        <div class="text-center text-muted py-5">
+            <i class="bi bi-graph-down-arrow" style="font-size:3rem;opacity:0.3"></i>
+            <p class="mt-3">点击「运行因子评估」开始30因子预测力分析（采样500只，约5秒）</p>
+        </div>
+    </div>
+</div>
+<script>
+async function runFactorEval() {
+    const btn = document.getElementById('btn-factor');
+    btn.disabled = true;
+    const el = document.getElementById('factor-result');
+    el.innerHTML = '<div class="text-center py-5"><div class="spinner-border text-primary"></div><p class="mt-3 mb-0">因子IC评估中（30因子×30月×500只，约5秒）...</p></div>';
+    try {
+        const data = await api('/api/factor/evaluate');
+        renderFactorEval(data);
+    } catch(e) {
+        el.innerHTML = `<div class="alert alert-danger">评估失败：${e.message}</div>`;
+    } finally { btn.disabled = false; }
+}
+
+function icColor(ic) {
+    const a = Math.abs(ic);
+    if (a >= 0.05) return ic > 0 ? 'success' : 'danger';
+    if (a >= 0.02) return ic > 0 ? 'info' : 'warning';
+    return 'secondary';
+}
+
+function renderFactorEval(data) {
+    const factors = data.factors || [];
+    const months = data.months || [];
+    document.getElementById('factor-meta').textContent = `采样${data.sample_size}只 · ${months[0]}~${months[-1]}(${months.length}月)`;
+
+    let html = '';
+
+    // 按大类分组
+    const cats = {};
+    factors.forEach(f => { (cats[f.category] = cats[f.category] || []).push(f); });
+    const catOrder = ['动量','反转','波动','流动性','量价','质量'];
+
+    // 1. 总览：有效因子统计
+    const effective = factors.filter(f => f.assessment.includes('有效') && !f.assessment.includes('无效'));
+    const positive = factors.filter(f => f.ic_mean > 0.02);
+    const negative = factors.filter(f => f.ic_mean < -0.02);
+    html += '<div class="row g-3 mb-3">';
+    html += `<div class="col-md-3"><div class="card border-success text-center"><div class="card-body py-2"><div class="h3 text-success mb-0">${effective.length}</div><small class="text-muted">有效因子</small></div></div></div>`;
+    html += `<div class="col-md-3"><div class="card border-info text-center"><div class="card-body py-2"><div class="h3 text-info mb-0">${positive.length}</div><small class="text-muted">正向预测</small></div></div></div>`;
+    html += `<div class="col-md-3"><div class="card border-danger text-center"><div class="card-body py-2"><div class="h3 text-danger mb-0">${negative.length}</div><small class="text-muted">负向预测</small></div></div></div>`;
+    html += `<div class="col-md-3"><div class="card border-secondary text-center"><div class="card-body py-2"><div class="h3 text-secondary mb-0">${factors.length - effective.length}</div><small class="text-muted">无效因子</small></div></div></div>`;
+    html += '</div>';
+
+    // 2. IC排名表（全因子）
+    html += '<div class="card mb-3"><div class="card-header fw-bold"><i class="bi bi-table"></i> 因子IC排名（按|IC|降序）</div>';
+    html += '<div class="card-body p-0"><div class="table-responsive"><table class="table table-sm table-hover mb-0 align-middle">';
+    html += '<thead class="table-dark"><tr><th>排名</th><th>因子</th><th>大类</th><th>IC均值</th><th>ICIR</th><th>月胜率</th><th>分层收益差</th><th>评价</th></tr></thead><tbody>';
+    factors.forEach((f, i) => {
+        const col = icColor(f.ic_mean);
+        const icStr = (f.ic_mean > 0 ? '+' : '') + f.ic_mean;
+        const ddStr = f.quantile_spread > 0 ? `<span class="text-success">+${f.quantile_spread}%</span>` : `<span class="text-danger">${f.quantile_spread}%</span>`;
+        html += `<tr><td>${i+1}</td><td class="fw-bold">${f.desc}<br><small class="text-muted">${f.name}</small></td><td><span class="badge bg-secondary">${f.category}</span></td>`;
+        html += `<td class="text-${col} fw-bold">${icStr}</td><td>${f.icir}</td><td>${f.win_rate}%</td><td>${ddStr}</td>`;
+        html += `<td><span class="badge bg-${f.assessment.includes('强')?'success':f.assessment.includes('有效')&&!f.assessment.includes('无效')?(f.assessment.includes('负')?'danger':'info'):'secondary'}">${f.assessment}</span></td></tr>`;
+    });
+    html += '</tbody></table></div></div></div>';
+
+    // 3. IC衰减曲线（Top5因子的月度IC序列）
+    const top5 = factors.slice(0, 5);
+    if (top5.length && data.ic_series) {
+        html += '<div class="card mb-3"><div class="card-header fw-bold"><i class="bi bi-activity"></i> Top5因子IC衰减曲线（月度IC时序）</div>';
+        html += '<div class="card-body"><canvas id="icChart" height="80"></canvas></div></div>';
+    }
+
+    // 4. 结论
+    if (effective.length > 0) {
+        const best = effective[0];
+        html += `<div class="alert alert-success"><i class="bi bi-lightbulb"></i> <strong>因子分析结论：</strong>最强因子 <strong>${best.desc}</strong>（IC=${best.ic_mean}，ICIR=${best.icir}，胜率${best.win_rate}%）。`;
+        html += ` 有效因子${effective.length}个，可作为多因子模型的输入。`;
+        const momentumNeg = factors.filter(f => f.category === '动量' && f.ic_mean < -0.03);
+        if (momentumNeg.length > 0) {
+            html += ` <strong class="text-danger">⚠️ 动量因子全部负IC</strong>（${momentumNeg.map(f=>f.desc).join('、')}）——A股追高是亏损来源，应反向使用或剔除。`;
+        }
+        const revPos = factors.filter(f => f.category === '反转' && f.ic_mean > 0.02);
+        if (revPos.length > 0) {
+            html += ` <strong class="text-success">✅ 反转因子正向有效</strong>（${revPos.map(f=>f.desc).join('、')}）——A股短期反转效应显著。`;
+        }
+        html += '</div>';
+    }
+
+    document.getElementById('factor-result').innerHTML = html;
+
+    // 画IC衰减曲线
+    if (top5.length && data.ic_series) {
+        const colors = ['#dc3545','#198754','#0d6efd','#fd7e14','#6610f2'];
+        const datasets = top5.map((f, i) => {
+            const ics = data.ic_series[f.name] || [];
+            return {
+                label: f.desc,
+                data: ics,
+                borderColor: colors[i],
+                borderWidth: 2, pointRadius: 0, tension: 0.3,
+                spanGaps: true,
+            };
+        });
+        const ctx = document.getElementById('icChart');
+        if (ctx) {
+            if (window._icChart) window._icChart.destroy();
+            window._icChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: months, datasets },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } } },
+                    scales: {
+                        y: { title: { display: true, text: '月度IC' }, ticks: { callback: v => v.toFixed(3) } },
+                        x: { ticks: { maxTicksLimit: 12, font: { size: 10 } } },
+                    },
+                },
+            });
+        }
+    }
+}
+</script>
+{% endblock %}

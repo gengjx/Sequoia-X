@@ -135,6 +135,14 @@ async def strategy_evaluate(request: Request):
     return await asyncio.to_thread(services.evaluate_strategies)
 
 
+@router.get("/factor/evaluate")
+async def factor_evaluate(request: Request):
+    """因子IC评估（30因子预测力，约5-10秒）。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.evaluate_factors)
+
+
 @router.get("/strategy/compare-combos")
 async def compare_combos(request: Request):
     """主观预设组合 vs 数据驱动最优组合 对比（约5-10秒）。"""

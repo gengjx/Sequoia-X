@@ -120,3 +120,11 @@ async def strategy_compare_page(request: Request):
         request=request, name="strategy_compare.html",
         context={},
     )
+
+@router.get("/factor")
+async def factor_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="factor.html",
+        context={},
+    )

@@ -20,6 +20,7 @@ from sequoia_x.analysis.decision import DecisionEngine
 from sequoia_x.analysis.position import PositionTracker
 from sequoia_x.analysis.combo_backtest import ComboBacktester, SIGNAL_FUNCS
 from sequoia_x.analysis.strategy_eval import StrategyEvaluator
+from sequoia_x.analysis.factor import evaluate_factor_ic
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
@@ -569,6 +570,10 @@ class WebServices:
         """主观预设组合 vs 数据驱动最优组合 对比。"""
         ev = StrategyEvaluator(self.engine, self.settings)
         return ev.compare_combos(hold_days=hold_days, sample_size=sample_size)
+
+    def evaluate_factors(self, hold_days: int = 20, sample_size: int = 500) -> dict:
+        """因子IC评估：30个因子的预测力评估（Rank IC/ICIR/分层）。"""
+        return evaluate_factor_ic(self.engine, hold_days=hold_days, sample_size=sample_size)
 
     # ------------------------------------------------------------------
     # 持仓跟踪 PositionTracker
