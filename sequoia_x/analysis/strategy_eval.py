@@ -191,6 +191,7 @@ class StrategyEvaluator:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"策略评估：采样 {len(symbols)} 只，持有期 {hold_days} 天")
+        cutoff_map = self.engine.get_ipo_cutoff_map()
 
         rtc = self.cost.round_trip_cost()
         strat_monthly: dict[str, dict[str, list[float]]] = {
@@ -206,14 +207,18 @@ class StrategyEvaluator:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < hold_days + 60:
                     continue
+                co = cutoff_map.get(symbol)
+                if co and "date" in df.columns:
+                    df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
                 close = df["close"]
                 dates = df["date"].astype(str) if "date" in df.columns else None
                 if dates is None:
                     continue
 
-                # 前向收益（每个交易日买入持N天的收益）
-                fwd = (close.shift(-hold_days) / close - 1).values
+                # 前向收益（信号当日收盘生成→次日收盘买入持N天卖出，杜绝前视）
+                # 策略与基准同口径：fwd[i] = close[i+hold+1]/close[i+1] - 1
+                fwd = (close.shift(-(hold_days + 1)) / close.shift(-1) - 1).values
                 # 有效行：前向收益非NaN 且 收盘价>0
                 valid_mask = ~(np.isnan(fwd)) & (close.values > 0)
                 dts = dates.values

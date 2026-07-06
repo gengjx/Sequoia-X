@@ -223,7 +223,7 @@ class ComboBacktester:
                     gross.extend(pair[1])
                 results.append({
                     "combo": combo_name, "hold_days": h,
-                    **self._stats(nets, gross),
+                    **self._stats(nets, gross, h),
                 })
 
         # 策略独立 IC（panel 整体秩相关：该策略触发 vs 其他策略触发的收益差异）
@@ -248,6 +248,7 @@ class ComboBacktester:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"共振回测：采样 {len(symbols)} 只股票")
+        cutoff_map = self.engine.get_ipo_cutoff_map()
 
         bands = {"1": {h: ([], []) for h in hold_days},
                  "2": {h: ([], []) for h in hold_days},
@@ -262,6 +263,9 @@ class ComboBacktester:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < 60:
                     continue
+                co = cutoff_map.get(symbol)
+                if co and "date" in df.columns:
+                    df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
                 signals = _compute_signals(df)
                 if not signals:
@@ -272,10 +276,10 @@ class ComboBacktester:
                 for h in hold_days:
                     for idx in resonance_count.index:
                         rc = int(resonance_count.iloc[idx])
-                        if rc == 0 or idx >= len(df) - h - 1:
+                        if rc == 0 or idx + 1 + h >= len(df):
                             continue
-                        entry = close.iloc[idx]
-                        exit_p = close.iloc[idx + h]
+                        entry = close.iloc[idx + 1]
+                        exit_p = close.iloc[idx + 1 + h]
                         if entry <= 0:
                             continue
                         gross = exit_p / entry - 1
@@ -295,7 +299,7 @@ class ComboBacktester:
             for h in hold_days:
                 nets, gross = bands[band][h]
                 results.append({"resonance": band, "hold_days": h,
-                                **self._stats(nets, gross)})
+                                **self._stats(nets, gross, h)})
 
         # 共振度因子 IC（每个持有期一组）
         resonance_ic = []
@@ -329,6 +333,7 @@ class ComboBacktester:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"组合回测：采样 {len(symbols)} 只股票，持有期 {hold_days}")
+        cutoff_map = self.engine.get_ipo_cutoff_map()
 
         strategy_returns: dict = {
             skey: {h: ([], []) for h in hold_days} for skey in SIGNAL_FUNCS
@@ -339,6 +344,9 @@ class ComboBacktester:
                 df = self.engine.get_ohlcv(symbol)
                 if len(df) < 60:
                     continue
+                co = cutoff_map.get(symbol)
+                if co and "date" in df.columns:
+                    df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
                 signals = _compute_signals(df)
                 if not signals:
@@ -365,13 +373,13 @@ class ComboBacktester:
         net_rets: list[float] = []
         gross_rets: list[float] = []
         sig = signal.fillna(False)
-        max_i = len(df) - hold - 1
         rtc = DEFAULT_COST.round_trip_cost()
+        # 信号第i日收盘生成 → 最早i+1日成交（次日收盘买入→i+1+hold收盘卖出），杜绝前视
         for i in sig.index[sig]:
-            if i >= max_i:
+            if i + 1 + hold >= len(df):
                 continue
-            entry = close.iloc[i]
-            exit_p = close.iloc[i + hold]
+            entry = close.iloc[i + 1]
+            exit_p = close.iloc[i + 1 + hold]
             if entry > 0:
                 gross = exit_p / entry - 1
                 gross_rets.append(gross)
@@ -379,8 +387,12 @@ class ComboBacktester:
         return net_rets, gross_rets
 
     @staticmethod
-    def _stats(net_returns: list[float], gross_returns: list[float]) -> dict:
-        """统计净/毛收益、成本侵蚀、胜率、夏普。"""
+    def _stats(net_returns: list[float], gross_returns: list[float], hold: int = 10) -> dict:
+        """统计净/毛收益、成本侵蚀、胜率、夏普（年化）。
+
+        hold: 持有期天数，夏普年化系数 = √(252/hold)。
+        夏普用收益小数/标准差小数（同口径），不再×100导致单位错配。
+        """
         if not net_returns:
             return {"avg_return": 0, "gross_return": 0, "cost_drag": 0,
                     "win_rate": 0, "count": 0, "sharpe": 0}
@@ -390,7 +402,7 @@ class ComboBacktester:
         gavg = float(g.mean()) * 100         # 毛收益
         win = float((n > 0).mean()) * 100
         std = float(n.std())
-        sharpe = float(avg / std) if std > 0 else 0
+        sharpe = float(n.mean() / std * np.sqrt(252 / hold)) if std > 0 else 0
         return {
             "avg_return": round(avg, 2),       # 净收益（扣成本后）
             "gross_return": round(gavg, 2),    # 毛收益（裸价）

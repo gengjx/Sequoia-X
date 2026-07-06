@@ -67,8 +67,14 @@ def quality_bonus(hit_strategies: list[str]) -> float:
     S级策略命中+5，A级+3，B级+1，C级0，D级-3。
     让决策中枢区分"命中好策略"与"命中差策略"。
     """
+    # hit_strategies 存中文展示名，需反查英文key再查STRATEGY_QUALITY
+    try:
+        from sequoia_x.web.services import STRATEGY_META
+        name_to_key = {meta.get("name_cn", k): k for k, meta in STRATEGY_META.items()}
+    except Exception:
+        name_to_key = {}
     return sum(
-        _TIER_BONUS.get(quality_tier(STRATEGY_QUALITY.get(s, 40)), 0)
+        _TIER_BONUS.get(quality_tier(STRATEGY_QUALITY.get(name_to_key.get(s, s), 40)), 0)
         for s in hit_strategies
     )
 
@@ -169,11 +175,10 @@ class DecisionEngine:
         """
         # ── Step 1: 多策略汇总去重 ──
         from sequoia_x.web.services import STRATEGY_META
-        pool: dict[str, list[str]] = {}   # {symbol: [策略key]}
+        pool: dict[str, list[str]] = {}   # {symbol: [英文策略key]} 用于查STRATEGY_QUALITY
         for skey, symbols in strategy_results.items():
-            sname = STRATEGY_META.get(skey, {}).get("name_cn", skey)
             for sym in symbols:
-                pool.setdefault(sym, []).append(sname)
+                pool.setdefault(sym, []).append(skey)
 
         logger.info(f"决策中枢：候选池 {len(pool)} 只（来自 {len(strategy_results)} 个策略）")
 
@@ -250,7 +255,7 @@ class DecisionEngine:
                     symbol=sym,
                     name=report.get("name", sym),
                     resonance=len(strat_names),
-                    hit_strategies=strat_names,
+                    hit_strategies=[STRATEGY_META.get(x, {}).get("name_cn", x) for x in strat_names],
                     strategy_quality=round(sum(STRATEGY_QUALITY.get(x, 40) for x in strat_names) / max(len(strat_names), 1), 1),
                     score=score,
                     action=rec.get("action", ""),

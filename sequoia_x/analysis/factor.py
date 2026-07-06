@@ -385,6 +385,7 @@ def evaluate_factor_ic(
         rng = random.Random(seed)
         symbols = rng.sample(symbols, sample_size)
     logger.info(f"因子IC评估：采样 {len(symbols)} 只，持有期 {hold_days} 天")
+    cutoff_map = engine.get_ipo_cutoff_map()
 
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
@@ -397,6 +398,9 @@ def evaluate_factor_ic(
             df = engine.get_ohlcv(sym)
             if len(df) < hold_days + 60:
                 continue
+            co = cutoff_map.get(sym)
+            if co and "date" in df.columns:
+                df = df[df["date"].astype(str) >= co]
             df = df.reset_index(drop=True)
             # 向量化算完整序列的因子值（一次算完，按月取截面）
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
@@ -406,7 +410,8 @@ def evaluate_factor_ic(
             dates = df["date"].astype(str).values
             months = np.array([d[:7] for d in dates])
             close = df["close"]
-            fwd = (close.shift(-hold_days) / close - 1).values
+            # 次日成交口径（信号当日生成→次日收盘买入持N天卖出），杜绝前视
+            fwd = (close.shift(-(hold_days + 1)) / close.shift(-1) - 1).values
 
             # 每月取第一个交易日作为截面日
             seen_months = set()

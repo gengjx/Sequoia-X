@@ -481,3 +481,35 @@ class DataEngine:
                 "SELECT DISTINCT symbol FROM stock_daily"
             ).fetchall()
         return [row[0] for row in rows]
+
+    def get_ipo_map(self) -> dict[str, str]:
+        """返回 {symbol: ipo_date}，用于回测过滤新股（缓解幸存者偏差）。
+
+        退市股历史行情当前缺失，本方法仅过滤新股上市初期的非理性波动。
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, ipo_date FROM stock_basic"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return {}
+        return {r[0]: r[1] for r in rows if r[0] and r[1]}
+
+    def get_ipo_cutoff_map(self, min_age_days: int = 365) -> dict[str, str]:
+        """返回 {symbol: cutoff_date}，cutoff = 上市日 + min_age_days。
+
+        回测时 df[date >= cutoff] 过滤新股上市初期的非理性波动，
+        缓解新股偏差（注意：退市股历史缺失仍需数据层重建）。
+        """
+        from datetime import datetime, timedelta
+        ipo_map = self.get_ipo_map()
+        out: dict[str, str] = {}
+        delta = timedelta(days=min_age_days)
+        for sym, ipo in ipo_map.items():
+            try:
+                d = datetime.strptime(str(ipo)[:10], "%Y-%m-%d")
+                out[sym] = (d + delta).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                continue
+        return out
