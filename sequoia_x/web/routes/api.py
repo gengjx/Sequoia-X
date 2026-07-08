@@ -682,3 +682,9 @@ async def paper_nav_history(request: Request, days: int = 90):
             "consec_loss": perf.consec_loss,
         },
     }
+
+@router.get("/system/rate-limit")
+async def rate_limit_status(request: Request):
+    """数据源限流状态。"""
+    from sequoia_x.core.rate_limiter import _rate_limiter
+    return _rate_limiter.status()

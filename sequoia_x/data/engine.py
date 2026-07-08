@@ -502,6 +502,17 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
+        # baostock 日额度检查（每只约2次API调用：login+query）
+        from sequoia_x.core.rate_limiter import _rate_limiter
+        estimated_calls = len(tasks) * 2
+        if not _rate_limiter.baostock_check(estimated_calls):
+            status = _rate_limiter.baostock_status()
+            logger.warning(
+                f"baostock 日额度不足，跳过同步。"
+                f"今日已用 {status['used']}/{status['limit']}（{status['usage_pct']}%）"
+            )
+            return 0
+
         n_workers = min(8, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
         logger.info(f"sync_today_bulk: {len(tasks)}只 分{n_workers}worker 每worker~{len(chunks[0])}只")
@@ -552,6 +563,9 @@ class DataEngine:
             conn.commit()
 
         logger.info(f"sync_today_bulk: UPSERT {count} 条（{df['symbol'].nunique()}只×{df['date'].nunique()}日）")
+        # 记录 baostock 消耗
+        from sequoia_x.core.rate_limiter import _rate_limiter
+        _rate_limiter.baostock_consume(len(tasks) * 2)
         return count
 
     def save_decision_pool(self, items: list[dict]) -> int:

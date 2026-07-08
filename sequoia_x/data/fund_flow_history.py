@@ -39,6 +39,9 @@ def fetch_fund_flow_history(symbol: str, days: int = 60) -> list[dict]:
     """
     secid = _to_secid(symbol)
     try:
+        from sequoia_x.core.rate_limiter import _rate_limiter
+        if not _rate_limiter.eastmoney_acquire():
+            return []
         r = requests.get(
             "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
             params={
@@ -67,8 +70,10 @@ def fetch_fund_flow_history(symbol: str, days: int = 60) -> list[dict]:
                 "big_net": float(parts[4]),    # 大单净流入
                 "super_net": float(parts[5]),  # 超大单净流入
             })
+        _rate_limiter.eastmoney_success()
         return result
     except Exception as e:
+        _rate_limiter.eastmoney_failure()
         logger.debug(f"资金流向历史 {symbol} 获取失败: {e}")
         return []
 
