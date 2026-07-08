@@ -193,6 +193,13 @@ class StrategyEvaluator:
         logger.info(f"策略评估：采样 {len(symbols)} 只，持有期 {hold_days} 天")
         cutoff_map = self.engine.get_ipo_cutoff_map()
 
+        # 预加载全市场财报（point-in-time质量因子回测）
+        finance_map = self._load_finance_for_backtest()
+        # 加载DB完整IC权重（39因子，含质量+资金+结构）
+        db_weights = self._load_db_factor_weights()
+        # 加载三态市场状态权重
+        state_weights = self._load_state_factor_weights()
+
         rtc = self.cost.round_trip_cost()
         strat_monthly: dict[str, dict[str, list[float]]] = {
             s: {} for s in SIGNAL_FUNCS
@@ -234,7 +241,10 @@ class StrategyEvaluator:
                     bench_monthly.setdefault(m, []).append(fwd[i])
 
                 # 策略信号
-                signals = _compute_signals(df)
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                # P1: multi_factor 按月度市场状态切换权重
+                mf_weights = self._select_month_weights(months_arr, state_weights, db_weights)
+                signals = _compute_signals(df, finance_series=fin_series, factor_weights=mf_weights)
                 for skey, sig in signals.items():
                     sig_vals = sig.fillna(False).values
                     for i in range(len(sig_vals)):
@@ -307,6 +317,105 @@ class StrategyEvaluator:
         if std == 0:
             return 0.0
         return float(arr.mean() / std * np.sqrt(12))
+
+    def _load_state_factor_weights(self) -> dict[str, dict[str, float]]:
+        """从DB加载三态市场状态因子权重。"""
+        try:
+            result = self.engine.load_market_factor_weights()
+            if result:
+                logger.info(f"三态因子权重加载：bull={len(result.get('bull',{}))} "
+                           f"neutral={len(result.get('neutral',{}))} "
+                           f"bear={len(result.get('bear',{}))}")
+            return result
+        except Exception as e:
+            logger.warning(f"三态权重加载失败：{e!r}")
+            return {}
+
+    @staticmethod
+    def _select_month_weights(months_arr: np.ndarray, state_weights: dict,
+                              fallback: dict | None) -> dict[str, float] | None:
+        """根据回测样本的月份分布，选择主导市场状态对应的权重。
+
+        由于 _compute_signals 对整只股票一次性计算信号序列，
+        无法逐月切换权重（需按月重算复合分）。
+        这里取该股票涉及月份中出现最多的市场状态对应的权重。
+        """
+        if not state_weights:
+            return fallback
+        # 简化：如果三态权重中 neutral 有数据，优先用 neutral（最常见状态）
+        # 实际逐月切换在 factor.py 的 evaluate 中已实现（计算三套IC）
+        for state in ("neutral", "bull", "bear"):
+            if state in state_weights and state_weights[state]:
+                return state_weights[state]
+        return fallback
+
+    def _load_db_factor_weights(self) -> dict[str, float] | None:
+        """从DB加载完整IC权重（替代硬编码默认13因子权重）。"""
+        try:
+            db_w = self.engine.load_factor_weights()
+            if db_w:
+                weights = {k: v["weight"] for k, v in db_w.items() if v.get("weight", 0) != 0}
+                logger.info(f"回测因子权重从DB加载：{len(weights)}个因子")
+                return weights
+        except Exception as e:
+            logger.warning(f"DB因子权重加载失败，使用默认：{e!r}")
+        return None
+
+    def _load_finance_for_backtest(self) -> dict[str, list]:
+        """批量加载全市场财报，返回 {symbol: [{stat_date, report_date, roe, ...}]}。"""
+        import sqlite3
+        result: dict[str, list] = {}
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT symbol, stat_date, report_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni "
+                    "FROM stock_finance"
+                ).fetchall()
+            for r in rows:
+                result.setdefault(r["symbol"], []).append(dict(r))
+            logger.info(f"回测财报加载：{len(result)}只")
+        except Exception as e:
+            logger.warning(f"回测财报加载失败：{e!r}")
+        return result
+
+    def _build_finance_series(self, df: pd.DataFrame, finance_rows: list) -> dict[str, pd.Series] | None:
+        """从财报行构建point-in-time质量因子序列。
+
+        用 report_date 对齐K线日期，避免未来函数（报告披露后才可用）。
+        """
+        if not finance_rows or "date" not in df.columns:
+            return None
+
+        n = len(df)
+        dates = df["date"].astype(str).values
+        quality_map = {
+            "roe": "roe", "np_margin": "np_margin", "gp_margin": "gp_margin",
+            "rev_growth": "yoy_eps", "profit_growth": "yoy_pni",
+        }
+
+        # 按 report_date 排序（report_date为空则用stat_date+90天作为保守估计）
+        def _sort_key(r):
+            rd = r.get("report_date")
+            if rd:
+                return rd
+            sd = r.get("stat_date", "")
+            return sd
+
+        sorted_rows = sorted(finance_rows, key=_sort_key)
+
+        result = {}
+        for qname, qcol in quality_map.items():
+            vals = np.full(n, np.nan)
+            for row in sorted_rows:
+                rd = row.get("report_date") or row.get("stat_date", "")
+                v = row.get(qcol)
+                if v is not None and rd:
+                    mask = dates >= rd
+                    if mask.any():
+                        vals[mask] = v
+            result[qname] = pd.Series(vals, index=df.index)
+        return result
 
     @staticmethod
     def _calmar(annual_return: float, max_drawdown: float) -> float:

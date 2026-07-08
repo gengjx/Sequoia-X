@@ -144,11 +144,15 @@ async def factor_weights(request: Request):
 
 
 @router.get("/factor/evaluate")
-async def factor_evaluate(request: Request):
-    """因子IC评估（30因子预测力，约5-10秒）。"""
+async def factor_evaluate(request: Request, rolling: int = 0):
+    """因子IC评估（全部因子预测力，约5-10秒）。
+
+    Args:
+        rolling: 滚动窗口月数（0=全样本，6=最近6个月）
+    """
     import asyncio
     services = request.app.state.services
-    return await asyncio.to_thread(services.evaluate_factors)
+    return await asyncio.to_thread(services.evaluate_factors, rolling_months=rolling)
 
 
 @router.get("/strategy/compare-combos")
@@ -326,6 +330,30 @@ async def refresh_industry(request: Request):
     return {"task_id": task_id, "status": TaskStatus.PENDING}
 
 
+@router.get("/market/sectors-realtime")
+async def sectors_realtime(request: Request):
+    """行业板块实时涨幅榜（盘中可用，30秒可轮询）。"""
+    from sequoia_x.analysis.market import MarketAnalyzer
+    import asyncio
+    services = request.app.state.services
+    analyzer = MarketAnalyzer(services.settings)
+
+    async def _fetch():
+        return analyzer.fetch_sectors_realtime()
+    return await _fetch()
+
+
+@router.get("/market/lhb-predict")
+async def lhb_predict(request: Request):
+    """龙虎榜盘中预判：根据资金流向+涨跌幅+换手率预判上榜。"""
+    import asyncio
+    from sequoia_x.analysis.lhb_predict import predict_lhb_candidates, predict_to_list
+
+    async def _fetch():
+        return predict_to_list(predict_lhb_candidates())
+    return await _fetch()
+
+
 @router.post("/market/backtest")
 async def run_backtest(request: Request):
     services = request.app.state.services
@@ -418,6 +446,14 @@ async def scan_positions(request: Request, apply_stop_move: bool = False):
     """扫描所有持仓，返回移动止损/减仓/止盈信号 + 组合摘要。"""
     services = request.app.state.services
     return services.scan_positions(apply_stop_move=apply_stop_move)
+
+
+@router.get("/positions/intraday")
+async def scan_positions_intraday(request: Request):
+    """盘中实时盯盘：批量快照 + 实时MA估算，30秒可轮询。"""
+    import asyncio
+    services = request.app.state.services
+    return await asyncio.to_thread(services.scan_positions_intraday)
 
 
 @router.post("/positions/import-decision")
@@ -529,3 +565,120 @@ async def auction_scan(request: Request, top_n: int = 50, push: bool = False):
     notifier = FeishuNotifier(settings) if push else None
     result = scanner.scan(top_n=top_n, push=push, notifier=notifier)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 模拟盘（Paper Trading）
+# ---------------------------------------------------------------------------
+
+@router.get("/paper/account")
+async def paper_account(request: Request):
+    """模拟盘账户+绩效概览。"""
+    from sequoia_x.analysis.paper_trade import PaperTradeEngine
+    settings = request.app.state.settings
+    engine = PaperTradeEngine(settings)
+    account = engine.get_account()
+    perf = engine.get_performance()
+    return {**perf.__dict__}
+
+
+@router.get("/paper/holdings")
+async def paper_holdings(request: Request):
+    """模拟盘当前持仓。"""
+    from sequoia_x.analysis.paper_trade import PaperTradeEngine
+    settings = request.app.state.settings
+    engine = PaperTradeEngine(settings)
+    return {"holdings": engine.get_holdings()}
+
+
+@router.get("/paper/trades")
+async def paper_trades(request: Request, limit: int = 50):
+    """模拟盘交易记录。"""
+    from sequoia_x.analysis.paper_trade import PaperTradeEngine
+    settings = request.app.state.settings
+    engine = PaperTradeEngine(settings)
+    return {"trades": engine.get_trades(limit=limit)}
+
+
+@router.post("/paper/auto-run")
+async def paper_auto_run(request: Request):
+    """一键执行模拟盘闭环：决策→买入→卖出→绩效。
+
+    完整流程：
+      1. 跑全策略选股 + 决策
+      2. 持仓扫描信号
+      3. 自动卖出（止损/止盈/减仓）
+      4. 自动买入（buy_list按评分+仓位约束）
+      5. 返回绩效快照
+    """
+    import asyncio
+    services = request.app.state.services
+
+    # Step1: 先扫描持仓 → 自动卖出
+    pos_signals = await asyncio.to_thread(services.scan_positions, False)
+    sell_result = await asyncio.to_thread(
+        services.paper_auto_sell, pos_signals.get("signals", [])
+    )
+
+    # Step2: 跑决策（全策略）
+    decision = await asyncio.to_thread(
+        services.generate_decision,
+        None, 100000, 50, None, True, 60, False
+    )
+
+    # Step3: 自动买入
+    buy_result = await asyncio.to_thread(services.paper_auto_buy, decision)
+
+    # Step4: 记录日度净值
+    nav_result = await asyncio.to_thread(services.paper_record_nav)
+
+    # Step5: 绩效
+    perf = await asyncio.to_thread(services.paper_performance)
+
+    return {
+        "sell": sell_result,
+        "nav": nav_result,
+        "decision": {
+            "buy_list_count": len(decision.get("buy_list", [])),
+            "pool_size": decision.get("pool_size", 0),
+            "market_state": decision.get("market_state", {}),
+        },
+        "buy": buy_result,
+        "performance": perf.__dict__,
+    }
+
+
+@router.post("/paper/reset")
+async def paper_reset(request: Request):
+    """重置模拟盘。"""
+    from sequoia_x.analysis.paper_trade import PaperTradeEngine
+    settings = request.app.state.settings
+    engine = PaperTradeEngine(settings)
+    engine.reset()
+    return {"success": True, "msg": "模拟盘已重置，恢复10万本金"}
+
+
+@router.get("/paper/nav-history")
+async def paper_nav_history(request: Request, days: int = 90):
+    """模拟盘净值曲线（含沪深300基准对比）。"""
+    from sequoia_x.analysis.paper_trade import PaperTradeEngine
+    settings = request.app.state.settings
+    engine = PaperTradeEngine(settings)
+    nav = engine.get_nav_history(days=days)
+    perf = engine.get_performance()
+    return {
+        "nav": nav,
+        "metrics": {
+            "sharpe_ratio": perf.sharpe_ratio,
+            "sortino_ratio": perf.sortino_ratio,
+            "calmar_ratio": perf.calmar_ratio,
+            "annual_return": perf.annual_return,
+            "alpha": perf.alpha,
+            "benchmark_return": perf.benchmark_return,
+            "max_drawdown_pct": perf.max_drawdown_pct,
+            "win_rate": perf.win_rate,
+            "profit_factor": perf.profit_factor,
+            "risk_circuit": perf.risk_circuit,
+            "consec_loss": perf.consec_loss,
+        },
+    }

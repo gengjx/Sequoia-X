@@ -1,83 +1,651 @@
+/* ═══════════════════════════════════════════════════════
+   Sequoia-X · 量化金融星空主题
+   深空背景 + 星辰粒子 + 毛玻璃卡片 + 金融配色 + 动效
+   ═══════════════════════════════════════════════════════ */
+
+:root {
+    /* ── 金融配色 ── */
+    --sx-bg:        #0a0e1a;       /* 深空底色 */
+    --sx-bg-2:      #111827;       /* 次级深色 */
+    --sx-surface:   rgba(17, 24, 39, 0.72);  /* 毛玻璃面 */
+    --sx-surface-2: rgba(30, 41, 59, 0.6);   /* 卡片hover */
+    --sx-border:    rgba(99, 179, 237, 0.15);
+    --sx-border-hi: rgba(99, 179, 237, 0.35);
+    --sx-text:      #e2e8f0;
+    --sx-text-dim:  #94a3b8;
+    --sx-primary:   #6366f1;       /* 靛蓝（科技感） */
+    --sx-primary-2: #818cf8;
+    --sx-cyan:      #22d3ee;       /* 青色（数据感） */
+    --sx-gold:      #fbbf24;       /* 金色（金融） */
+    --sx-up:        #f43f5e;       /* 涨=红（A股） */
+    --sx-down:      #22c55e;       /* 跌=绿（A股） */
+    --sx-warn:      #fb923c;
+    --sx-danger:    #ef4444;
+    --sx-glow:      0 0 20px rgba(99, 102, 241, 0.3);
+    --sx-glow-cyan: 0 0 20px rgba(34, 211, 238, 0.25);
+    --sx-radius:    12px;
+    --sx-font:      -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    --sx-mono:      'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+}
+
+/* ── 全局重置 ── */
+* { box-sizing: border-box; }
+
 body {
-    background-color: #f8f9fa;
+    background: var(--sx-bg) !important;
+    color: var(--sx-text) !important;
+    font-family: var(--sx-font) !important;
+    min-height: 100vh;
+    overflow-x: hidden;
 }
 
-.card {
-    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
-    transition: box-shadow 0.2s;
+main {
+    position: relative;
+    z-index: 2;
 }
 
-.card:hover {
-    box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+/* ── 星空背景层（fixed，pointer-events:none，不影响交互）── */
+#sx-starfield {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: -2;
+    pointer-events: none;
 }
 
-.strategy-card {
-    cursor: pointer;
+/* 深空底色（纯色，z-index:-3 在 canvas 下方，让 canvas 星云透出来）*/
+body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: -3;
+    pointer-events: none;
+    background: linear-gradient(180deg, #050810 0%, #0a0e1a 50%, #080c18 100%);
 }
 
-.table-stock {
+/* 星云闪烁叠层（内容下方，canvas 上方）*/
+body::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 0;
+    pointer-events: none;
+    background:
+        radial-gradient(circle 2px at 15% 30%, rgba(255,255,255,0.3), transparent),
+        radial-gradient(circle 1px at 25% 60%, rgba(255,255,255,0.2), transparent),
+        radial-gradient(circle 1.5px at 70% 15%, rgba(226,232,240,0.25), transparent),
+        radial-gradient(circle 1px at 85% 45%, rgba(255,255,255,0.2), transparent),
+        radial-gradient(circle 2px at 45% 85%, rgba(226,232,240,0.2), transparent),
+        radial-gradient(circle 1px at 55% 25%, rgba(255,255,255,0.15), transparent),
+        radial-gradient(circle 1.5px at 90% 70%, rgba(226,232,240,0.2), transparent),
+        radial-gradient(circle 1px at 10% 75%, rgba(255,255,255,0.15), transparent);
+    animation: sx-twinkle 4s ease-in-out infinite alternate;
+}
+
+@keyframes sx-twinkle {
+    0%   { opacity: 0.4; }
+    100% { opacity: 0.9; }
+}
+
+/* ════════ 导航栏 ════════ */
+.navbar {
+    background: rgba(10, 14, 26, 0.85) !important;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--sx-border);
+    box-shadow: 0 1px 30px rgba(0, 0, 0, 0.5);
+}
+
+.navbar-brand {
+    background: linear-gradient(135deg, var(--sx-primary-2), var(--sx-cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.navbar-dark .navbar-nav .nav-link {
+    color: var(--sx-text-dim) !important;
+    transition: all 0.25s;
+    border-radius: 8px;
+    padding: 0.4rem 0.7rem !important;
+    margin: 0 1px;
     font-size: 0.875rem;
 }
 
-.log-viewer {
-    background-color: #1e1e1e;
-    color: #d4d4d4;
-    font-family: 'Consolas', 'Monaco', monospace;
+.navbar-dark .navbar-nav .nav-link:hover {
+    color: var(--sx-cyan) !important;
+    background: rgba(34, 211, 238, 0.08);
+    box-shadow: var(--sx-glow-cyan);
+}
+
+.navbar-dark .navbar-nav .nav-link.active {
+    color: var(--sx-cyan) !important;
+    background: rgba(34, 211, 238, 0.12);
+}
+
+/* ════════ 卡片（毛玻璃）════════ */
+.card {
+    background: var(--sx-surface) !important;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--sx-border) !important;
+    border-radius: var(--sx-radius) !important;
+    color: var(--sx-text) !important;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+.card:hover {
+    border-color: var(--sx-border-hi) !important;
+    box-shadow: 0 8px 40px rgba(99, 102, 241, 0.12), 0 0 0 1px var(--sx-border-hi);
+    transform: translateY(-2px);
+}
+
+.card-header {
+    background: rgba(30, 41, 59, 0.5) !important;
+    border-bottom: 1px solid var(--sx-border) !important;
+    color: var(--sx-text) !important;
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+
+.card-body { color: var(--sx-text) !important; }
+
+/* ════════ 表格 ════════ */
+.table {
+    color: var(--sx-text) !important;
+    --bs-table-bg: transparent;
+    --bs-table-color: var(--sx-text);
+    --bs-table-striped-bg: rgba(99, 102, 241, 0.04);
+    --bs-table-hover-bg: rgba(34, 211, 238, 0.06);
+    --bs-table-hover-color: var(--sx-text);
+}
+
+.table > :not(caption) > * > * {
+    background-color: transparent;
+    color: var(--sx-text);
+    border-color: var(--sx-border);
+}
+
+.table thead th {
+    background: rgba(30, 41, 59, 0.4);
+    color: var(--sx-text-dim) !important;
+    font-weight: 600;
     font-size: 0.8rem;
-    max-height: 500px;
-    overflow-y: auto;
-    padding: 1rem;
-    border-radius: 0.375rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--sx-border-hi) !important;
 }
 
-.spinner-border-sm {
-    width: 1rem;
-    height: 1rem;
+.table tbody tr {
+    transition: background 0.2s;
 }
 
-/* ===== 大盘分析报告 ===== */
-.report-section .card-header {
-    background-color: #fff;
-    font-size: 1.05rem;
+.table-striped > tbody > tr:nth-of-type(odd) > * {
+    background-color: rgba(99, 102, 241, 0.03);
 }
 
+/* ════════ A股涨跌色（红涨绿跌）════════ */
+.text-danger { color: var(--sx-up) !important; }
+.text-success { color: var(--sx-down) !important; }
+.text-warning { color: var(--sx-warn) !important; }
+.text-info { color: var(--sx-cyan) !important; }
+.text-muted { color: var(--sx-text-dim) !important; }
+.text-primary { color: var(--sx-primary-2) !important; }
+.text-gold { color: var(--sx-gold) !important; }
+
+/* ════════ 按钮 ════════ */
+.btn-primary {
+    background: linear-gradient(135deg, var(--sx-primary), var(--sx-primary-2)) !important;
+    border: none !important;
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
+    transition: all 0.25s;
+    font-weight: 600;
+}
+
+.btn-primary:hover {
+    box-shadow: 0 6px 24px rgba(99, 102, 241, 0.5);
+    transform: translateY(-1px);
+}
+
+.btn-outline-danger {
+    color: var(--sx-danger) !important;
+    border-color: rgba(239, 68, 68, 0.4) !important;
+}
+.btn-outline-danger:hover {
+    background: rgba(239, 68, 68, 0.15) !important;
+    border-color: var(--sx-danger) !important;
+}
+
+/* ════════ Badge ════════ */
+.badge {
+    font-weight: 500;
+    padding: 0.35em 0.6em;
+    border-radius: 6px;
+}
+.badge.bg-danger { background: var(--sx-up) !important; }
+.badge.bg-warning { background: var(--sx-warn) !important; color: #1a1a2e !important; }
+.badge.bg-secondary { background: rgba(100, 116, 139, 0.4) !important; }
+
+/* ════════ 滚动条 ════════ */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--sx-bg-2); }
+::-webkit-scrollbar-thumb {
+    background: rgba(99, 102, 241, 0.3);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.5); }
+
+/* ════════ 链接 ════════ */
+a { color: var(--sx-cyan); text-decoration: none; transition: color 0.2s; }
+a:hover { color: var(--sx-primary-2); }
+
+/* ════════ 表单 ════════ */
+.form-control, .form-select {
+    background: rgba(30, 41, 59, 0.6) !important;
+    border: 1px solid var(--sx-border) !important;
+    color: var(--sx-text) !important;
+    border-radius: 8px;
+}
+.form-control:focus, .form-select:focus {
+    background: rgba(30, 41, 59, 0.8) !important;
+    border-color: var(--sx-primary) !important;
+    box-shadow: 0 0 0 0.2rem rgba(99, 102, 241, 0.15) !important;
+    color: var(--sx-text) !important;
+}
+.form-control::placeholder { color: var(--sx-text-dim); }
+.form-label { color: var(--sx-text-dim) !important; font-size: 0.85rem; }
+.form-check-label { color: var(--sx-text-dim) !important; }
+
+/* ════════ 日志查看器 ════════ */
+.log-viewer {
+    background: rgba(10, 14, 26, 0.9) !important;
+    color: #a5b4fc !important;
+    font-family: var(--sx-mono);
+    font-size: 0.8rem;
+    border: 1px solid var(--sx-border) !important;
+    border-radius: 8px;
+    backdrop-filter: blur(8px);
+}
+
+/* ════════ 大盘分析 ════════ */
 .report-section {
-    border-left: 4px solid #0d6efd;
+    border-left: 3px solid var(--sx-primary) !important;
+    background: var(--sx-surface);
+    backdrop-filter: blur(8px);
+    border-radius: 0 8px 8px 0 !important;
 }
 
-/* 盘面信号评分环形仪表 */
+/* 信号环形仪表 */
 .signal-ring {
-    width: 130px;
-    height: 130px;
+    width: 130px; height: 130px;
     border-radius: 50%;
+    margin: 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    background: conic-gradient(var(--score-color, var(--sx-primary)) calc(var(--ring, 0) * 1%), rgba(99, 179, 237, 0.1) 0);
+    position: relative;
+    box-shadow: var(--sx-glow);
+}
+.signal-ring::after {
+    content: '';
+    position: absolute; inset: 6px;
+    border-radius: 50%;
+    background: var(--sx-bg-2);
+}
+
+/* ════════ 动效 ════════ */
+
+/* 渐入动画 */
+@keyframes sx-fade-up {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+main > .row, main > .card, main > div {
+    animation: sx-fade-up 0.5s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+main > *:nth-child(2) { animation-delay: 0.05s; }
+main > *:nth-child(3) { animation-delay: 0.1s; }
+main > *:nth-child(4) { animation-delay: 0.15s; }
+
+/* 数字闪烁（实时数据更新感）*/
+@keyframes sx-flash {
+    0% { color: var(--sx-cyan); text-shadow: 0 0 8px rgba(34, 211, 238, 0.6); }
+    100% { color: inherit; text-shadow: none; }
+}
+.sx-flash { animation: sx-flash 0.6s ease-out; }
+
+/* 脉冲点（在线状态指示）*/
+@keyframes sx-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+    50%      { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+}
+.sx-live-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #22c55e;
+    animation: sx-pulse 2s infinite;
+}
+
+/* 加载旋转（金融感）*/
+.sx-spinner {
+    display: inline-block;
+    width: 16px; height: 16px;
+    border: 2px solid rgba(99, 102, 241, 0.2);
+    border-top-color: var(--sx-cyan);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 卡片hover光扫过 */
+.card { position: relative; overflow: hidden; }
+.card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+    transition: left 0.6s;
+    pointer-events: none;
+}
+.card:hover::before { left: 100%; }
+
+/* ════════ 模拟盘绩效卡片 ════════ */
+.border-primary { border-color: rgba(99, 102, 241, 0.3) !important; }
+.border-success { border-color: rgba(34, 197, 94, 0.3) !important; }
+.border-danger  { border-color: rgba(244, 63, 94, 0.3) !important; }
+.border-warning { border-color: rgba(251, 146, 60, 0.3) !important; }
+.border-info    { border-color: rgba(34, 211, 238, 0.3) !important; }
+.border-secondary { border-color: rgba(100, 116, 139, 0.3) !important; }
+
+/* ════════ hr 分割线 ════════ */
+hr {
+    border-color: var(--sx-border) !important;
+    opacity: 0.5;
+}
+
+/* ════════ 模态框 ════════ */
+.modal-content {
+    background: var(--sx-surface) !important;
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--sx-border-hi) !important;
+    color: var(--sx-text) !important;
+}
+.modal-header { border-bottom: 1px solid var(--sx-border) !important; }
+.modal-footer { border-top: 1px solid var(--sx-border) !important; }
+.modal-title { color: var(--sx-text) !important; }
+
+/* ════════ alert ════════ */
+.alert {
+    border-radius: 8px;
+    backdrop-filter: blur(8px);
+}
+.alert-info {
+    background: rgba(34, 211, 238, 0.1) !important;
+    border-color: rgba(34, 211, 238, 0.3) !important;
+    color: var(--sx-cyan) !important;
+}
+
+/* ════════ 代码/等宽 ════════ */
+code, pre {
+    font-family: var(--sx-mono) !important;
+    color: var(--sx-cyan) !important;
+}
+
+/* ════════ 下拉菜单 ════════ */
+.dropdown-menu {
+    background: var(--sx-surface) !important;
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--sx-border-hi) !important;
+}
+.dropdown-item { color: var(--sx-text-dim) !important; }
+.dropdown-item:hover { background: rgba(99, 102, 241, 0.15) !important; color: var(--sx-cyan) !important; }
+
+/* ════════ 页面标题渐变 ════════ */
+h3, h4, h5 {
+    background: linear-gradient(135deg, var(--sx-text), var(--sx-text-dim));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+/* 移除渐变的小标题 */
+.badge, .card-header, .navbar-brand, .btn, .table th { -webkit-text-fill-color: initial; }
+
+/* ════════ 信号环形仪表（修复文字被遮挡）════════ */
+.signal-ring::after {
+    z-index: 0;
+}
+.signal-value {
+    position: relative;
+    z-index: 1;
+    font-size: 2rem;
+    font-weight: 800;
+    color: var(--sx-text);
+    text-shadow: 0 0 12px rgba(99, 102, 241, 0.3);
+}
+.signal-value small {
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: var(--sx-text-dim);
+}
+
+/* ═══════════════════════════════════════════════════════
+   宇宙星球导航系统
+   ═══════════════════════════════════════════════════════ */
+
+.sx-universe {
+    position: relative;
+    width: 100%;
+    max-width: 680px;
+    height: 680px;
     margin: 0 auto;
     display: flex;
     align-items: center;
     justify-content: center;
-    background:
-        conic-gradient(var(--score-color) calc(var(--ring, 0) * 1%), #e9ecef 0);
-    position: relative;
 }
 
-.signal-ring::before {
-    content: "";
+/* ── 中心恒星 ── */
+.sx-sun {
     position: absolute;
-    inset: 12px;
-    background: #fff;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 10;
+    text-align: center;
+}
+
+.sx-sun-core {
+    width: 80px;
+    height: 80px;
     border-radius: 50%;
-    box-shadow: inset 0 0 6px rgba(0,0,0,0.06);
+    background: url('/static/img/planets/thumb_sun.jpg') center/cover;
+    box-shadow:
+        0 0 30px rgba(251, 191, 36, 0.6),
+        0 0 60px rgba(251, 191, 36, 0.3);
+    animation: sx-sun-pulse 3s ease-in-out infinite;
 }
 
-.signal-value {
-    position: relative;
-    font-size: 2.6rem;
+@keyframes sx-sun-pulse {
+    0%, 100% { box-shadow: 0 0 30px rgba(251,191,36,0.6), 0 0 60px rgba(251,191,36,0.3); }
+    50%      { box-shadow: 0 0 45px rgba(251,191,36,0.8), 0 0 90px rgba(251,191,36,0.4); }
+}
+
+.sx-sun-glow {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 120px; height: 120px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(251,191,36,0.15), transparent 70%);
+    animation: sx-sun-glow 4s ease-in-out infinite alternate;
+    pointer-events: none;
+}
+
+@keyframes sx-sun-glow {
+    from { opacity: 0.6; transform: translate(-50%,-50%) scale(1); }
+    to   { opacity: 1;   transform: translate(-50%,-50%) scale(1.3); }
+}
+
+.sx-sun-label {
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 8px;
+    font-size: 11px;
     font-weight: 700;
-    line-height: 1;
-    color: var(--score-color);
+    letter-spacing: 1px;
+    background: linear-gradient(135deg, #fbbf24, #f59e0b);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    white-space: nowrap;
 }
 
-.signal-value small {
-    font-size: 1rem;
-    color: #adb5bd;
-    font-weight: 400;
+/* ── 轨道线 ── */
+.sx-orbit {
+    position: absolute;
+    top: 50%; left: 50%;
+    border-radius: 50%;
+    border: 1px dashed rgba(99, 179, 237, 0.1);
+}
+
+.sx-orbit-1 { width: 260px; height: 260px; margin: -130px 0 0 -130px; }
+.sx-orbit-2 { width: 420px; height: 420px; margin: -210px 0 0 -210px; }
+.sx-orbit-3 { width: 580px; height: 580px; margin: -290px 0 0 -290px; }
+
+/* ── 星球 ── */
+.sx-planet {
+    position: absolute;
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none !important;
+    cursor: pointer;
+    transition: transform 0.3s, box-shadow 0.3s;
+    z-index: 5;
+}
+
+.sx-planet i {
+    font-size: 22px;
+    color: rgba(255,255,255,0.9);
+    text-shadow: 0 0 8px rgba(0,0,0,0.5);
+}
+
+.sx-planet-name {
+    position: absolute;
+    bottom: -20px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--sx-text-dim);
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.3s, color 0.3s;
+}
+
+.sx-planet:hover {
+    transform: scale(1.3);
+    z-index: 20;
+}
+
+.sx-planet:hover .sx-planet-name {
+    opacity: 1;
+    color: var(--sx-text);
+}
+
+/* 星球颜色 */
+.sx-p-market    { background: url('/static/img/planets/thumb_earth.jpg') center/cover; box-shadow: 0 0 20px rgba(96,165,250,0.4); }
+.sx-p-auction   { background: url('/static/img/planets/thumb_mercury.jpg') center/cover; box-shadow: 0 0 20px rgba(251,191,36,0.4); }
+.sx-p-intraday  { background: url('/static/img/planets/thumb_mars.jpg') center/cover; box-shadow: 0 0 20px rgba(239,68,68,0.4); }
+
+.sx-p-stock     { background: url('/static/img/planets/thumb_neptune.jpg') center/cover; box-shadow: 0 0 20px rgba(34,211,238,0.4); }
+.sx-p-decision  { background: url('/static/img/planets/thumb_jupiter.jpg') center/cover; box-shadow: 0 0 20px rgba(124,58,237,0.4); }
+.sx-p-position  { background: url('/static/img/planets/thumb_saturn.jpg') center/cover; box-shadow: 0 0 20px rgba(249,115,22,0.4); }
+.sx-p-paper     { background: url('/static/img/planets/thumb_venus.jpg') center/cover; box-shadow: 0 0 20px rgba(34,197,94,0.4); }
+
+.sx-p-strategy  { background: url('/static/img/planets/thumb_uranus.jpg') center/cover; box-shadow: 0 0 20px rgba(59,130,246,0.4); }
+.sx-p-factor    { background: url('/static/img/planets/thumb_ceres.jpg') center/cover; box-shadow: 0 0 20px rgba(20,184,166,0.4); }
+.sx-p-portfolio { background: url('/static/img/planets/thumb_moon.jpg') center/cover; box-shadow: 0 0 20px rgba(234,179,8,0.4); }
+.sx-p-stocks    { background: url('/static/img/planets/thumb_eris.jpg') center/cover; box-shadow: 0 0 20px rgba(107,114,128,0.4); }
+.sx-p-system    { background: url('/static/img/planets/thumb_makemake.jpg') center/cover; box-shadow: 0 0 20px rgba(99,102,241,0.4); }
+
+/* 星球悬停光晕 */
+.sx-p-market:hover    { box-shadow: 0 0 35px rgba(96,165,250,0.8); }
+.sx-p-auction:hover   { box-shadow: 0 0 35px rgba(251,191,36,0.8); }
+.sx-p-intraday:hover  { box-shadow: 0 0 35px rgba(239,68,68,0.8); }
+.sx-p-stock:hover     { box-shadow: 0 0 35px rgba(34,211,238,0.8); }
+.sx-p-decision:hover  { box-shadow: 0 0 35px rgba(124,58,237,0.8); }
+.sx-p-position:hover  { box-shadow: 0 0 35px rgba(249,115,22,0.8); }
+.sx-p-paper:hover     { box-shadow: 0 0 35px rgba(34,197,94,0.8); }
+.sx-p-strategy:hover  { box-shadow: 0 0 35px rgba(59,130,246,0.8); }
+.sx-p-factor:hover    { box-shadow: 0 0 35px rgba(20,184,166,0.8); }
+.sx-p-portfolio:hover { box-shadow: 0 0 35px rgba(234,179,8,0.8); }
+.sx-p-stocks:hover    { box-shadow: 0 0 35px rgba(107,114,128,0.8); }
+.sx-p-system:hover    { box-shadow: 0 0 35px rgba(99,102,241,0.8); }
+
+/* ── 星球定位（均匀分布在轨道上）── */
+/* 内层轨道 3 球：120° 间隔 */
+.sx-p-market   { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(0deg)   translateY(-130px) rotate(0deg); }
+.sx-p-auction  { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(120deg)  translateY(-130px) rotate(-120deg); }
+.sx-p-intraday { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(240deg)  translateY(-130px) rotate(-240deg); }
+
+/* 中层轨道 4 球：90° 间隔 */
+.sx-p-stock    { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(0deg)   translateY(-210px) rotate(0deg); }
+.sx-p-decision { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(90deg)  translateY(-210px) rotate(-90deg); }
+.sx-p-position { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(180deg) translateY(-210px) rotate(-180deg); }
+.sx-p-paper    { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(270deg) translateY(-210px) rotate(-270deg); }
+
+/* 外层轨道 5 球：72° 间隔 */
+.sx-p-strategy  { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(0deg)   translateY(-290px) rotate(0deg); }
+.sx-p-factor    { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(72deg)  translateY(-290px) rotate(-72deg); }
+.sx-p-portfolio { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(144deg) translateY(-290px) rotate(-144deg); }
+.sx-p-stocks    { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(216deg) translateY(-290px) rotate(-216deg); }
+.sx-p-system    { top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(288deg) translateY(-290px) rotate(-288deg); }
+
+/* hover 时保持 rotate 纠正 + 放大 */
+.sx-p-market:hover    { transform: translate(-50%, -50%) rotate(0deg)   translateY(-130px) rotate(0deg) scale(1.3); }
+.sx-p-auction:hover   { transform: translate(-50%, -50%) rotate(120deg)  translateY(-130px) rotate(-120deg) scale(1.3); }
+.sx-p-intraday:hover  { transform: translate(-50%, -50%) rotate(240deg)  translateY(-130px) rotate(-240deg) scale(1.3); }
+.sx-p-stock:hover     { transform: translate(-50%, -50%) rotate(0deg)   translateY(-210px) rotate(0deg) scale(1.3); }
+.sx-p-decision:hover  { transform: translate(-50%, -50%) rotate(90deg)  translateY(-210px) rotate(-90deg) scale(1.3); }
+.sx-p-position:hover  { transform: translate(-50%, -50%) rotate(180deg) translateY(-210px) rotate(-180deg) scale(1.3); }
+.sx-p-paper:hover     { transform: translate(-50%, -50%) rotate(270deg) translateY(-210px) rotate(-270deg) scale(1.3); }
+.sx-p-strategy:hover  { transform: translate(-50%, -50%) rotate(0deg)   translateY(-290px) rotate(0deg) scale(1.3); }
+.sx-p-factor:hover    { transform: translate(-50%, -50%) rotate(72deg)  translateY(-290px) rotate(-72deg) scale(1.3); }
+.sx-p-portfolio:hover { transform: translate(-50%, -50%) rotate(144deg) translateY(-290px) rotate(-144deg) scale(1.3); }
+.sx-p-stocks:hover    { transform: translate(-50%, -50%) rotate(216deg) translateY(-290px) rotate(-216deg) scale(1.3); }
+.sx-p-system:hover    { transform: translate(-50%, -50%) rotate(288deg) translateY(-290px) rotate(-288deg) scale(1.3); }
+
+/* ── 图例 ── */
+.sx-universe-legend {
+    text-align: center;
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--sx-text-dim);
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.sx-legend-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-right: 4px;
+}
+
+.sx-ld-1 { background: #60a5fa; box-shadow: 0 0 8px rgba(96,165,250,0.5); }
+.sx-ld-2 { background: #a78bfa; box-shadow: 0 0 8px rgba(167,139,250,0.5); }
+.sx-ld-3 { background: #5eead4; box-shadow: 0 0 8px rgba(94,234,212,0.5); }
+
+/* ── 响应式：小屏幕缩小 ── */
+@media (max-width: 768px) {
+    .sx-universe { transform: scale(0.55); height: 400px; }
 }

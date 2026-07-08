@@ -146,3 +146,12 @@ async def factor_page(request: Request):
         request=request, name="factor.html",
         context={},
     )
+
+
+@router.get("/paper")
+async def paper_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="paper.html",
+        context={},
+    )

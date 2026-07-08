@@ -212,6 +212,9 @@ class DecisionEngine:
         market_state, market_score, market_label = self._get_market_state(market_fn)
         logger.info(f"市场状态：{market_state}（评分{market_score} {market_label}）")
 
+        # 信号日涨停过滤：封死的票买不进，T+1再观察
+        pool = self._filter_limit_up(pool)
+
         # 分层截断候选池（对齐回测价值，非纯共振度排序）
         # 回测事实：单策略+1.22%/47%最优，2策略+1.08%/44%，3+策略-2.07%/27%过热见顶
         # 故：3+共振直接淘汰 → 剩余按动量+共振bonus预筛
@@ -323,6 +326,19 @@ class DecisionEngine:
         buy_list = [i for i in buy_list if i.shares > 0]
         reject_list = cannot_buy + reject_list
 
+        # 决策池落库：buy_list + 接近买入线的reject纳入盘中关注池
+        watch_candidates = [self._to_dict(i) for i in buy_list]
+        for i in reject_list:
+            if i.score >= max(min_score - 10, 50):  # 评分接近买入线的也监控
+                d = self._to_dict(i)
+                d["source"] = "watch"
+                watch_candidates.append(d)
+        try:
+            self.engine.save_decision_pool(watch_candidates)
+            logger.info(f"决策池落库：{len(watch_candidates)}只纳入盘中关注")
+        except Exception as e:
+            logger.warning(f"决策池落库失败（不影响决策结果）：{e!r}")
+
         return {
             "buy_list": [self._to_dict(i) for i in buy_list],
             "reject_list": [self._to_dict(i) for i in reject_list],
@@ -374,6 +390,52 @@ class DecisionEngine:
         if excluded:
             logger.info(f"市场板块过滤：剔除 {excluded} 只（{','.join(exclude_markets)}）")
         return filtered
+
+    def _filter_limit_up(self, pool: dict[str, list[str]]) -> dict[str, list[str]]:
+        """剔除信号日涨停股（封死买不进，追涨停≠量化选股）。
+
+        用pct_chg字段按板块限幅判定涨停：创业板/科创板20%、北交所30%、主板10%。
+        阈值取板块限幅95%（避免复权精度误差误判）。
+        """
+        import sqlite3
+
+        syms = list(pool.keys())
+        if not syms:
+            return pool
+
+        placeholders = ",".join("?" * len(syms))
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                latest = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()[0]
+                if not latest:
+                    return pool
+                rows = conn.execute(
+                    f"SELECT symbol, pct_chg FROM stock_daily WHERE date=? AND symbol IN ({placeholders})",
+                    [latest] + syms,
+                ).fetchall()
+        except Exception:
+            return pool
+
+        def _limit_threshold(symbol: str) -> float:
+            if symbol.startswith(("300", "301", "688", "689")):
+                return 19.0
+            if symbol.startswith(("8", "4", "92")):
+                return 28.5
+            return 9.5
+
+        pct_map = {sym: pct for sym, pct in rows}
+        kept = {}
+        excluded = 0
+        for sym in syms:
+            pct = pct_map.get(sym)
+            if pct is not None and pct >= _limit_threshold(sym):
+                excluded += 1
+            else:
+                kept[sym] = pool[sym]
+
+        if excluded:
+            logger.info(f"涨停过滤：剔除 {excluded} 只信号日涨停股（封死买不进，T+1再看）")
+        return kept
 
     # ------------------------------------------------------------------
     # 定级逻辑

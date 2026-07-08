@@ -428,6 +428,19 @@ class StockAnalyzer:
             piv = all_df[all_df["date"].isin([latest, prev])].pivot(index="symbol", columns="date", values="close")
             if latest in piv.columns and prev in piv.columns:
                 chg = (piv[latest] - piv[prev]) / piv[prev] * 100
+                # 用 pct_chg 校正：除权日后复权自算会失真，改用 DB pct_chg 字段
+                import sqlite3 as _sq
+                with _sq.connect(self.db_path) as _c:
+                    _chg_rows = _c.execute(
+                        "SELECT symbol, pct_chg FROM stock_daily WHERE date=? AND pct_chg IS NOT NULL",
+                        (latest,),
+                    ).fetchall()
+                if _chg_rows:
+                    _chg_map = {s: v for s, v in _chg_rows}
+                    chg = chg.copy()
+                    for _idx in chg.index:
+                        if _idx in _chg_map:
+                            chg[_idx] = _chg_map[_idx]
                 if symbol in chg.index and pd.notna(chg[symbol]):
                     rank = (chg > chg[symbol]).sum() + 1
                     result["today_chg"] = round(float(chg[symbol]), 2)
@@ -472,8 +485,8 @@ class StockAnalyzer:
                 return {"board": "未分类"}
             board = row[0]
             rows = conn.execute("""
-                SELECT t.symbol, (t.close-p.close)/p.close*100 AS chg
-                FROM (SELECT symbol,close FROM stock_daily WHERE date=?) t
+                SELECT t.symbol, COALESCE(t.pct_chg, (t.close-p.close)/p.close*100) AS chg
+                FROM (SELECT symbol,close,pct_chg FROM stock_daily WHERE date=?) t
                 JOIN (SELECT symbol,close FROM stock_daily WHERE date=?) p USING(symbol)
                 JOIN stock_board_em bd ON bd.symbol=t.symbol WHERE bd.board=?
             """, (latest, prev, board)).fetchall()
@@ -518,8 +531,8 @@ class StockAnalyzer:
             # 大盘评分（复用 signal_score 逻辑）
             breadth_score = round(up_ratio)
             avg_chg_row = conn.execute("""
-                SELECT AVG((t.close-p.close)/p.close*100) FROM
-                (SELECT symbol,close FROM stock_daily WHERE date=?) t
+                SELECT AVG(COALESCE(t.pct_chg, (t.close-p.close)/p.close*100)) FROM
+                (SELECT symbol,close,pct_chg FROM stock_daily WHERE date=?) t
                 JOIN (SELECT symbol,close FROM stock_daily WHERE date=?) p USING(symbol)
             """, (latest, prev)).fetchone()
             avg_chg = avg_chg_row[0] or 0
@@ -531,11 +544,11 @@ class StockAnalyzer:
                     SUM(CASE WHEN age>5 AND chg>=th THEN 1 ELSE 0 END),
                     SUM(CASE WHEN age>5 AND chg<=-th THEN 1 ELSE 0 END)
                 FROM (
-                    SELECT c.symbol,(c.close-p.close)/p.close*100 AS chg,
+                    SELECT c.symbol,COALESCE(c.pct_chg,(c.close-p.close)/p.close*100) AS chg,
                         CASE WHEN c.symbol LIKE '30%' OR c.symbol LIKE '68%' THEN 19.5
                              WHEN COALESCE(b.name,'') LIKE '%ST%' THEN 4.6 ELSE 9.7 END AS th,
                         julianday(?) - julianday(COALESCE(b.ipo_date,'2000-01-01')) AS age
-                    FROM (SELECT symbol,close FROM stock_daily WHERE date=?) c
+                    FROM (SELECT symbol,close,pct_chg FROM stock_daily WHERE date=?) c
                     JOIN (SELECT symbol,close FROM stock_daily WHERE date=?) p USING(symbol)
                     LEFT JOIN stock_basic b ON b.symbol=c.symbol
                 )
@@ -557,9 +570,9 @@ class StockAnalyzer:
             board_hot = None
             if brd_row:
                 boards = conn.execute(f"""
-                    WITH chg AS (SELECT bd.board AS b,(t.close-p.close)/p.close*100 AS pct,
+                    WITH chg AS (SELECT bd.board AS b,COALESCE(t.pct_chg,(t.close-p.close)/p.close*100) AS pct,
                         COALESCE(mc.circ_mv,t.turnover,1) AS w FROM
-                        (SELECT symbol,close,turnover FROM stock_daily WHERE date=?) t
+                        (SELECT symbol,close,turnover,pct_chg FROM stock_daily WHERE date=?) t
                         JOIN (SELECT symbol,close FROM stock_daily WHERE date=?) p USING(symbol)
                         JOIN {_BOARD_TABLE} bd ON bd.symbol=t.symbol
                         LEFT JOIN {_MARKET_CAP_TABLE} mc ON mc.symbol=t.symbol)
@@ -817,9 +830,17 @@ class StockAnalyzer:
     def _analyze_capital(self, symbol: str) -> dict:
         """资金面：主力净流入占比/净额（东财）+ 龙虎榜（近5日）。"""
         quote = self._fetch_quote(symbol)
-        main_amount = quote.get("main_amount")
-        float_cap = quote.get("float_cap")
-        main_pct = quote.get("main_pct")
+
+        def _safe_float(v):
+            """东财返回'-'等非数字字符串时返回None，避免类型错误。"""
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        main_amount = _safe_float(quote.get("main_amount"))
+        float_cap = _safe_float(quote.get("float_cap"))
+        main_pct = _safe_float(quote.get("main_pct"))
         if main_pct is None and main_amount is not None and float_cap and float_cap > 0:
             main_pct = main_amount / float_cap * 100
 
@@ -1062,8 +1083,20 @@ class StockAnalyzer:
             return {"missing": 0, "fetched": 0, "skipped": len(symbols)}
 
         logger.info(f"财报批量预采：{len(missing)}/{len(symbols)} 只缺财报，集中采集...")
-        import time
+        import time, socket
         t0 = time.time()
+
+        # baostock连通性预检（3秒socket超时，避免服务器宕机时卡死决策线程）
+        try:
+            sock = socket.create_connection(("114.94.20.73", 10030), timeout=3)
+            sock.close()
+        except Exception:
+            logger.warning(
+                f"baostock不可达(3s超时)，跳过财报预采{len(missing)}只，"
+                f"已有缓存{len(symbols) - len(missing)}只照常使用"
+            )
+            return {"missing": len(missing), "fetched": 0, "skipped": len(symbols) - len(missing)}
+
         import baostock as bs
         _baostock_acquire()
         fetched_total = 0
@@ -1140,7 +1173,43 @@ class StockAnalyzer:
         return fetched
 
     def _fetch_lhb(self, symbol: str) -> dict | None:
-        """东财龙虎榜：查近 7 日该股是否上榜，返回上榜日/净买额/解读。"""
+        """龙虎榜：查近 7 日该股是否上榜，返回上榜日/净买额/解读。
+        优先查本地 DB（毫秒级），无数据时 fallback akshare。
+        """
+        result = self._fetch_lhb_local(symbol)
+        if result is not None:
+            return result
+        return self._fetch_lhb_remote(symbol)
+
+    def _fetch_lhb_local(self, symbol: str) -> dict | None:
+        """从本地 lhb_detail 查个股龙虎榜（毫秒级，无网络依赖）。"""
+        import sqlite3
+        from sequoia_x.core.config import Settings
+        db_path = Settings().db_path
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    """SELECT date, net_buy, close, pct_chg, reason, interp
+                       FROM lhb_detail WHERE symbol=?
+                       ORDER BY date DESC LIMIT 1""",
+                    (symbol,),
+                ).fetchone()
+        except Exception as e:
+            logger.debug(f"本地龙虎榜查询失败（表可能未创建）：{e!r}")
+            return None
+        if not row:
+            return None
+        return {
+            "date": str(row["date"]),
+            "reason": str(row["interp"] or row["reason"] or ""),
+            "net_buy": self._sf(row["net_buy"]),
+            "close": self._sf(row["close"]),
+            "chg": self._sf(row["pct_chg"]),
+        }
+
+    def _fetch_lhb_remote(self, symbol: str) -> dict | None:
+        """fallback：实时拉 akshare 龙虎榜（网络慢）。"""
         import akshare as ak
         from datetime import date, timedelta
         end = date.today().strftime("%Y%m%d")

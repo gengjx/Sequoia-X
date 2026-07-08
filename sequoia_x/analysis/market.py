@@ -200,7 +200,7 @@ class MarketAnalyzer:
     # ------------------------------------------------------------------
     def _compute_breadth(self, latest: str, prev: str) -> dict:
         sql = """
-        WITH t AS (SELECT symbol, close, turnover FROM stock_daily WHERE date = ?),
+        WITH t AS (SELECT symbol, close, turnover, pct_chg FROM stock_daily WHERE date = ?),
              p AS (SELECT symbol, close FROM stock_daily WHERE date = ?)
         SELECT
             SUM(CASE WHEN t.close > p.close THEN 1 ELSE 0 END) AS up,
@@ -208,7 +208,7 @@ class MarketAnalyzer:
             SUM(CASE WHEN t.close = p.close THEN 1 ELSE 0 END) AS flat,
             COUNT(*) AS total,
             SUM(t.turnover) AS turnover,
-            AVG((t.close - p.close) / p.close * 100) AS avg_chg
+            AVG(COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100)) AS avg_chg
         FROM t JOIN p ON t.symbol = p.symbol
         """
         with sqlite3.connect(self.db_path) as conn:
@@ -220,10 +220,10 @@ class MarketAnalyzer:
         lim_sql = """
         WITH c AS (
             SELECT t.symbol,
-                   (t.close - p.close) / p.close * 100 AS chg,
+                   COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg,
                    (t.high  - p.close) / p.close * 100 AS hi,
                    (t.low   - p.close) / p.close * 100 AS lo
-            FROM (SELECT symbol, close, high, low FROM stock_daily WHERE date = ?) t
+            FROM (SELECT symbol, close, high, low, pct_chg FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
         ),
         cl AS (
@@ -383,6 +383,7 @@ class MarketAnalyzer:
                     start_date=start_date,
                     end_date=latest,
                     frequency="d",
+                    adjustflag="3",  # 指数不复权
                 )
                 if rs.error_code != "0":
                     continue
@@ -767,9 +768,9 @@ class MarketAnalyzer:
         sql = f"""
         WITH chg AS (
             SELECT bd.board AS sector,
-                   (t.close - p.close) / p.close * 100 AS pct,
+                   COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS pct,
                    COALESCE(mc.circ_mv, t.turnover, 1) AS w
-            FROM (SELECT symbol, close, turnover FROM stock_daily WHERE date = ?) t
+            FROM (SELECT symbol, close, turnover, pct_chg FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
             JOIN {_BOARD_TABLE} bd ON bd.symbol = t.symbol
             LEFT JOIN {_MARKET_CAP_TABLE} mc ON mc.symbol = t.symbol
@@ -798,9 +799,9 @@ class MarketAnalyzer:
         sql = f"""
         WITH c AS (
             SELECT ind.industry AS sector,
-                   (t.close - p.close) / p.close * 100 AS chg,
+                   COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg,
                    COALESCE(mc.circ_mv, t.turnover, 1) AS w
-            FROM (SELECT symbol, close, turnover FROM stock_daily WHERE date = ?) t
+            FROM (SELECT symbol, close, turnover, pct_chg FROM stock_daily WHERE date = ?) t
             JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING (symbol)
             JOIN {_INDUSTRY_TABLE} ind ON ind.symbol = t.symbol
             LEFT JOIN {_MARKET_CAP_TABLE} mc ON mc.symbol = t.symbol
@@ -974,7 +975,7 @@ class MarketAnalyzer:
                 net = conn.execute("""
                     SELECT SUM(CASE WHEN t.close > p.close THEN 1 ELSE 0 END) -
                            SUM(CASE WHEN t.close < p.close THEN 1 ELSE 0 END)
-                    FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                    FROM (SELECT symbol, close, pct_chg FROM stock_daily WHERE date = ?) t
                     JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                 """, (today, prev)).fetchone()[0]
                 adl_daily.append(net or 0)
@@ -1390,7 +1391,7 @@ class MarketAnalyzer:
             # 一次性算出每日 breadth（用窗口函数 LAG 高效计算）
             daily = conn.execute("""
                 WITH ranked AS (
-                    SELECT date, symbol, close, turnover,
+                    SELECT date, symbol, close, turnover, pct_chg,
                            LAG(close) OVER (PARTITION BY symbol ORDER BY date) AS prev_close
                     FROM stock_daily WHERE date >= ?
                 )
@@ -1400,7 +1401,7 @@ class MarketAnalyzer:
                     SUM(CASE WHEN close = prev_close THEN 1 ELSE 0 END) AS flat,
                     COUNT(*) AS total,
                     SUM(turnover) AS turnover,
-                    AVG((close - prev_close) / prev_close * 100) AS avg_chg
+                    AVG(COALESCE(pct_chg, (close - prev_close) / prev_close * 100)) AS avg_chg
                 FROM ranked WHERE prev_close IS NOT NULL
                 GROUP BY date ORDER BY date
             """, (start_date,)).fetchall()
@@ -1464,8 +1465,8 @@ class MarketAnalyzer:
             for today, yest in date_pairs:
                 lu, ld = conn.execute("""
                     WITH c AS (
-                        SELECT t.symbol, (t.close - p.close) / p.close * 100 AS chg
-                        FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                        SELECT t.symbol, COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg
+                        FROM (SELECT symbol, close, pct_chg FROM stock_daily WHERE date = ?) t
                         JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                     )
                     SELECT
@@ -1650,7 +1651,7 @@ class MarketAnalyzer:
                 rows = conn.execute("""
                     SELECT symbol FROM (
                         SELECT t.symbol,
-                               (t.close - p.close) / p.close * 100 AS chg,
+                               COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg,
                                CASE
                                    WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
                                    WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
@@ -1658,7 +1659,7 @@ class MarketAnalyzer:
                                    ELSE 9.7
                                END AS th,
                                julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
-                        FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                        FROM (SELECT symbol, close, pct_chg FROM stock_daily WHERE date = ?) t
                         JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                         LEFT JOIN stock_basic b ON b.symbol = t.symbol
                     )
@@ -1696,7 +1697,7 @@ class MarketAnalyzer:
                 FROM (
                     SELECT t.symbol,
                            (t.high  - p.close) / p.close * 100 AS hi,
-                           (t.close - p.close) / p.close * 100 AS chg,
+                           COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg,
                            CASE
                                WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
                                WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
@@ -1704,7 +1705,7 @@ class MarketAnalyzer:
                                ELSE 9.7
                            END AS th,
                            julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
-                    FROM (SELECT symbol, close, high FROM stock_daily WHERE date = ?) t
+                    FROM (SELECT symbol, close, high, pct_chg FROM stock_daily WHERE date = ?) t
                     JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                     LEFT JOIN stock_basic b ON b.symbol = t.symbol
                 )
@@ -1717,7 +1718,7 @@ class MarketAnalyzer:
             ld = conn.execute("""
                 SELECT COUNT(*) FROM (
                     SELECT t.symbol,
-                           (t.close - p.close) / p.close * 100 AS chg,
+                           COALESCE(t.pct_chg, (t.close - p.close) / p.close * 100) AS chg,
                            CASE
                                WHEN t.symbol LIKE '30%' OR t.symbol LIKE '68%' THEN 19.5
                                WHEN t.symbol LIKE '8%' OR t.symbol LIKE '4%' THEN 29.0
@@ -1725,7 +1726,7 @@ class MarketAnalyzer:
                                ELSE 9.7
                            END AS th,
                            julianday(?) - julianday(COALESCE(b.ipo_date, '2000-01-01')) AS age
-                    FROM (SELECT symbol, close FROM stock_daily WHERE date = ?) t
+                    FROM (SELECT symbol, close, pct_chg FROM stock_daily WHERE date = ?) t
                     JOIN (SELECT symbol, close FROM stock_daily WHERE date = ?) p USING(symbol)
                     LEFT JOIN stock_basic b ON b.symbol = t.symbol
                 ) WHERE age > 5 AND chg <= -th
@@ -1751,7 +1752,66 @@ class MarketAnalyzer:
         }
 
     def _fetch_dragon_tiger(self) -> dict:
-        """龙虎榜：游资席位、机构净买卖。"""
+        """龙虎榜：游资席位、机构净买卖。优先查本地 DB，无数据时 fallback akshare。"""
+        result = self._fetch_dragon_tiger_local()
+        if result.get("total_count", 0) > 0:
+            return result
+        # fallback：实时拉 akshare
+        return self._fetch_dragon_tiger_remote()
+
+    def _fetch_dragon_tiger_local(self) -> dict:
+        """从本地 lhb_detail + lhb_seats 查龙虎榜（毫秒级，无网络依赖）。"""
+        result: dict = {}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # 近5日龙虎榜个股东涛
+                stocks = conn.execute(
+                    """SELECT symbol, name, date, net_buy, pct_chg
+                       FROM lhb_detail
+                       WHERE date IN (
+                           SELECT DISTINCT date FROM lhb_detail ORDER BY date DESC LIMIT 5
+                       )
+                       ORDER BY net_buy DESC LIMIT 10"""
+                ).fetchall()
+                if stocks:
+                    result["top_stocks"] = [
+                        {"code": r["symbol"], "name": r["name"],
+                         "net_buy": round((r["net_buy"] or 0) / 1e8, 2),
+                         "change_pct": round(r["pct_chg"] or 0, 2)}
+                        for r in stocks
+                    ]
+                    result["total_count"] = conn.execute(
+                        """SELECT COUNT(DISTINCT symbol) FROM lhb_detail WHERE date=(
+                           SELECT MAX(date) FROM lhb_detail)"""
+                    ).fetchone()[0]
+                    # 席位净买入 TOP5（近5日汇总）
+                    seats = conn.execute(
+                        """SELECT seat_name, SUM(net_amount) AS net
+                           FROM lhb_seats
+                           WHERE date IN (
+                               SELECT DISTINCT date FROM lhb_detail ORDER BY date DESC LIMIT 5
+                           )
+                           GROUP BY seat_name ORDER BY net DESC LIMIT 5"""
+                    ).fetchall()
+                    if seats:
+                        result["top_institutions"] = [
+                            {"name": r["seat_name"],
+                             "net_buy": round((r["net"] or 0) / 1e8, 2)}
+                            for r in seats
+                        ]
+        except Exception as exc:
+            logger.debug(f"本地龙虎榜查询失败（表可能未创建）：{exc}")
+
+        result["text"] = (
+            f"龙虎榜共 {result.get('total_count', 0)} 只个股上榜。"
+            + (f"游资/机构重点关注：{result.get('top_stocks', [{}])[0].get('name', '')}。"
+               if result.get("top_stocks") else "")
+        )
+        return result
+
+    def _fetch_dragon_tiger_remote(self) -> dict:
+        """fallback：实时拉 akshare 龙虎榜（网络慢，仅在本地无数据时调用）。"""
         import akshare as ak
         from datetime import datetime as _dt, timedelta as _td
 
@@ -1831,3 +1891,45 @@ class MarketAnalyzer:
         if not risks:
             risks.append("当前盘面信号平稳，建议关注后续量能变化与主线延续性。")
         return risks
+
+
+    @staticmethod
+    def fetch_sectors_realtime() -> list[dict]:
+        """拉取东财行业板块实时涨幅榜（盘中可用）。
+
+        Returns:
+            [{code, name, change_pct, turnover_rate, up_count, down_count, leading_stock}, ...]
+        """
+        import requests
+
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+        result = []
+        try:
+            r = requests.get(
+                "https://push2delay.eastmoney.com/api/qt/clist/get",
+                params={
+                    "pn": 1, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                    "fs": "m:90+t:2",  # 行业板块
+                    "fields": "f12,f14,f2,f3,f8,f104,f105,f128,f136",
+                },
+                headers=headers, timeout=10,
+            )
+            data = r.json().get("data", {}).get("diff", [])
+            for item in data:
+                try:
+                    result.append({
+                        "code": str(item.get("f12", "")),
+                        "name": str(item.get("f14", "")),
+                        "price": float(item.get("f2", 0) or 0),
+                        "change_pct": round(float(item.get("f3", 0) or 0), 2),
+                        "turnover_rate": round(float(item.get("f8", 0) or 0), 2),
+                        "up_count": int(item.get("f104", 0) or 0),
+                        "down_count": int(item.get("f105", 0) or 0),
+                        "leading_stock": str(item.get("f128", "")),
+                    })
+                except (ValueError, TypeError):
+                    continue
+            result.sort(key=lambda x: x["change_pct"], reverse=True)
+        except Exception as e:
+            logger.warning(f"板块实时行情拉取失败：{e!r}")
+        return result

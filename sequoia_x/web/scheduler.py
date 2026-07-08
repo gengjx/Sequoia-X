@@ -29,12 +29,17 @@ class AuctionScheduler:
         (9, 25, "auction_scan"),
         (9, 30, "intraday_scan_start"),  # 启动盘中轮询
         (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
+        (21, 5, "sync_lhb"),         # 龙虎榜数据同步（紧跟日K之后）
+        (21, 6, "sync_fund_flow"),   # 主力资金流向同步
+        (21, 10, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
+        (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
     ]
 
     def __init__(self, settings: Settings, db_path: str) -> None:
         self.settings = settings
         self.db_path = db_path
+        self.engine = None  # 延迟初始化
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_run: dict[str, str] = {}  # {task_name: "YYYY-MM-DD"}
@@ -86,6 +91,14 @@ class AuctionScheduler:
             self._auction_verify()
         elif task == "intraday_scan_start":
             self._intraday_loop()
+        elif task == "paper_trade":
+            self._paper_trade()
+        elif task == "sync_lhb":
+            self._sync_lhb()
+        elif task == "sync_fund_flow":
+            self._sync_fund_flow()
+        elif task == "refresh_factor_ic":
+            self._refresh_factor_ic()
 
     def _auction_scan(self) -> None:
         """竞价扫描 + 飞书推送。"""
@@ -110,6 +123,71 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"定时数据同步失败：{e!r}")
 
+    def _sync_lhb(self) -> None:
+        """龙虎榜数据自动同步（日K同步后执行）。"""
+        from sequoia_x.data.engine import DataEngine
+        try:
+            engine = DataEngine(self.settings)
+            n = engine.sync_lhb()
+            logger.info(f"龙虎榜同步完成：{n} 只个股明细")
+            # 席位明细较慢（逐股请求），后台执行不阻塞
+            n2 = engine.sync_lhb_seats()
+            logger.info(f"龙虎榜席位同步完成：{n2} 行")
+        except Exception as e:
+            logger.warning(f"龙虎榜同步失败：{e!r}")
+
+    def _refresh_factor_ic(self) -> None:
+        """因子IC权重自动刷新（滚动6个月窗口 + 三态权重）。
+
+        每天盘后执行：
+          1. 用最近6个月数据重算因子IC
+          2. 写入带符号权重到DB
+          3. 更新三态市场状态权重
+          4. 飞书通知刷新结果
+        """
+        try:
+            from sequoia_x.data.engine import DataEngine
+            from sequoia_x.analysis.factor import evaluate_factor_ic
+            engine = DataEngine(self.settings)
+            result = evaluate_factor_ic(
+                engine, hold_days=20, sample_size=500, rolling_months=6
+            )
+            factors = result.get("factors", [])
+            effective = [f for f in factors if abs(f.get("ic_mean", 0)) > 0.015
+                         and abs(f.get("icir", 0)) > 0.3]
+            logger.info(f"因子IC刷新完成：{len(effective)}/{len(factors)}个有效因子（滚动6个月）")
+        except Exception as e:
+            logger.warning(f"因子IC刷新失败：{e!r}")
+
+    def _sync_fund_flow(self) -> None:
+        """主力资金流向同步（盘后执行）+ 历史回填。"""
+        from sequoia_x.data.engine import DataEngine
+        try:
+            engine = DataEngine(self.settings)
+            n = engine.sync_fund_flow()
+            logger.info(f"资金流向同步完成：{n} 行")
+        except Exception as e:
+            logger.warning(f"资金流向同步失败：{e!r}")
+
+        # 历史回填（增量，只补充最近60天）
+        try:
+            import sqlite3
+            from sequoia_x.data.fund_flow_history import backfill_fund_flow_history
+            with sqlite3.connect(self.db_path) as conn:
+                symbols = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT symbol FROM ("
+                    "SELECT symbol FROM decision_pool UNION "
+                    "SELECT symbol FROM lhb_detail) "
+                    "ORDER BY symbol LIMIT 500"
+                ).fetchall()]
+            if symbols:
+                result = backfill_fund_flow_history(
+                    self.db_path, symbols, days=60, n_workers=3
+                )
+                logger.info(f"资金流向历史回填：{result}")
+        except Exception as e:
+            logger.warning(f"资金流向历史回填失败：{e!r}")
+
     def _auction_verify(self) -> None:
         """竞价T+1命中验证（数据同步后执行）。"""
         from sequoia_x.analysis.auction import AuctionScanner
@@ -124,6 +202,66 @@ class AuctionScheduler:
                 logger.info(f"竞价验证跳过：{result.get('msg', '无新数据')}")
         except Exception as e:
             logger.warning(f"竞价T+1验证失败：{e!r}")
+
+    def _paper_trade(self) -> None:
+        """模拟盘盘后自动执行：数据同步后跑决策→自动买卖→飞书推送绩效。
+
+        流程：持仓扫描卖出 → 全策略决策 → 自动买入 → 绩效快照 → 飞书推送。
+        """
+        from sequoia_x.core.config import Settings
+        from sequoia_x.web.services import Services
+        from sequoia_x.notify.feishu import FeishuNotifier
+
+        try:
+            settings = self.settings
+            engine_mod = __import__("sequoia_x.data.engine", fromlist=["DataEngine"])
+            data_engine = engine_mod.DataEngine(settings)
+            services = Services(settings, data_engine)
+            notifier = FeishuNotifier(settings)
+
+            # Step1: 持仓扫描 → 自动卖出
+            pos_result = services.scan_positions(apply_stop_move=False)
+            sell_result = services.paper_auto_sell(pos_result.get("signals", []))
+
+            # Step2: 全策略决策
+            decision = services.generate_decision(
+                strategy_keys=None, capital=100000, min_score=50,
+                exclude_markets=None, exclude_st=True,
+                max_candidates=60, include_auction=False,
+            )
+
+            # Step3: 自动买入
+            buy_result = services.paper_auto_buy(decision)
+
+            # Step4: 记录日度净值
+            try:
+                services.paper_record_nav()
+            except Exception:
+                pass
+
+            # Step5: 绩效
+            perf = services.paper_performance()
+
+            # Step6: 飞书推送
+            sharpe_str = f" 夏普{perf.sharpe_ratio}" if perf.sharpe_ratio else ""
+            alpha_str = f" 超额{perf.alpha:+.1f}%" if perf.alpha else ""
+            summary = (
+                f"📊 模拟盘日报\n"
+                f"总资产 ¥{perf.total_assets:,.0f} (收益{perf.total_return_pct:+.2f}% 年化{perf.annual_return:+.1f}%)\n"
+                f"现金 ¥{perf.cash:,.0f} | 持仓 ¥{perf.market_value:,.0f} ({perf.holding_count}只)\n"
+                f"今日：卖出{len(sell_result.get('sold',[]))}笔 买入{len(buy_result.get('bought',[]))}只\n"
+                f"累计：{perf.total_trades}笔 胜率{perf.win_rate}% 盈亏比{perf.profit_factor if perf.profit_factor<999 else '∞'}"
+                f" 回撤{perf.max_drawdown_pct:.1f}%\n"
+                f"风控状态：{perf.risk_circuit}"
+                f"{sharpe_str}{alpha_str}"
+            )
+            try:
+                notifier.send_text(summary)
+            except Exception:
+                pass
+            logger.info(f"模拟盘执行完成：买{len(buy_result.get('bought',[]))} 卖{len(sell_result.get('sold',[]))} 收益{perf.total_return_pct}%")
+        except Exception as e:
+            logger.warning(f"模拟盘自动执行失败：{e!r}")
 
     def _intraday_loop(self) -> None:
         """盘中信号轮询：9:30-15:00 每60秒扫描关注池。"""
@@ -148,7 +286,28 @@ class AuctionScheduler:
                     count += len(signals)
                 except Exception as e:
                     logger.warning(f"盘中扫描异常：{e!r}")
+
+                # 持仓盘中盯盘（每轮同步扫描，复用同一循环）
+                try:
+                    self._position_monitor(notifier)
+                except Exception as e:
+                    logger.warning(f"持仓监控异常：{e!r}")
+
                 self._stop.wait(60)  # 每60秒一轮
             logger.info(f"盘中轮询结束，累计推送信号 {count} 个")
         except Exception as e:
             logger.warning(f"盘中轮询启动失败：{e!r}")
+
+    def _position_monitor(self, notifier=None) -> None:
+        """持仓盘中实时盯盘：批量快照 + 实时MA + 信号推送。"""
+        from sequoia_x.analysis.position import PositionTracker
+        try:
+            from sequoia_x.data.engine import DataEngine
+            engine = DataEngine(self.settings)
+            tracker = PositionTracker(engine, self.settings)
+            signals = tracker.scan_intraday(notifier=notifier)
+            danger = [s for s in signals if s.signal_level == "danger"]
+            if danger:
+                logger.warning(f"持仓盘中预警：{len(danger)}只触发止损/清仓信号")
+        except Exception as e:
+            logger.warning(f"持仓监控失败：{e!r}")

@@ -34,6 +34,7 @@ from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
 from sequoia_x.strategy.dragon_head import DragonHeadStrategy
 from sequoia_x.strategy.bottom_volume import BottomVolumeStrategy
 from sequoia_x.strategy.multi_factor import MultiFactorStrategy
+from sequoia_x.strategy.volume_extreme import VolumeExtremeStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
         DragonHeadStrategy,
         BottomVolumeStrategy,
         MultiFactorStrategy,
+        VolumeExtremeStrategy,
     ]
 }
 
@@ -117,6 +119,13 @@ STRATEGY_META: dict[str, dict] = {
         "name_cn": "底部放量",
         "description": "超跌15%+异动放量3倍+下影线阳线，左侧反转信号",
         "min_bars": 20,
+    },
+    "volume_extreme": {
+        "name": "VolumeExtreme",
+        "name_cn": "地量见底",
+        "description": "换手率创60日新低+价格企稳+非涨停，地量地价左侧反转",
+        "min_bars": 60,
+        "category": "量能择时",
     },
 }
 
@@ -588,9 +597,17 @@ class WebServices:
         ev = StrategyEvaluator(self.engine, self.settings)
         return ev.compare_combos(hold_days=hold_days, sample_size=sample_size)
 
-    def evaluate_factors(self, hold_days: int = 20, sample_size: int = 500) -> dict:
-        """因子IC评估：30个因子的预测力评估（Rank IC/ICIR/分层）。"""
-        return evaluate_factor_ic(self.engine, hold_days=hold_days, sample_size=sample_size)
+    def evaluate_factors(self, hold_days: int = 20, sample_size: int = 500,
+                         rolling_months: int = 0) -> dict:
+        """因子IC评估：全部因子的预测力评估（Rank IC/ICIR/分层）。
+
+        Args:
+            rolling_months: 滚动窗口月数（0=全样本，6=最近6个月）
+        """
+        return evaluate_factor_ic(
+            self.engine, hold_days=hold_days, sample_size=sample_size,
+            rolling_months=rolling_months,
+        )
 
     def get_factor_weights(self) -> dict:
         """读取DB中的因子权重快照。"""
@@ -631,6 +648,14 @@ class WebServices:
     def scan_positions(self, apply_stop_move: bool = False) -> dict:
         """扫描所有持仓，返回信号列表 + 组合摘要。"""
         signals = self.positions.scan_all(apply_stop_move=apply_stop_move)
+        return {
+            "signals": [self.positions.signal_to_dict(s) for s in signals],
+            "summary": self.positions.summary(signals),
+        }
+
+    def scan_positions_intraday(self) -> dict:
+        """盘中实时盯盘扫描：批量快照 + 实时MA估算。"""
+        signals = self.positions.scan_intraday()
         return {
             "signals": [self.positions.signal_to_dict(s) for s in signals],
             "summary": self.positions.summary(signals),
@@ -878,3 +903,31 @@ class WebServices:
     def get_recent_logs(self, handler: RingBufferHandler, limit: int = 100) -> list[str]:
         items = list(handler.buffer)
         return items[-limit:]
+
+    # ------------------------------------------------------------------
+    # 模拟盘（Paper Trading）
+    # ------------------------------------------------------------------
+
+    @property
+    def paper_engine(self) -> "PaperTradeEngine":
+        """懒加载模拟盘引擎。"""
+        if not hasattr(self, "_paper_engine") or self._paper_engine is None:
+            from sequoia_x.analysis.paper_trade import PaperTradeEngine
+            self._paper_engine = PaperTradeEngine(self.settings)
+        return self._paper_engine
+
+    def paper_auto_buy(self, decision_result: dict) -> dict:
+        """模拟盘自动买入。"""
+        return self.paper_engine.auto_buy(decision_result)
+
+    def paper_auto_sell(self, position_signals: list[dict]) -> dict:
+        """模拟盘自动卖出（信号dict列表 → 引擎执行）。"""
+        return self.paper_engine.auto_sell(position_signals)
+
+    def paper_performance(self):
+        """模拟盘绩效快照。"""
+        return self.paper_engine.get_performance()
+
+    def paper_record_nav(self) -> dict:
+        """记录日度净值快照。"""
+        return self.paper_engine.record_daily_nav()

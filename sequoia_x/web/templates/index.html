@@ -1,49 +1,112 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - Sequoia-X{% endblock %}
+{% block title %}Sequoia-X · 量化宇宙{% endblock %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-4">
-    <div>
-        <h2 class="mb-1">策略总览</h2>
-        <p class="text-muted mb-0">6 个量化选股策略，点击查看详情或手动运行</p>
+<!-- ════════ 宇宙星球导航 ════════ -->
+<div class="sx-universe">
+    <!-- 中心恒星 -->
+    <div class="sx-sun">
+        <div class="sx-sun-core"></div>
+        <div class="sx-sun-glow"></div>
+        <span class="sx-sun-label">Sequoia-X</span>
     </div>
-    <a href="/docs" class="btn btn-outline-secondary btn-sm" target="_blank">
-        <i class="bi bi-braces"></i> API Docs
-    </a>
+
+    <!-- 内层轨道：实时行情 -->
+    <div class="sx-orbit sx-orbit-1">
+        <a href="/market" class="sx-planet sx-p-market" title="大盘分析">
+            <i class="bi bi-clipboard-data"></i>
+            <span class="sx-planet-name">大盘</span>
+        </a>
+        <a href="/auction" class="sx-planet sx-p-auction" title="集合竞价选股">
+            <i class="bi bi-alarm"></i>
+            <span class="sx-planet-name">竞价</span>
+        </a>
+        <a href="/intraday" class="sx-planet sx-p-intraday" title="盘中实时信号">
+            <i class="bi bi-lightning-charge"></i>
+            <span class="sx-planet-name">盘中</span>
+        </a>
+    </div>
+
+    <!-- 中层轨道：交易闭环 -->
+    <div class="sx-orbit sx-orbit-2">
+        <a href="/stock-analysis" class="sx-planet sx-p-stock" title="个股深度分析">
+            <i class="bi bi-graph-up"></i>
+            <span class="sx-planet-name">个股</span>
+        </a>
+        <a href="/decision" class="sx-planet sx-p-decision" title="量化决策引擎">
+            <i class="bi bi-list-check"></i>
+            <span class="sx-planet-name">决策</span>
+        </a>
+        <a href="/positions" class="sx-planet sx-p-position" title="持仓跟踪">
+            <i class="bi bi-bag-check"></i>
+            <span class="sx-planet-name">持仓</span>
+        </a>
+        <a href="/paper" class="sx-planet sx-p-paper" title="模拟盘">
+            <i class="bi bi-cash-coin"></i>
+            <span class="sx-planet-name">模拟盘</span>
+        </a>
+    </div>
+
+    <!-- 外层轨道：投研工具 -->
+    <div class="sx-orbit sx-orbit-3">
+        <a href="/strategy-compare" class="sx-planet sx-p-strategy" title="策略评估与组合">
+            <i class="bi bi-bar-chart-steps"></i>
+            <span class="sx-planet-name">策略</span>
+        </a>
+        <a href="/factor" class="sx-planet sx-p-factor" title="因子评估">
+            <i class="bi bi-graph-down-arrow"></i>
+            <span class="sx-planet-name">因子</span>
+        </a>
+        <a href="/portfolio" class="sx-planet sx-p-portfolio" title="持仓体检">
+            <i class="bi bi-clipboard-check"></i>
+            <span class="sx-planet-name">体检</span>
+        </a>
+        <a href="/stocks" class="sx-planet sx-p-stocks" title="股票浏览">
+            <i class="bi bi-search"></i>
+            <span class="sx-planet-name">浏览</span>
+        </a>
+        <a href="/system" class="sx-planet sx-p-system" title="系统设置">
+            <i class="bi bi-hdd-stack"></i>
+            <span class="sx-planet-name">系统</span>
+        </a>
+    </div>
 </div>
 
-<div class="row g-4">
-    {% for s in strategies %}
-    <div class="col-md-6 col-lg-4">
-        <div class="card strategy-card h-100" onclick="window.location='/strategy/{{ s.key }}'">
-            <div class="card-body">
-                <div class="d-flex justify-content-between align-items-start mb-2">
-                    <h5 class="card-title mb-0">{{ s.name_cn }}</h5>
-                    <span class="badge bg-secondary">{{ s.webhook_key }}</span>
-                </div>
-                <p class="text-muted small mb-1">{{ s.name }}</p>
-                <p class="card-text">{{ s.description }}</p>
-                <div class="d-flex justify-content-between align-items-center mt-3">
-                    <span class="badge bg-info" id="count-{{ s.key }}">
-                        {% if s.latest_result_count > 0 %}
-                            {{ s.latest_result_count }} 只选股
-                        {% else %}
-                            未运行
-                        {% endif %}
-                    </span>
-                    <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); runStrategy('{{ s.key }}')">
-                        <i class="bi bi-play-fill"></i> 运行
-                    </button>
-                </div>
-                <div id="status-{{ s.key }}" class="mt-2" style="display:none;">
-                    <div class="progress" style="height: 4px;">
-                        <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%"></div>
+<!-- 星球说明 -->
+<div class="sx-universe-legend">
+    <span class="sx-legend-dot sx-ld-1"></span> 实时行情
+    <span class="sx-legend-dot sx-ld-2"></span> 交易闭环
+    <span class="sx-legend-dot sx-ld-3"></span> 投研工具
+</div>
+
+<!-- 策略卡片（保留在星球下方）-->
+<div class="mt-5">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h3 class="mb-0"><i class="bi bi-collection"></i> 策略工坊</h3>
+        <p class="text-muted mb-0 small">点击星球进入功能，或选择策略直接运行</p>
+    </div>
+    <div class="row g-3">
+        {% for s in strategies %}
+        <div class="col-md-6 col-lg-4">
+            <div class="card strategy-card h-100" onclick="window.location='/strategy/{{ s.key }}'">
+                <div class="card-body py-3">
+                    <div class="d-flex justify-content-between align-items-start mb-1">
+                        <h6 class="card-title mb-0">{{ s.name_cn }}</h6>
+                        <span class="badge bg-secondary">{{ s.webhook_key }}</span>
                     </div>
-                    <small class="text-muted" id="status-text-{{ s.key }}">运行中...</small>
+                    <p class="card-text small text-muted mb-2">{{ s.description }}</p>
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span class="badge bg-info" id="count-{{ s.key }}">
+                            {% if s.latest_result_count > 0 %}{{ s.latest_result_count }} 只{% else %}未运行{% endif %}
+                        </span>
+                        <button class="btn btn-primary btn-sm py-1" onclick="event.stopPropagation(); runStrategy('{{ s.key }}')">
+                            <i class="bi bi-play-fill"></i> 运行
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
+        {% endfor %}
     </div>
-    {% endfor %}
 </div>
 {% endblock %}
 
@@ -51,32 +114,24 @@
 <script>
 async function runStrategy(key) {
     const statusEl = document.getElementById('status-' + key);
-    const statusText = document.getElementById('status-text-' + key);
     const countEl = document.getElementById('count-' + key);
-
-    statusEl.style.display = 'block';
-    statusText.textContent = '提交中...';
-
     try {
         const { task_id } = await api(`/api/strategies/${key}/run`, { method: 'POST' });
-        statusText.textContent = '运行中...';
-
-        const result = await pollTask(task_id, (data) => {
-            if (data.status === 'running') statusText.textContent = '运行中...';
-        });
-
+        const result = await pollTask(task_id);
         if (result.status === 'done') {
-            countEl.textContent = result.result_count + ' 只选股';
+            countEl.textContent = result.result_count + ' 只';
             countEl.className = 'badge bg-' + (result.result_count > 0 ? 'success' : 'secondary');
             showToast(`${key} 完成，选出 ${result.result_count} 只股票`);
-        } else {
-            showToast(`${key} 出错: ${result.error}`, 'error');
-        }
-    } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
-    }
-
-    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+        } else { showToast(`${key} 出错: ${result.error}`, 'error'); }
+    } catch (e) { showToast('请求失败: ' + e.message, 'error'); }
 }
+
+// 星球进场动画（依次出现）
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.sx-planet').forEach((p, i) => {
+        p.style.opacity = '0';
+        setTimeout(() => { p.style.transition = 'opacity 0.6s'; p.style.opacity = '1'; }, 300 + i * 100);
+    });
+});
 </script>
 {% endblock %}

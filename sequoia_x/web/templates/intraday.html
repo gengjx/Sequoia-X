@@ -1,5 +1,76 @@
 {% extends "base.html" %}
-{% block title %}盘中信号 - Sequoia-X{% endblock %}
+{% block title %}盘中信号 - Sequoia-X
+<!-- 板块轮动实时监控 -->
+<div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-graph-up-arrow"></i> 板块轮动实时监控</span>
+        <div class="d-flex gap-2 align-items-center">
+            <button class="btn btn-sm btn-outline-primary" onclick="loadSectors()">
+                <i class="bi bi-arrow-clockwise"></i> 刷新
+            </button>
+            <span class="text-muted small" id="sector-update"></span>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="row g-2 mb-2">
+            <div class="col-auto">
+                <div class="btn-group btn-group-sm" role="group">
+                    <button class="btn btn-outline-success active" id="sector-tab-up" onclick="switchSectorTab('up')">涨幅榜</button>
+                    <button class="btn btn-outline-danger" id="sector-tab-down" onclick="switchSectorTab('down')">跌幅榜</button>
+                </div>
+            </div>
+        </div>
+        <div id="sector-empty" class="text-center text-muted py-4">
+            <i class="bi bi-pie-chart" style="font-size:2rem"></i>
+            <p class="mt-2 small">点击「刷新」获取实时板块行情</p>
+        </div>
+        <div id="sector-wrapper" style="display:none">
+            <div class="table-responsive" style="max-height:360px;overflow-y:auto">
+                <table class="table table-sm table-hover align-middle">
+                    <thead class="table-light sticky-top"><tr>
+                        <th>#</th><th>板块</th><th class="text-end">涨跌幅</th>
+                        <th>领涨股</th><th class="text-end">换手</th>
+                        <th class="text-center">涨/跌</th>
+                    </tr></thead>
+                    <tbody id="sector-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 龙虎榜盘中预判 -->
+<div class="card mt-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-trophy"></i> 龙虎榜盘中预判</span>
+        <div class="d-flex gap-2 align-items-center">
+            <button class="btn btn-sm btn-outline-primary" onclick="loadLhbPredict()">
+                <i class="bi bi-arrow-clockwise"></i> 刷新
+            </button>
+            <span class="text-muted small" id="lhb-update"></span>
+        </div>
+    </div>
+    <div class="card-body">
+        <p class="text-muted small mb-2">基于涨跌幅、主力资金流入、换手率预判当日大概率上榜个股（盘后实际龙虎榜验证）。</p>
+        <div id="lhb-empty" class="text-center text-muted py-4">
+            <i class="bi bi-trophy" style="font-size:2rem"></i>
+            <p class="mt-2 small">点击「刷新」获取预判候选</p>
+        </div>
+        <div id="lhb-wrapper" style="display:none">
+            <div class="table-responsive" style="max-height:360px;overflow-y:auto">
+                <table class="table table-sm table-hover align-middle">
+                    <thead class="table-light sticky-top"><tr>
+                        <th>代码</th><th>名称</th><th class="text-end">涨跌幅</th>
+                        <th>概率</th><th class="text-end">主力净额</th><th>上榜理由</th>
+                    </tr></thead>
+                    <tbody id="lhb-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
 {% block content %}
 <h2 class="mb-3"><i class="bi bi-lightning-charge"></i> 盘中实时信号</h2>
 <p class="text-muted">9:30-15:00 每60秒自动扫描关注池（竞价A级+持仓），突破/涨停/异动实时触发。调度器交易时段自动轮询。</p>
@@ -121,10 +192,117 @@ function renderSignals(data) {
 
 function toggleAutoRefresh() {
     if (document.getElementById('auto-refresh').checked) {
-        refreshTimer = setInterval(() => doScan(false), 60000);
+        refreshAll();
+        refreshTimer = setInterval(() => { doScan(false); refreshAll(); }, 60000);
     } else {
         clearInterval(refreshTimer);
     }
+}
+
+let sectorData = [];
+let sectorTab = 'up';
+let lhbData = [];
+
+async function loadSectors() {
+    const upd = document.getElementById('sector-update');
+    upd.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    try {
+        const r = await fetch('/api/market/sectors-realtime');
+        const data = await r.json();
+        sectorData = Array.isArray(data) ? data : (data.sectors || []);
+        renderSectors();
+        const now = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+        upd.textContent = sectorData.length + '个板块 更新于 ' + now;
+    } catch(e) {
+        upd.textContent = '';
+        showToast('板块数据加载失败: ' + e.message, 'error');
+    }
+}
+
+function switchSectorTab(tab) {
+    sectorTab = tab;
+    document.getElementById('sector-tab-up').classList.toggle('active', tab==='up');
+    document.getElementById('sector-tab-down').classList.toggle('active', tab==='down');
+    renderSectors();
+}
+
+function renderSectors() {
+    const sorted = [...sectorData].sort((a,b) => 
+        sectorTab==='up' ? (b.change_pct||0)-(a.change_pct||0) : (a.change_pct||0)-(b.change_pct||0)
+    );
+    if (sorted.length === 0) {
+        document.getElementById('sector-empty').style.display = 'block';
+        document.getElementById('sector-wrapper').style.display = 'none';
+        return;
+    }
+    document.getElementById('sector-empty').style.display = 'none';
+    document.getElementById('sector-wrapper').style.display = 'block';
+    const body = document.getElementById('sector-body');
+    body.innerHTML = sorted.slice(0, 50).map((s, i) => {
+        const pct = (s.change_pct||0).toFixed(2);
+        const cls = (s.change_pct||0) >= 0 ? 'text-danger' : 'text-success';
+        const barW = Math.min(Math.abs(s.change_pct||0) * 8, 100);
+        const barColor = (s.change_pct||0) >= 0 ? 'bg-danger' : 'bg-success';
+        return `<tr>
+            <td class="text-muted">${i+1}</td>
+            <td class="fw-semibold">${s.name||''}</td>
+            <td class="text-end">
+                <span class="${cls} fw-bold">${pct>=0?'+':''}${pct}%</span>
+                <div class="progress" style="height:3px;width:60px"><div class="progress-bar ${barColor}" style="width:${barW}%"></div></div>
+            </td>
+            <td class="small">${s.leading_stock||'-'}</td>
+            <td class="text-end small">${(s.turnover_rate||0).toFixed(2)}%</td>
+            <td class="text-center small"><span class="text-danger">${s.up_count||0}</span>/<span class="text-success">${s.down_count||0}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+async function loadLhbPredict() {
+    const upd = document.getElementById('lhb-update');
+    upd.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    try {
+        const r = await fetch('/api/market/lhb-predict');
+        const data = await r.json();
+        lhbData = Array.isArray(data) ? data : (data.candidates || []);
+        renderLhb();
+        const now = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+        upd.textContent = lhbData.length + '只候选 更新于 ' + now;
+    } catch(e) {
+        upd.textContent = '';
+        showToast('龙虎榜预判加载失败: ' + e.message, 'error');
+    }
+}
+
+function renderLhb() {
+    if (lhbData.length === 0) {
+        document.getElementById('lhb-empty').style.display = 'block';
+        document.getElementById('lhb-wrapper').style.display = 'none';
+        return;
+    }
+    document.getElementById('lhb-empty').style.display = 'none';
+    document.getElementById('lhb-wrapper').style.display = 'block';
+    const body = document.getElementById('lhb-body');
+    body.innerHTML = lhbData.map(s => {
+        const pct = (s.pct_chg||s.pct||0).toFixed(2);
+        const cls = (s.pct_chg||s.pct||0) >= 0 ? 'text-danger' : 'text-success';
+        const prob = s.probability || '中';
+        const probBadge = prob==='高' ? 'bg-danger' : 'bg-warning text-dark';
+        const mainNet = (s.main_net||0) / 10000;
+        return `<tr>
+            <td><a href="/stock-analysis?code=${s.symbol}" class="text-decoration-none"><code>${s.symbol}</code></a></td>
+            <td class="fw-semibold">${s.name||''}</td>
+            <td class="text-end ${cls} fw-bold">${pct>=0?'+':''}${pct}%</td>
+            <td><span class="badge ${probBadge}">${prob}</span></td>
+            <td class="text-end small">${mainNet.toFixed(0)}万</td>
+            <td class="small text-muted">${(s.reasons||[]).join('；')}</td>
+        </tr>`;
+    }).join('');
+}
+
+// 自动刷新联动
+function refreshAll() {
+    loadSectors();
+    loadLhbPredict();
 }
 </script>
 {% endblock %}

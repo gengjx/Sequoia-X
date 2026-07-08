@@ -50,22 +50,43 @@ FACTOR_META: dict[str, dict] = {
     "volume_ratio":{"category": "流动性", "desc": "量比"},
     "liq_rank":    {"category": "流动性", "desc": "流动性分位"},
     "amihud":      {"category": "流动性", "desc": "Amihud非流动性", "reverse": True},
+    # ── 换手率(4)（A股核心量能维度，baostock turn字段）──
+    "turn_ratio":    {"category": "换手率", "desc": "当日换手率"},
+    "turn_ma5":      {"category": "换手率", "desc": "5日均换手率"},
+    "turn_surge":    {"category": "换手率", "desc": "换手率倍数(今日/20日均)"},
+    "turn_reversal": {"category": "换手率", "desc": "低换手率反转", "reverse": True},
     # ── 量价(5) ──
     "ma_cross":    {"category": "量价", "desc": "均线金叉信号"},
     "vol_surge":   {"category": "量价", "desc": "放量倍数"},
     "vol_shrink_p":{"category": "量价", "desc": "缩量程度", "reverse": True},
     "flag_tight":  {"category": "量价", "desc": "旗形收敛度"},
     "vp_divergence":{"category": "量价", "desc": "量价共振度"},
+    # ── 结构(4)（A股微观结构因子，纯量价，学术验证有效）──
+    "close_pos":   {"category": "结构", "desc": "收盘价位置（越高越强）"},
+    "gap":         {"category": "结构", "desc": "隔夜跳空幅度"},
+    "range_pct":   {"category": "结构", "desc": "日内振幅", "reverse": True},
+    "vol_wt_mom":  {"category": "结构", "desc": "量加权动量"},
+    # ── 资金(2)（主力资金流向，东财fund_flow表）──
+    "main_net":    {"category": "资金", "desc": "主力净流入额"},
+    "main_pct":    {"category": "资金", "desc": "主力净流入占比"},
     # ── 质量(5) ──
     "roe":         {"category": "质量", "desc": "净资产收益率"},
     "np_margin":   {"category": "质量", "desc": "净利率"},
     "gp_margin":   {"category": "质量", "desc": "毛利率"},
     "rev_growth":  {"category": "质量", "desc": "营收增速"},
     "profit_growth":{"category": "质量", "desc": "利润增速"},
+    # ── 龙虎榜(2) ──
+    "lhb_count":   {"category": "龙虎榜", "desc": "近30天上榜次数"},
+    "lhb_netbuy":  {"category": "龙虎榜", "desc": "近30天龙虎榜净买入额"},
+    # ── 资金流近似(3)（用日K构建，无需外部接口）──
+    "flow_strength":  {"category": "资金流", "desc": "上涨日成交额占比"},
+    "flow_weighted":  {"category": "资金流", "desc": "涨跌幅加权资金流"},
+    "flow_trend":     {"category": "资金流", "desc": "5日vs20日资金流趋势"},
 }
 
 
-def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, float]:
+def compute_factors(df: pd.DataFrame, finance: dict | None = None,
+                   fund_flow: dict | None = None, lhb_data: dict | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
     Args:
@@ -86,6 +107,16 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     open_ = df["open"]
 
     factors: dict[str, float] = {}
+
+    def _safe_float(val):
+        """安全转float，None/NaN→NaN。"""
+        if val is None:
+            return np.nan
+        try:
+            f = float(val)
+            return f if f == f else np.nan  # NaN check
+        except (TypeError, ValueError):
+            return np.nan
 
     # ════════ 动量(8) ════════
     factors["mom_5"] = _ret(close, 5)
@@ -135,6 +166,26 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     else:
         factors["amihud"] = np.nan
 
+    # ════════ 换手率(4)（baostock turn字段，A股核心量能维度）════════
+    turn = df["turn"] if "turn" in df.columns else pd.Series(dtype=float)
+    turn_valid = turn.notna().any() and len(turn) > 0
+    if turn_valid:
+        # turn可能含NaN（历史数据），前向填充后取最新
+        turn_ff = turn.ffill()
+        factors["turn_ratio"] = float(turn_ff.iloc[-1]) if pd.notna(turn_ff.iloc[-1]) else np.nan
+        turn_ma5_v = turn_ff.rolling(5).mean()
+        factors["turn_ma5"] = float(turn_ma5_v.iloc[-1]) if pd.notna(turn_ma5_v.iloc[-1]) else np.nan
+        turn_ma20_v = turn_ff.rolling(20).mean()
+        if pd.notna(turn_ma20_v.iloc[-1]) and turn_ma20_v.iloc[-1] > 0:
+            factors["turn_surge"] = float(turn_ff.iloc[-1] / turn_ma20_v.iloc[-1])
+        else:
+            factors["turn_surge"] = np.nan
+        # 低换手率反转：20日均换手的负值（换手越低=分越高，左侧信号）
+        factors["turn_reversal"] = -float(turn_ma20_v.iloc[-1]) if pd.notna(turn_ma20_v.iloc[-1]) else np.nan
+    else:
+        for k in ["turn_ratio", "turn_ma5", "turn_surge", "turn_reversal"]:
+            factors[k] = np.nan
+
     # ════════ 量价(5) ════════
     ma5 = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
@@ -161,13 +212,44 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None) -> dict[str, 
     vr = volume.iloc[-1] / vol_ma20.iloc[-1] if pd.notna(vol_ma20.iloc[-1]) and vol_ma20.iloc[-1] else 1
     factors["vp_divergence"] = float(chg * vr * 100)
 
+    # ════════ 结构(4) ════════
+    if len(df) >= 20:
+        lo20 = float(low.tail(20).min())
+        hi20 = float(high.tail(20).max())
+        denom = hi20 - lo20 if (hi20 - lo20) != 0 else 1
+        factors["close_pos"] = float((close.iloc[-1] - lo20) / denom * 100)
+        prev_close = float(close.iloc[-2]) if len(close) >= 2 else float(close.iloc[-1])
+        factors["gap"] = float((prev_close - float(open_.iloc[-1])) / prev_close * 100) if prev_close else np.nan
+        factors["range_pct"] = -float((float(high.iloc[-1]) - float(low.iloc[-1])) / float(close.iloc[-1]) * 100)
+        vol_ma20_last = float(volume.tail(20).mean()) if len(volume) >= 20 else 1
+        factors["vol_wt_mom"] = float((close.iloc[-1] / close.iloc[-20] - 1) * (volume.iloc[-1] / vol_ma20_last if vol_ma20_last else 1) * 100)
+    else:
+        for k in ["close_pos", "gap", "range_pct", "vol_wt_mom"]:
+            factors[k] = np.nan
+
+    # ════════ 资金(2) ════════
+    if fund_flow:
+        factors["main_net"] = _safe_float(fund_flow.get("main_net"))
+        factors["main_pct"] = _safe_float(fund_flow.get("main_pct"))
+    else:
+        for k in ["main_net", "main_pct"]:
+            factors[k] = np.nan
+
+    # ════════ 龙虎榜(2) ════════
+    if lhb_data:
+        factors["lhb_count"] = float(lhb_data.get("count", 0))
+        factors["lhb_netbuy"] = float(lhb_data.get("net_buy", 0))
+    else:
+        for k in ["lhb_count", "lhb_netbuy"]:
+            factors[k] = np.nan
+
     # ════════ 质量(5) ════════
     if finance:
-        factors["roe"] = float(finance.get("roe", 0))
-        factors["np_margin"] = float(finance.get("np_margin", 0))
-        factors["gp_margin"] = float(finance.get("gp_margin", 0))
-        factors["rev_growth"] = float(finance.get("yoy_ni", 0))  # 营收增速用yoy_ni近似
-        factors["profit_growth"] = float(finance.get("yoy_ni", 0))
+        factors["roe"] = _safe_float(finance.get("roe"))             # 净资产收益率
+        factors["np_margin"] = _safe_float(finance.get("np_margin")) # 净利率
+        factors["gp_margin"] = _safe_float(finance.get("gp_margin")) # 毛利率
+        factors["rev_growth"] = _safe_float(finance.get("yoy_eps"))  # EPS增速（营收增速代理）
+        factors["profit_growth"] = _safe_float(finance.get("yoy_pni"))  # 扣非净利润增速
     else:
         for k in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"]:
             factors[k] = np.nan
@@ -230,7 +312,7 @@ def cross_section_rank(df: pd.DataFrame) -> pd.DataFrame:
     return df.rank(pct=True) * 100
 
 
-def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = None) -> dict[str, pd.Series]:
+def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = None, finance_series: dict[str, pd.Series] | None = None) -> dict[str, pd.Series]:
     """向量化计算完整序列的因子值（性能优化核心）。
 
     一次性算出每个因子在每个交易日的值，下游按月取截面。
@@ -238,7 +320,8 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
 
     Args:
         df: OHLCV DataFrame（按日期升序）
-        factor_names: 需要计算的因子列表，None=全部非质量因子（质量因子无时序）
+        factor_names: 需要计算的因子列表，None=全部因子
+        finance_series: 质量因子的point-in-time序列（{因子名: pd.Series}），None=跳过质量因子
 
     Returns:
         {因子名: pd.Series（与df等长，每日因子值）}
@@ -246,6 +329,7 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
     if len(df) < 20:
         return {}
     close = df["close"]
+    open_ = df["open"]
     high = df["high"]
     low = df["low"]
     volume = df["volume"]
@@ -294,6 +378,15 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
     series["liq_rank"] = turnover
     series["amihud"] = -rets.abs() / turnover.replace(0, np.nan) * 1e10
 
+    # 换手率（baostock turn字段）
+    if "turn" in df.columns:
+        turn_s = df["turn"].ffill()
+        series["turn_ratio"] = turn_s
+        series["turn_ma5"] = turn_s.rolling(5).mean()
+        turn_ma20_s = turn_s.rolling(20).mean()
+        series["turn_surge"] = turn_s / turn_ma20_s.replace(0, np.nan)
+        series["turn_reversal"] = -turn_ma20_s
+
     # 量价
     series["ma_cross"] = ((ma5.shift(1) < ma20.shift(1)) & (ma5 > ma20)).astype(float)
     series["vol_surge"] = volume / vol_ma20.replace(0, np.nan)
@@ -303,7 +396,31 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
     series["flag_tight"] = -range_10 / range_40.replace(0, np.nan)
     series["vp_divergence"] = rets * (volume / vol_ma20.replace(0, np.nan)) * 100
 
-    # 质量因子无时序，IC评估跳过
+    # 结构（A股微观结构因子）
+    series["close_pos"] = (close - low.rolling(20).min()) / (high.rolling(20).max() - low.rolling(20).min().replace(0, np.nan)) * 100
+    series["gap"] = (close.shift(1) - open_) / close.shift(1).replace(0, np.nan) * 100  # 开盘跳空
+    series["range_pct"] = -(high - low) / close.replace(0, np.nan) * 100  # 日内振幅（取负=小振幅溢价）
+    series["vol_wt_mom"] = (close.pct_change(20) * (volume / vol_ma20.replace(0, np.nan))).rolling(20).mean() * 100
+
+    # 资金流近似（用日K构建，无需外部接口）
+    up_mask = (close > open_).astype(float)
+    turnover_total_60 = turnover.rolling(60, min_periods=20).sum()
+    up_turnover_60 = (turnover * up_mask).rolling(60, min_periods=20).sum()
+    series["flow_strength"] = (up_turnover_60 / turnover_total_60.replace(0, np.nan) - 0.5) * 100
+    rets_all = close.pct_change()
+    flow_num = (rets_all * turnover).rolling(20, min_periods=10).sum()
+    flow_den = turnover.rolling(20, min_periods=10).sum().replace(0, np.nan)
+    series["flow_weighted"] = flow_num / flow_den * 10000
+    flow_5 = (rets_all * turnover).rolling(5).sum() / turnover.rolling(5).sum().replace(0, np.nan)
+    flow_20v = (rets_all * turnover).rolling(20, min_periods=10).sum() / turnover.rolling(20, min_periods=10).sum().replace(0, np.nan)
+    series["flow_trend"] = (flow_5 - flow_20v) * 10000
+
+    # 质量因子（point-in-time，从finance_series注入）
+    if finance_series:
+        for qname in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"]:
+            if qname in finance_series and len(finance_series[qname]) == len(df):
+                series[qname] = finance_series[qname]
+
     if factor_names:
         return {k: v for k, v in series.items() if k in factor_names}
     return series
@@ -311,6 +428,7 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
 
 def compute_composite_score(
     df: pd.DataFrame, weights: dict[str, float] | None = None,
+    finance_series: dict[str, pd.Series] | None = None,
 ) -> pd.Series:
     """计算多因子综合得分序列（每日一个分，用于回测信号）。
 
@@ -328,7 +446,7 @@ def compute_composite_score(
     if len(df) < 60:
         return pd.Series(0.0, index=df.index)
 
-    series = compute_factor_series(df)
+    series = compute_factor_series(df, finance_series=finance_series)
     if not series:
         return pd.Series(0.0, index=df.index)
 
@@ -338,16 +456,84 @@ def compute_composite_score(
     if not valid:
         return pd.Series(0.0, index=df.index)
 
-    # 单股时序百分位排名（rolling rank近似横截面）
+    # 带符号加权：正IC因子高分=好，负IC因子高分=差（权重为负自动反向）
     total_w = sum(abs(v) for v in valid.values())
     composite = pd.Series(0.0, index=df.index)
     for fname, w in valid.items():
-        # 时序百分位：当前值在过去252日的排名位置(0-1)
+        # 时序百分位：当前值在过去252日的排名位置(0-100)
         pct = series[fname].rolling(252, min_periods=20).rank(pct=True) * 100
-        composite += pct.fillna(50) * (abs(w) / total_w)
+        # 带符号权重：正权重直接加，负权重做减法
+        composite += pct.fillna(50) * (w / total_w)
     return composite
 
 
+
+
+
+def _neutralize截面(df截面: pd.DataFrame, factor_cols: list[str],
+                     market_cap_map: dict, industry_map: dict) -> pd.DataFrame:
+    """对截面做市值+行业中性化。
+
+    对每个因子值，回归 log(市值) + 行业哑变量，取残差作为中性化后的因子值。
+    这样消除"大市值公司普遍 ROE 低/波动小"等系统性偏差。
+
+    Args:
+        df截面: 单月截面数据（含 factor_cols + symbol）
+        factor_cols: 需要中性化的因子列
+        market_cap_map: {symbol: 流通市值}
+        industry_map: {symbol: 行业}
+
+    Returns:
+        df截面（因子列替换为残差）
+    """
+    import numpy as np
+
+    # 构建 log(市值) 和行业哑变量
+    symbols = df截面["symbol"].values if "symbol" in df截面.columns else None
+    if symbols is None:
+        return df截面
+
+    log_mv = np.array([np.log(market_cap_map.get(s, 0) + 1) if market_cap_map.get(s, 0) > 0 else np.nan for s in symbols])
+
+    # 只对有市值的行做中性化
+    valid_mask = ~np.isnan(log_mv)
+    if valid_mask.sum() < 30:
+        return df截面  # 样本太少，跳过中性化
+
+    # 行业哑变量
+    industries = [industry_map.get(s, "未知") for s in symbols]
+    unique_ind = list(set(industries))
+    ind_to_idx = {ind: i for i, ind in enumerate(unique_ind)}
+
+    n = len(symbols)
+    n_ind = len(unique_ind)
+    # X = [截距, log_mv, 行业哑变量...]
+    X = np.column_stack([
+        np.ones(n),
+        log_mv,
+        *[np.array([1.0 if ind == ui else 0.0 for ind in industries]) for ui in unique_ind]
+    ])
+
+    for f in factor_cols:
+        y = df截面[f].values
+        mask = valid_mask & ~np.isnan(y.astype(float))
+        if mask.sum() < 30:
+            continue
+        try:
+            X_valid = X[mask]
+            y_valid = y[mask].astype(float)
+            # OLS: beta = (X'X)^-1 X'y
+            beta = np.linalg.lstsq(X_valid, y_valid, rcond=None)[0]
+            residual = y_valid - X_valid @ beta
+            # 填回残差
+            result_col = np.full(n, np.nan)
+            result_col[mask] = residual
+            df截面[f + "_neutral"] = result_col
+            df截面[f] = result_col  # 替换原值
+        except Exception:
+            continue
+
+    return df截面
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -357,6 +543,7 @@ def compute_composite_score(
 def evaluate_factor_ic(
     engine, factor_names: list[str] | None = None,
     hold_days: int = 20, sample_size: int = 500, seed: int = 42,
+    neutralize: bool = True, rolling_months: int = 0,
 ) -> dict:
     """评估全部因子的预测力（月度Rank IC + ICIR + 分层收益）。
 
@@ -388,11 +575,91 @@ def evaluate_factor_ic(
         symbols = rng.sample(symbols, sample_size)
     logger.info(f"因子IC评估：采样 {len(symbols)} 只，持有期 {hold_days} 天")
     cutoff_map = engine.get_ipo_cutoff_map()
+    factor_set = factor_names or list(FACTOR_META.keys())
+
+    # 加载市值/行业映射（用于中性化）
+    market_cap_map: dict[str, float] = {}
+    industry_map: dict[str, str] = {}
+    if neutralize:
+        import sqlite3 as _sq
+        try:
+            with _sq.connect(engine.db_path) as _conn:
+                for r in _conn.execute("SELECT symbol, circ_mv FROM stock_market_cap").fetchall():
+                    if r[1] and r[1] > 0:
+                        market_cap_map[r[0]] = float(r[1])
+                for r in _conn.execute("SELECT symbol, industry FROM stock_industry").fetchall():
+                    industry_map[r[0]] = r[1]
+            logger.info(f"因子中性化：市值{len(market_cap_map)}只，行业{len(industry_map)}只")
+        except Exception as e:
+            logger.warning(f"市值/行业加载失败，跳过中性化：{e!r}")
+            neutralize = False
+
+    # 加载质量因子的月度截面（按财报季度月份匹配）
+    # stat_date 格式 YYYY-MM-DD，取 YYYY-MM 作为截面月份
+    quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"}
+    has_quality = bool(set(factor_set) & quality_factors)
+    finance_map: dict[str, dict] = {}  # {symbol: {roe, np_margin, ...}}
+    if has_quality:
+        import sqlite3 as _sq
+        try:
+            with _sq.connect(engine.db_path) as _conn:
+                # 取每只股票最新一季财报
+                _rows = _conn.execute(
+                    """SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni
+                       FROM stock_finance
+                       WHERE (symbol, stat_date) IN (
+                           SELECT symbol, MAX(stat_date) FROM stock_finance GROUP BY symbol
+                       )"""
+                ).fetchall()
+                for r in _rows:
+                    finance_map[r[0]] = {
+                        "roe": r[1], "np_margin": r[2], "gp_margin": r[3],
+                        "yoy_eps": r[4], "yoy_pni": r[5],
+                    }
+            logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：财报加载失败：{e!r}")
+
+    # 加载资金流向（main_net / main_pct）
+    fund_flow_factors = {"main_net", "main_pct"}
+    has_fund_flow = bool(set(factor_set) & fund_flow_factors)
+    fund_flow_map: dict[str, dict] = {}
+    if has_fund_flow:
+        import sqlite3 as _sq2
+        try:
+            with _sq2.connect(engine.db_path) as _conn2:
+                _ff_rows = _conn2.execute(
+                    "SELECT symbol, main_net, main_pct FROM fund_flow "
+                    "WHERE date=(SELECT MAX(date) FROM fund_flow)"
+                ).fetchall()
+                for r in _ff_rows:
+                    fund_flow_map[r[0]] = {"main_net": r[1], "main_pct": r[2]}
+            logger.info(f"因子IC评估：加载资金流向 {len(fund_flow_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：资金流向加载失败：{e!r}")
+
+    # 加载龙虎榜因子（近30天上榜次数 + 净买入额）
+    lhb_factors = {"lhb_count", "lhb_netbuy"}
+    has_lhb = bool(set(factor_set) & lhb_factors)
+    lhb_map: dict[str, dict] = {}
+    if has_lhb:
+        import sqlite3 as _sq3
+        try:
+            with _sq3.connect(engine.db_path) as _conn3:
+                _lhb_rows = _conn3.execute(
+                    "SELECT symbol, COUNT(*) as cnt, SUM(net_buy) as total_net "
+                    "FROM lhb_detail WHERE date >= date('now', '-60 days') "
+                    "GROUP BY symbol"
+                ).fetchall()
+                for r in _lhb_rows:
+                    lhb_map[r[0]] = {"count": r[1], "net_buy": r[2] or 0}
+            logger.info(f"因子IC评估：加载龙虎榜 {len(lhb_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：龙虎榜加载失败：{e!r}")
 
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
     records: dict[str, list[dict]] = {}  # {month: [{factor_values..., fwd_return}]}
-    factor_set = factor_names or list(FACTOR_META.keys())
     processed = 0
 
     for sym in symbols:
@@ -407,7 +674,8 @@ def evaluate_factor_ic(
             # 向量化算完整序列的因子值（一次算完，按月取截面）
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
             ts_factors = [f for f in factor_set if f not in
-                          ("roe","np_margin","gp_margin","rev_growth","profit_growth")]
+                          ("roe","np_margin","gp_margin","rev_growth","profit_growth",
+                           "lhb_count","lhb_netbuy","main_net","main_pct")]
             series = compute_factor_series(df, ts_factors)
             dates = df["date"].astype(str).values
             months = np.array([d[:7] for d in dates])
@@ -427,9 +695,40 @@ def evaluate_factor_ic(
                 fwd_ret = fwd[i]
                 if np.isnan(fwd_ret):
                     continue
-                row = {k: (float(series[k].iloc[i])
-                         if k in series and not np.isnan(series[k].iloc[i]) else None)
-                       for k in factor_set}
+                row = {"symbol": sym}
+                for k in factor_set:
+                    if k in fund_flow_factors:
+                        ff = fund_flow_map.get(sym)
+                        if ff:
+                            if k == "main_net":
+                                row[k] = float(ff.get("main_net", 0)) if ff.get("main_net") is not None else None
+                            elif k == "main_pct":
+                                row[k] = float(ff.get("main_pct", 0)) if ff.get("main_pct") is not None else None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in quality_factors:
+                        fin = finance_map.get(sym)
+                        if fin:
+                            if k == "rev_growth":
+                                row[k] = float(fin.get("yoy_eps", 0)) if fin.get("yoy_eps") is not None else None
+                            elif k == "profit_growth":
+                                row[k] = float(fin.get("yoy_pni", 0)) if fin.get("yoy_pni") is not None else None
+                            elif k == "roe":
+                                row[k] = float(fin.get("roe", 0)) if fin.get("roe") is not None else None
+                            elif k == "np_margin":
+                                row[k] = float(fin.get("np_margin", 0)) if fin.get("np_margin") is not None else None
+                            elif k == "gp_margin":
+                                row[k] = float(fin.get("gp_margin", 0)) if fin.get("gp_margin") is not None else None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in series and not np.isnan(series[k].iloc[i]):
+                        row[k] = float(series[k].iloc[i])
+                    else:
+                        row[k] = None
                 row["fwd_return"] = float(fwd_ret)
                 records.setdefault(m, []).append(row)
             processed += 1
@@ -440,11 +739,20 @@ def evaluate_factor_ic(
 
     # 计算每个因子的月度IC序列
     sorted_months = sorted(records.keys())
+    # P3: 滚动窗口——只取最近N个月（0=全样本）
+    if rolling_months > 0 and len(sorted_months) > rolling_months:
+        cutoff_month = sorted_months[-rolling_months]
+        sorted_months = [m for m in sorted_months if m >= cutoff_month]
+        records = {m: records[m] for m in sorted_months if m in records}
+        logger.info(f"滚动IC窗口：最近{rolling_months}个月（{sorted_months[0]}~{sorted_months[-1]}）")
     ic_series: dict[str, list[float]] = {f: [] for f in factor_set}
 
     for m in sorted_months:
         batch = records[m]
         df_batch = pd.DataFrame(batch)
+        # 截面中性化（市值+行业）
+        if neutralize and len(df_batch) >= 50:
+            df_batch = _neutralize截面(df_batch, factor_set, market_cap_map, industry_map)
         for f in factor_set:
             valid = df_batch[[f, "fwd_return"]].dropna()
             if len(valid) < 20:
@@ -453,11 +761,81 @@ def evaluate_factor_ic(
             ic = float(valid[f].rank().corr(valid["fwd_return"].rank()))
             ic_series[f].append(ic)
 
+    # ════════ P1: 三态市场状态分组IC（bull/neutral/bear 各一套权重）════════
+    # 用全市场等权月度收益判定该月市场状态：
+    #   月收益 >3% → bull, <-3% → bear, 中间 → neutral
+    month_returns = {}
+    for m in sorted_months:
+        rets = [r["fwd_return"] for r in records[m] if r["fwd_return"] is not None]
+        month_returns[m] = float(np.median(rets)) if rets else 0.0
+
+    def _state_of(m_ret: float) -> str:
+        if m_ret > 0.03:
+            return "bull"
+        elif m_ret < -0.03:
+            return "bear"
+        return "neutral"
+
+    month_states = {m: _state_of(month_returns[m]) for m in sorted_months}
+    state_ic_series: dict[str, dict[str, list[float]]] = {
+        s: {f: [] for f in factor_set} for s in ("bull", "neutral", "bear")
+    }
+    for m in sorted_months:
+        state = month_states[m]
+        batch = records[m]
+        df_batch = pd.DataFrame(batch)
+        if neutralize and len(df_batch) >= 50:
+            df_batch = _neutralize截面(df_batch, factor_set, market_cap_map, industry_map)
+        for f in factor_set:
+            valid = df_batch[[f, "fwd_return"]].dropna()
+            if len(valid) < 10:
+                continue
+            ic = float(valid[f].rank().corr(valid["fwd_return"].rank()))
+            state_ic_series[state][f].append(ic)
+
+    # 计算三态权重
+    state_weights: dict[str, list[dict]] = {}
+    for state in ("bull", "neutral", "bear"):
+        state_reports = []
+        for f in factor_set:
+            ics = [x for x in state_ic_series[state][f] if not np.isnan(x)]
+            if len(ics) < 3:
+                continue
+            ic_mean = float(np.mean(ics))
+            ic_std = float(np.std(ics))
+            icir = ic_mean / ic_std if ic_std > 0 else 0
+            win_rate = float((np.array(ics) > 0).mean() * 100)
+            if abs(ic_mean) > 0.015 and abs(icir) > 0.3:
+                state_reports.append({
+                    "factor_name": f,
+                    "category": FACTOR_META.get(f, {}).get("category", ""),
+                    "ic_mean": round(ic_mean, 4),
+                    "icir": round(icir, 4),
+                    "win_rate": round(win_rate, 1),
+                })
+        total_ic = sum(abs(r["ic_mean"]) for r in state_reports)
+        if total_ic > 0:
+            for r in state_reports:
+                r["weight"] = round(r["ic_mean"] / total_ic, 4)
+            state_weights[state] = state_reports
+
+    # 写入三态权重表
+    try:
+        engine.save_market_factor_weights(state_weights)
+        parts = [f"{s}:{len(state_weights.get(s,[]))}" for s in ("bull", "neutral", "bear")]
+        logger.info(f"三态因子权重已写入DB（{' '.join(parts)}）")
+    except Exception as e:
+        logger.warning(f"三态权重写入失败：{e!r}")
+
+    # 记录各月市场状态（供回测/展示）
+    for m in sorted_months:
+        month_returns[m] = round(month_returns[m], 4)
+
     # 汇总统计
     factor_reports = []
     for f in factor_set:
         ics = [x for x in ic_series[f] if not np.isnan(x)]
-        if len(ics) < 6:
+        if len(ics) < 4:
             factor_reports.append({
                 "name": f, **FACTOR_META.get(f, {}),
                 "ic_mean": 0, "icir": 0, "win_rate": 0,
@@ -495,23 +873,86 @@ def evaluate_factor_ic(
     # 按IC绝对值降序
     factor_reports.sort(key=lambda x: abs(x["ic_mean"]), reverse=True)
 
-    # 写回DB：有效因子(|IC|>0.015)按IC归一化为权重，自动刷新多因子策略
+    # 写回DB：带符号IC权重（正IC→正权重，负IC→负权重）+ ICIR筛选门槛
+    #
+    # 专业做法：
+    #   1. 只保留 |IC|>0.015 且 |ICIR|>0.3 的因子（剔除噪音）
+    #   2. 权重 = IC_signed / sum(|IC_signed|)，保留IC方向
+    #   3. 负IC因子获得负权重，在综合分中做减法（相当于反向指标的正确使用）
+    #   4. 综合分 = Σ(因子排名 × signed_weight)，正因子贡献高分，负因子拖累
     try:
-        effective = [f for f in factor_reports if abs(f["ic_mean"]) > 0.015]
+        effective = [f for f in factor_reports
+                     if abs(f["ic_mean"]) > 0.015 and abs(f.get("icir", 0)) > 0.3]
+
+        # P4: 因子去重——剔除同义因子，只保留每组IC最强的
+        # 定义同义因子组（因子值高度相关，来自截面相关性分析）
+        _SYNONYM_GROUPS = [
+            # 动量/反转互为镜像，只保留IC绝对值最大的一个
+            {"mom_5", "rev_5"},
+            {"mom_10", "rev_10"},
+            {"mom_20", "rev_20"},
+            # 流动性三重计数
+            {"turnover", "liq_rank"},
+            # 换手率重复
+            {"turn_surge", "vol_surge"},
+            {"turn_ma5", "turn_ratio"},
+            # 高位距离/超卖镜像
+            {"high_dist", "oversold"},
+            # 波动率高度相关
+            {"atr_pct", "vol_20"},
+        ]
+        removed = set()
+        for group in _SYNONYM_GROUPS:
+            in_effective = [f for f in effective if f["name"] in group]
+            if len(in_effective) > 1:
+                # 保留 |IC| 最大的
+                best = max(in_effective, key=lambda x: abs(x["ic_mean"]))
+                for f in in_effective:
+                    if f["name"] != best["name"]:
+                        removed.add(f["name"])
+        if removed:
+            effective = [f for f in effective if f["name"] not in removed]
+            logger.info(f"因子去重：剔除{len(removed)}个同义因子({', '.join(sorted(removed))})")
+
         total_ic = sum(abs(f["ic_mean"]) for f in effective)
         if total_ic > 0:
+            effective_names = {f["name"] for f in effective}
+            # 先清零所有因子的旧权重（防止未筛选因子残留旧绝对值正值权重）
+            import sqlite3 as _sq3
+            with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
+                _conn.execute("UPDATE factor_weights SET weight=0")
+            # 写入新的带符号权重
             weights = [{
                 "factor_name": f["name"],
                 "category": f.get("category", ""),
                 "ic_mean": f["ic_mean"],
                 "icir": f.get("icir", 0),
                 "win_rate": f.get("win_rate", 0),
-                "weight": round(abs(f["ic_mean"]) / total_ic, 4),
+                # 带符号权重：正IC正权重，负IC负权重，按|IC|归一化
+                "weight": round(f["ic_mean"] / total_ic, 4),
             } for f in effective]
             engine.save_factor_weights(weights)
-            logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子")
+            pos_cnt = sum(1 for w in weights if w["weight"] > 0)
+            neg_cnt = sum(1 for w in weights if w["weight"] < 0)
+            logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子（{pos_cnt}正+{neg_cnt}负）")
     except Exception as e:
         logger.warning(f"因子权重写DB失败（不影响评估结果）：{e!r}")
+
+    # P4: 因子拥挤度评估（多头组合集中度）
+    # 拥挤度 = 因子Top20%组合的行业集中度（HHI指数）
+    # 高拥挤度意味着因子选出的票集中在少数行业，反转风险高
+    crowding_scores = {}
+    if "fwd_return" in str(records.get(sorted_months[-1], [{}])[0]):
+        last_month = sorted_months[-1] if sorted_months else None
+        if last_month:
+            last_batch = pd.DataFrame(records[last_month])
+            for f in factor_set:
+                valid_f = last_batch[[f, "fwd_return"]].dropna()
+                if len(valid_f) >= 50:
+                    top_q = valid_f.nlargest(max(len(valid_f)//5, 10), f)
+                    # 简化拥挤度：Top组合的收益分散度（标准差越小越拥挤）
+                    crowd = float(top_q["fwd_return"].std()) if len(top_q) > 5 else 0
+                    crowding_scores[f] = round(crowd, 4)
 
     return {
         "factors": factor_reports,
@@ -520,6 +961,10 @@ def evaluate_factor_ic(
         "months": sorted_months,
         "ic_series": {f: [round(x, 4) if not np.isnan(x) else None for x in ic_series[f]]
                       for f in factor_set},
+        "market_state_weights": {s: {w["factor_name"]: w["weight"] for w in ws}
+                                 for s, ws in state_weights.items()},
+        "month_states": month_states,
+        "crowding": crowding_scores,
     }
 
 

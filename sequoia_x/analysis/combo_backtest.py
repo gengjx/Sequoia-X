@@ -88,7 +88,7 @@ def _ic_assessment(ic_mean: float) -> str:
         return "有效负向"
     return "区分力不足"
 
-def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
+def _compute_signals(df: pd.DataFrame, finance_series: dict[str, pd.Series] | None = None, factor_weights: dict[str, float] | None = None) -> dict[str, pd.Series]:
     """计算所有策略的逐日信号序列（布尔，True=当天触发）。
 
     复用 StockAnalyzer._detect_strategy_hits 的核心逻辑，但面向整个序列向量化。
@@ -177,7 +177,7 @@ def _compute_signals(df: pd.DataFrame) -> dict[str, pd.Series]:
     # 多因子选股：综合因子分Top20%分位 = 触发信号
     try:
         from sequoia_x.analysis.factor import compute_composite_score
-        composite = compute_composite_score(df)
+        composite = compute_composite_score(df, weights=factor_weights, finance_series=finance_series)
         # 滚动分位：综合分进入自身历史前20%时触发
         threshold = composite.rolling(120, min_periods=60).quantile(0.8)
         signals["multi_factor"] = composite >= threshold

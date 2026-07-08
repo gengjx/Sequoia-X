@@ -73,6 +73,23 @@ class IntradayScanner:
             return row[1][0]  # 倒数第2个=昨日
         return None
 
+    def _get_adjust_factor(self, symbol: str, true_price: float) -> float | None:
+        """复权因子：真实价 / 后复权收盘价（用于将DB后复权价转为真实价口径）。"""
+        if true_price <= 0:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT close FROM stock_daily WHERE symbol=? ORDER BY date DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        factor = true_price / row[0]
+        # 合理性校验：因子应在 0.01~100.0 之间（除权日跳变属正常）
+        if 0.01 < factor < 100.0:
+            return factor
+        return None
+
     def _limit_pct(self, symbol: str) -> float:
         """涨停幅度：创业板/科创板20%，主板10%，ST 5%（简化）。"""
         if symbol.startswith(("3", "68")):
@@ -80,9 +97,17 @@ class IntradayScanner:
         return 0.10
 
     def detect_breakout(self, symbol: str, current_price: float, name: str = "") -> IntradaySignal | None:
-        """1. 20日新高突破：盘中价 > 昨日20日最高价。"""
+        """1. 20日新高突破：盘中价 > 昨日20日最高价。
+        DB存后复权价，实时价是真实价，用复权因子校正。
+        """
         high20 = self._get_daily_high20(symbol)
-        if not high20 or current_price <= high20:
+        if not high20:
+            return None
+        # 复权因子校正：后复权 high20 × factor = 真实价 high20
+        factor = self._get_adjust_factor(symbol, current_price)
+        if factor:
+            high20 = high20 * factor
+        if current_price <= high20:
             return None
         pct_over = round((current_price / high20 - 1) * 100, 2)
         return IntradaySignal(
@@ -103,10 +128,10 @@ class IntradayScanner:
         prev = df.iloc[-2]
         if pd.isna(last["ma5"]) or pd.isna(last["vol_ma20"]):
             return None
-        # 金叉：上一根 ma5<ma20，当前 ma5>ma20（用close近似，分钟K均线需够长）
-        cross = prev["ma5"] <= prev["close"].rolling(5).mean() if len(df) > 20 else False
-        # 简化：当前MA5>MA20 且 放量
+        # 均线判定：当前MA5>MA20 且 放量 且 MA5上行（近似金叉）
         ma20_now = df["close"].rolling(20).mean().iloc[-1]
+        if pd.isna(ma20_now):
+            return None
         vol_surge = last["volume"] > last["vol_ma20"] * 1.5
         if last["ma5"] > ma20_now and vol_surge and last["ma5"] > prev["ma5"]:
             return IntradaySignal(
@@ -117,10 +142,17 @@ class IntradayScanner:
             )
         return None
 
-    def detect_limit(self, symbol: str, current_price: float, name: str = "") -> IntradaySignal | None:
-        """3. 涨停封板/炸板：触及涨停板 或 涨停后回落（炸板）。"""
-        prev_close = self._get_prev_close(symbol)
-        if not prev_close:
+    def detect_limit(self, symbol: str, current_price: float, name: str = "", prev_close: float = 0) -> IntradaySignal | None:
+        """3. 涨停封板/炸板：触及涨停板 或 涨停后回落（炸板）。
+        prev_close 优先用东财实时昨收(f60, 真实价)；无则用复权因子校正DB后复权价。
+        """
+        if prev_close <= 0:
+            prev_close = self._get_prev_close(symbol)
+            # 复权因子校正
+            factor = self._get_adjust_factor(symbol, current_price)
+            if prev_close and factor:
+                prev_close = prev_close * factor
+        if not prev_close or prev_close <= 0:
             return None
         limit_price = round(prev_close * (1 + self._limit_pct(symbol)), 2)
         limit_down = round(prev_close * (1 - self._limit_pct(symbol)), 2)
@@ -197,8 +229,9 @@ class IntradayScanner:
             # 1. 突破（用实时价）
             if sig := self.detect_breakout(sym, price, name):
                 signals.append(sig)
-            # 3. 涨停/跌停（用实时价）
-            if sig := self.detect_limit(sym, price, name):
+            # 3. 涨停/跌停（用东财真实昨收）
+            prev_close = spot.get("prev_close", 0)
+            if sig := self.detect_limit(sym, price, name, prev_close=prev_close):
                 signals.append(sig)
             # 2+4 均线/异动（用分钟K）
             try:
@@ -240,7 +273,7 @@ class IntradayScanner:
                 "https://push2delay.eastmoney.com/api/qt/clist/get",
                 params={"pn": 1, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
                         "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
-                        "fields": "f12,f14,f2,f3"},
+                        "fields": "f12,f14,f2,f3,f60"},
                 headers=headers, timeout=8,
             )
             for item in r.json().get("data", {}).get("diff", []) or []:
@@ -250,7 +283,7 @@ class IntradayScanner:
                         price = float(item.get("f2", 0))
                     except (TypeError, ValueError):
                         price = 0
-                    result[sym] = {"price": price, "name": item.get("f14", ""), "pct": float(item.get("f3", 0) or 0)}
+                    result[sym] = {"price": price, "name": item.get("f14", ""), "pct": float(item.get("f3", 0) or 0), "prev_close": float(item.get("f60", 0) or 0)}
             # 翻页（关注池>200只时）
             total = r.json().get("data", {}).get("total", 0)
             for page in range(2, total // 200 + 2):
@@ -260,7 +293,7 @@ class IntradayScanner:
                     "https://push2delay.eastmoney.com/api/qt/clist/get",
                     params={"pn": page, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
                             "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
-                            "fields": "f12,f14,f2,f3"},
+                            "fields": "f12,f14,f2,f3,f60"},
                     headers=headers, timeout=8,
                 )
                 for item in r2.json().get("data", {}).get("diff", []) or []:
@@ -270,7 +303,7 @@ class IntradayScanner:
                             price = float(item.get("f2", 0))
                         except (TypeError, ValueError):
                             price = 0
-                        result[sym] = {"price": price, "name": item.get("f14", "")}
+                        result[sym] = {"price": price, "name": item.get("f14", ""), "prev_close": float(item.get("f60", 0) or 0)}
         except Exception as e:
             logger.warning(f"盘中快照拉取失败：{e!r}")
         return result

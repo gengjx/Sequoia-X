@@ -11,8 +11,10 @@
         <button class="btn btn-warning btn-sm" onclick="scanPositions(false)"><i class="bi bi-radar"></i> 扫描信号</button>
         <button class="btn btn-success btn-sm" onclick="scanPositions(true)"><i class="bi bi-arrow-up-circle"></i> 扫描并移止损</button>
         <button class="btn btn-info btn-sm" onclick="pushFeishu()"><i class="bi bi-send"></i> 推飞书</button>
+        <button class="btn btn-outline-primary btn-sm" id="intradayBtn" onclick="toggleIntraday()"><i class="bi bi-broadcast"></i> 实时盯盘</button>
     </div>
 </div>
+<div id="intraday-status" class="alert alert-info d-none py-1 mb-2"><i class="bi bi-broadcast-pin"></i> 盘中实时盯盘中…每30秒自动刷新</div>
 
 <!-- 组合摘要 -->
 <div class="row g-3 mb-3" id="summary-row"></div>
@@ -178,6 +180,41 @@ function renderTable(items) {
             </tr>`;
         }).join('');
     }
+}
+
+let intradayTimer = null;
+let intradayOn = false;
+
+function toggleIntraday() {
+    intradayOn = !intradayOn;
+    const btn = document.getElementById('intradayBtn');
+    const status = document.getElementById('intraday-status');
+    if (intradayOn) {
+        btn.classList.replace('btn-outline-primary', 'btn-danger');
+        btn.innerHTML = '<i class="bi bi-stop-circle"></i> 停止盯盘';
+        status.classList.remove('d-none');
+        intradayRefresh();
+        intradayTimer = setInterval(intradayRefresh, 30000);
+    } else {
+        btn.classList.replace('btn-danger', 'btn-outline-primary');
+        btn.innerHTML = '<i class="bi bi-broadcast"></i> 实时盯盘';
+        status.classList.add('d-none');
+        if (intradayTimer) { clearInterval(intradayTimer); intradayTimer = null; }
+    }
+}
+
+async function intradayRefresh() {
+    try {
+        const d = await api('/api/positions/intraday');
+        lastSignals = {};
+        (d.signals||[]).forEach(s => lastSignals[s.id] = s);
+        renderSummary(d.summary);
+        loadList();
+        const danger = (d.signals||[]).filter(s=>s.signal_level==='danger').length;
+        if (danger > 0) {
+            showToast(`⚠️ ${danger}只持仓触发止损/清仓信号！`, 'error');
+        }
+    } catch(e) { console.error('盯盘刷新失败:', e); }
 }
 
 async function scanPositions(applyMove) {

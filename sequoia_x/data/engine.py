@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS stock_daily (
     close    REAL,
     volume   REAL,
     turnover REAL,
+    turn        REAL,      -- 换手率(%)
+    pct_chg     REAL,      -- 涨跌幅(%)
+    tradestatus INTEGER,   -- 交易状态 1=正常 0=停牌
+    isst        INTEGER,   -- 是否ST 1=ST 0=非ST
     UNIQUE (symbol, date)
 );
 """
@@ -84,6 +88,85 @@ CREATE TABLE IF NOT EXISTS strategy_weights (
 );
 """
 
+_CREATE_DECISION_POOL_SQL = """
+CREATE TABLE IF NOT EXISTS decision_pool (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    grade       TEXT    DEFAULT '',   -- A/B/C/观望/淘汰
+    score       INTEGER DEFAULT 0,
+    action      TEXT    DEFAULT '',
+    source      TEXT    DEFAULT '',   -- buy/watch/竞价/持仓
+    UNIQUE (symbol, date)
+);
+"""
+
+_CREATE_PAPER_ACCOUNT_SQL = """
+CREATE TABLE IF NOT EXISTS paper_account (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT    DEFAULT 'default',
+    initial_capital REAL    NOT NULL,    -- 初始本金
+    cash            REAL    NOT NULL,    -- 可用现金
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+"""
+
+_CREATE_PAPER_TRADES_SQL = """
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   INTEGER NOT NULL DEFAULT 1,
+    symbol       TEXT    NOT NULL,
+    name         TEXT    DEFAULT '',
+    side         TEXT    NOT NULL,   -- buy / sell
+    price        REAL    NOT NULL,
+    shares       INTEGER NOT NULL,
+    amount       REAL    NOT NULL,   -- 成交金额
+    date         TEXT    NOT NULL,
+    reason       TEXT    DEFAULT '',  -- 买入理由/卖出原因
+    pnl          REAL    DEFAULT 0,   -- 卖出时记录本次盈亏
+    pnl_pct      REAL    DEFAULT 0,
+    hold_days    INTEGER DEFAULT 0,
+    entry_price  REAL    DEFAULT 0,   -- 卖出记录对应买入价
+    created_at   TEXT    NOT NULL
+);
+"""
+
+_CREATE_PAPER_HOLDINGS_SQL = """
+CREATE TABLE IF NOT EXISTS paper_holdings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id   INTEGER NOT NULL DEFAULT 1,
+    symbol       TEXT    NOT NULL,
+    name         TEXT    DEFAULT '',
+    entry_price  REAL    NOT NULL,
+    shares       INTEGER NOT NULL,
+    entry_date   TEXT    NOT NULL,
+    stop_loss    REAL    DEFAULT 0,
+    initial_stop REAL    DEFAULT 0,
+    target       REAL    DEFAULT 0,
+    grade        TEXT    DEFAULT '',
+    hit_strategies TEXT DEFAULT '',
+    cost         REAL    DEFAULT 0,
+    UNIQUE (account_id, symbol)
+);
+"""
+
+_CREATE_PAPER_NAV_SQL = """
+CREATE TABLE IF NOT EXISTS paper_nav (
+    date            TEXT    NOT NULL,
+    total_assets    REAL    NOT NULL,
+    cash            REAL    NOT NULL,
+    market_value    REAL    NOT NULL,
+    daily_return    REAL    DEFAULT 0,    -- 当日收益率%
+    cum_return      REAL    DEFAULT 0,    -- 累计收益率%
+    benchmark_return REAL   DEFAULT 0,    -- 沪深300当日收益率%
+    benchmark_cum   REAL    DEFAULT 0,    -- 沪深300累计收益率%
+    holding_count   INTEGER DEFAULT 0,
+    UNIQUE (date)
+);
+"""
+
+
 _CREATE_FACTOR_WEIGHTS_SQL = """
 CREATE TABLE IF NOT EXISTS factor_weights (
     factor_name TEXT PRIMARY KEY,
@@ -95,6 +178,60 @@ CREATE TABLE IF NOT EXISTS factor_weights (
     updated_at  TEXT NOT NULL
 );
 """
+
+_CREATE_MARKET_FACTOR_WEIGHTS_SQL = """
+CREATE TABLE IF NOT EXISTS market_factor_weights (
+    market_state TEXT    NOT NULL,   -- bull / neutral / bear
+    factor_name  TEXT    NOT NULL,
+    category     TEXT    DEFAULT '',
+    ic_mean      REAL    NOT NULL,
+    icir         REAL    DEFAULT 0,
+    win_rate     REAL    DEFAULT 0,
+    weight       REAL    NOT NULL,
+    updated_at   TEXT    NOT NULL,
+    PRIMARY KEY (market_state, factor_name)
+);
+"""
+
+_CREATE_LHB_DETAIL_SQL = """
+CREATE TABLE IF NOT EXISTS lhb_detail (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol        TEXT    NOT NULL,
+    name          TEXT    DEFAULT '',
+    date          TEXT    NOT NULL,
+    close         REAL    DEFAULT 0,
+    pct_chg       REAL    DEFAULT 0,
+    net_buy       REAL    DEFAULT 0,
+    buy_amount    REAL    DEFAULT 0,
+    sell_amount   REAL    DEFAULT 0,
+    total_amount  REAL    DEFAULT 0,
+    market_amount REAL    DEFAULT 0,
+    net_ratio     REAL    DEFAULT 0,
+    turnover_rate REAL    DEFAULT 0,
+    circ_mv       REAL    DEFAULT 0,
+    reason        TEXT    DEFAULT '',
+    interp        TEXT    DEFAULT '',
+    UNIQUE (symbol, date)
+);
+"""
+
+_CREATE_LHB_SEATS_SQL = """
+CREATE TABLE IF NOT EXISTS lhb_seats (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol     TEXT    NOT NULL,
+    date       TEXT    NOT NULL,
+    direction  TEXT    NOT NULL,
+    seat_name  TEXT    NOT NULL,
+    buy_amount REAL    DEFAULT 0,
+    sell_amount REAL   DEFAULT 0,
+    net_amount REAL    DEFAULT 0,
+    buy_ratio  REAL    DEFAULT 0,
+    sell_ratio REAL    DEFAULT 0,
+    reason     TEXT    DEFAULT '',
+    UNIQUE (symbol, date, direction, seat_name)
+);
+"""
+
 
 
 def _bs_fetch_batch(tasks: list) -> list:
@@ -113,7 +250,7 @@ def _bs_fetch_batch(tasks: list) -> list:
                     bs.login()
                 rs = bs.query_history_k_data_plus(
                     bs_code,
-                    "date,open,high,low,close,volume,amount",
+                    "date,open,high,low,close,volume,amount,turn,pctChg,tradestatus,isST",
                     start_date=start,
                     end_date=end,
                     frequency="d",
@@ -151,8 +288,26 @@ class DataEngine:
             conn.execute(_CREATE_HOLDING_SQL)
             conn.execute(_CREATE_WEIGHTS_SQL)
             conn.execute(_CREATE_FACTOR_WEIGHTS_SQL)
+            conn.execute(_CREATE_LHB_DETAIL_SQL)
+            conn.execute(_CREATE_LHB_SEATS_SQL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lhb_detail_date ON lhb_detail(date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lhb_seats_sym_dt ON lhb_seats(symbol, date)")
+            conn.execute(_CREATE_DECISION_POOL_SQL)
+            conn.execute(_CREATE_PAPER_ACCOUNT_SQL)
+            conn.execute(_CREATE_PAPER_TRADES_SQL)
+            conn.execute(_CREATE_PAPER_HOLDINGS_SQL)
+            conn.execute(_CREATE_PAPER_NAV_SQL)
+            conn.execute(_CREATE_MARKET_FACTOR_WEIGHTS_SQL)
             conn.execute(_CREATE_MINUTE_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_sym_dt ON stock_minute(symbol, datetime)")
+            # 增量迁移：给已有DB补列（旧数据新列为NULL，不破坏）
+            _existing = {r[1] for r in conn.execute("PRAGMA table_info(stock_daily)")}
+            for _col, _ddl in [
+                ("turn", "REAL"), ("pct_chg", "REAL"),
+                ("tradestatus", "INTEGER"), ("isst", "INTEGER"),
+            ]:
+                if _col not in _existing:
+                    conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {_col} {_ddl}")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -167,14 +322,17 @@ class DataEngine:
         sql = ("INSERT OR REPLACE INTO factor_weights "
                "(factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
                "VALUES (?,?,?,?,?,?,?)")
-        with sqlite3.connect(self.db_path) as conn:
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
             for w in weights:
                 conn.execute(sql, (
                     w["factor_name"], w.get("category", ""),
                     w["ic_mean"], w.get("icir", 0), w.get("win_rate", 0),
                     w["weight"], now,
                 ))
-            conn.commit()
+        finally:
+            conn.close()
 
     def load_factor_weights(self) -> dict[str, dict]:
         """读取全部因子权重，返回 {factor_name: {weight, ic_mean, ...}}。"""
@@ -189,6 +347,42 @@ class DataEngine:
             }
             for r in rows
         }
+
+    def save_market_factor_weights(self, weights_by_state: dict[str, list[dict]]) -> None:
+        """批量写入三态因子权重（bull/neutral/bear）。
+
+        Args:
+            weights_by_state: {"bull": [{factor_name, weight, ...}], "neutral": [...], ...}
+        """
+        import time
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("DELETE FROM market_factor_weights")
+            for state, weights in weights_by_state.items():
+                for w in weights:
+                    conn.execute(
+                        "INSERT INTO market_factor_weights "
+                        "(market_state, factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (state, w["factor_name"], w.get("category", ""),
+                         w["ic_mean"], w.get("icir", 0), w.get("win_rate", 0),
+                         w["weight"], now),
+                    )
+        finally:
+            conn.close()
+
+    def load_market_factor_weights(self) -> dict[str, dict[str, float]]:
+        """读取三态因子权重，返回 {market_state: {factor_name: weight}}。"""
+        sql = ("SELECT market_state, factor_name, weight "
+               "FROM market_factor_weights WHERE weight != 0")
+        result: dict[str, dict[str, float]] = {}
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(sql).fetchall()
+        for state, fname, weight in rows:
+            result.setdefault(state, {})[fname] = weight
+        return result
 
     def save_strategy_weights(self, weights: list[dict]) -> None:
         """批量写入策略评估权重（UPSERT）。"""
@@ -322,12 +516,25 @@ class DataEngine:
             all_rows.extend(batch)
 
         if not all_rows:
-            logger.info("无新数据（可能非交易日或baostock超时）")
-            return 0
+            logger.warning("baostock无数据返回，切换东财fallback...")
+            return self.sync_today_eastmoney()
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
+        # 若baostock只拉到部分（<50%），补充东财fallback
+        synced_syms = len({r[0] for r in all_rows})
+        if synced_syms < len(tasks) * 0.5:
+            logger.warning(f"baostock仅拉到{synced_syms}/{len(tasks)}只，东财补充剩余...")
+            em_count = self.sync_today_eastmoney()
+            # baostock结果也落库（可能有东财没有的票）
+            pass
+
+        df = pd.DataFrame(all_rows, columns=[
+            "symbol", "date", "open", "high", "low", "close", "volume", "turnover",
+            "turn", "pct_chg", "tradestatus", "isst",
+        ])
+        for col in ["open", "high", "low", "close", "volume", "turnover", "turn", "pct_chg"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ["tradestatus", "isst"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
 
@@ -336,14 +543,163 @@ class DataEngine:
         # 避免多次同步时本轮拉取不完整覆盖掉上轮已成功的票
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO stock_daily (symbol, date, open, high, low, close, volume, turnover) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]].values.tolist(),
+                "INSERT OR REPLACE INTO stock_daily "
+                "(symbol, date, open, high, low, close, volume, turnover, turn, pct_chg, tradestatus, isst) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover",
+                    "turn", "pct_chg", "tradestatus", "isst"]].values.tolist(),
             )
             conn.commit()
 
         logger.info(f"sync_today_bulk: UPSERT {count} 条（{df['symbol'].nunique()}只×{df['date'].nunique()}日）")
         return count
+
+    def save_decision_pool(self, items: list[dict]) -> int:
+        """决策结果落库：盘后选出的票纳入盘中关注池。
+
+        每次 generate_decision 后调用，UPSERT 今日决策池。
+        build_watchlist 读取此表扩展盘中监控范围。
+        """
+        if not items:
+            return 0
+        import sqlite3 as _sql
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y-%m-%d")
+        rows = [
+            (it["symbol"], today, it.get("grade", ""),
+             it.get("score", 0), it.get("action", ""), it.get("source", "buy"))
+            for it in items
+        ]
+        with _sql.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO decision_pool (symbol, date, grade, score, action, source) "
+                "VALUES (?, ?, ?, ?, ?, ?)", rows
+            )
+            conn.commit()
+        return len(rows)
+
+    def sync_today_eastmoney(self) -> int:
+        """东财批量快照补全今日日K（baostock宕机时的fallback）。
+
+        原理：东财clist返回全市场实时OHLCV（不复权）+昨收(f18)，
+        用 DB后复权昨收 / 东财raw昨收 = 复权系数，
+        raw今日OHLC × 系数 = 后复权今日OHLC。
+        volume×100（手→股），turnover直接用amt。
+        全市场3秒搞定（vs baostock 8worker×5分钟）。
+        """
+        import requests as _req
+        from datetime import date as _date
+
+        today_str = _date.today().strftime("%Y-%m-%d")
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+
+        # 查出缺今日数据的股票及DB最后一天后复权close
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
+            ).fetchall()
+            last_hfq = dict(conn.execute("""
+                SELECT symbol, close FROM stock_daily d
+                WHERE date = (SELECT MAX(date) FROM stock_daily WHERE symbol = d.symbol)
+            """).fetchall())
+
+        missing = {sym: last for sym, last in rows if not last or last < today_str}
+
+        # 今日已有数据但缺turn/pct_chg的，也纳入更新（东财补全字段）
+        with sqlite3.connect(self.db_path) as conn:
+            stale = conn.execute(
+                "SELECT symbol FROM stock_daily WHERE date=? AND turn IS NULL", (today_str,)
+            ).fetchall()
+        for r in stale:
+            if r[0] not in missing:
+                missing[r[0]] = today_str
+        if stale:
+            logger.info(f"东财fallback: 含{len(stale)}只今日缺turn字段，一并补全")
+
+        if not missing:
+            logger.info("东财fallback: 所有股票已是最新，字段完整")
+            return 0
+        logger.info(f"东财fallback: 需补 {len(missing)} 只")
+
+        # 东财批量拉全市场沪深A股快照
+        all_spot: dict[str, dict] = {}
+        for page in range(1, 80):
+            try:
+                r = _req.get(
+                    "https://push2delay.eastmoney.com/api/qt/clist/get",
+                    params={
+                        "pn": page, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                        "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
+                        "fields": "f12,f2,f3,f5,f6,f8,f15,f16,f17,f18",
+                    },
+                    headers=headers, timeout=10,
+                )
+                d = r.json().get("data") or {}
+                diff = d.get("diff") or []
+                if not diff:
+                    break
+                for item in diff:
+                    sym = item.get("f12", "")
+                    if sym and len(sym) == 6 and sym.isdigit():
+                        all_spot[sym] = item
+            except Exception:
+                continue
+
+        logger.info(f"东财fallback: 快照获取 {len(all_spot)} 只")
+
+        # 转换为后复权并落库
+        rows_to_insert = []
+        for sym in missing:
+            spot = all_spot.get(sym)
+            if not spot:
+                continue
+
+            def _num(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            raw_close = _num(spot.get("f2"))
+            raw_open = _num(spot.get("f17"))
+            raw_high = _num(spot.get("f15"))
+            raw_low = _num(spot.get("f16"))
+            raw_yest = _num(spot.get("f18"))
+            vol = _num(spot.get("f5"))
+            amt = _num(spot.get("f6"))
+            pct_chg = _num(spot.get("f3"))   # 东财涨跌幅%
+            turn = _num(spot.get("f8"))       # 东财换手率%
+
+            if raw_close <= 0 or vol <= 0:
+                continue
+            hfq_yest = last_hfq.get(sym)
+            if not hfq_yest or raw_yest <= 0:
+                continue
+            factor = hfq_yest / raw_yest
+
+            rows_to_insert.append((
+                sym, today_str,
+                round(raw_open * factor, 6), round(raw_high * factor, 6),
+                round(raw_low * factor, 6), round(raw_close * factor, 6),
+                round(vol * 100, 2), round(amt, 2),
+                round(turn, 4) if turn > 0 else None,         # 换手率
+                round(pct_chg, 4) if pct_chg != 0 else None,  # 涨跌幅
+                1,    # tradestatus=1 正常交易（停牌的close=0已跳过）
+                0,    # isst=0（东财快照无ST标记，保守设0，baostock恢复后可修正）
+            ))
+
+        if rows_to_insert:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO stock_daily "
+                    "(symbol, date, open, high, low, close, volume, turnover, turn, pct_chg, tradestatus, isst) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows_to_insert,
+                )
+                conn.commit()
+
+        logger.info(f"东财fallback: UPSERT {len(rows_to_insert)} 条")
+        return len(rows_to_insert)
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
@@ -412,7 +768,7 @@ class DataEngine:
                     try:
                         rs = bs.query_history_k_data_plus(
                             bs_code,
-                            "date,open,high,low,close,volume,amount",
+                            "date,open,high,low,close,volume,amount,turn,pctChg,tradestatus,isST",
                             start_date=start,
                             end_date=today_str,
                             frequency="d",
@@ -451,7 +807,9 @@ class DataEngine:
                     continue
 
                 df = pd.DataFrame(rows, columns=rs.fields)
-                for col in ["open", "high", "low", "close", "volume", "amount"]:
+                for col in ["open", "high", "low", "close", "volume", "amount", "turn", "pctChg"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                for col in ["tradestatus", "isST"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 df = df.dropna(subset=["close"])
                 df = df[df["volume"] > 0]
@@ -461,15 +819,21 @@ class DataEngine:
                     continue
 
                 df["symbol"] = symbol
-                df = df.rename(columns={"amount": "turnover"})
-                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
+                df = df.rename(columns={
+                    "amount": "turnover", "pctChg": "pct_chg", "isST": "isst",
+                })
+                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover",
+                         "turn", "pct_chg", "tradestatus", "isst"]]
 
                 try:
                     with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO stock_daily "
+                            "(symbol, date, open, high, low, close, volume, turnover, turn, pct_chg, tradestatus, isst) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            df.values.tolist(),
                         )
+                        conn.commit()
                 except sqlite3.IntegrityError:
                     pass
 
@@ -589,3 +953,318 @@ class DataEngine:
                         conn, params=(symbol, f"{latest_date}%"),
                     )
         return df
+
+    # ------------------------------------------------------------------
+    # 龙虎榜数据采集
+    # ------------------------------------------------------------------
+    def sync_lhb(self, date_str: str | None = None) -> int:
+        """同步龙虎榜数据到本地 DB。
+
+        Args:
+            date_str: 日期 YYYYMMDD 格式，默认当天。
+
+        Returns:
+            写入的个股明细行数。
+        """
+        import akshare as ak
+        from datetime import datetime as dt
+
+        target = date_str or dt.now().strftime("%Y%m%d")
+        db_date = f"{target[:4]}-{target[4:6]}-{target[6:8]}"
+
+        with sqlite3.connect(self.db_path) as conn:
+            # 跳过已同步的日期（幂等）
+            exists = conn.execute(
+                "SELECT COUNT(*) FROM lhb_detail WHERE date=?", (db_date,)
+            ).fetchone()[0]
+            if exists > 0:
+                logger.info(f"龙虎榜 {db_date} 已存在 {exists} 行，跳过")
+                return exists
+
+        try:
+            df = ak.stock_lhb_detail_em(start_date=target, end_date=target)
+        except Exception as exc:
+            logger.warning(f"龙虎榜拉取失败 {target}: {exc}")
+            return 0
+
+        if df is None or len(df) == 0:
+            logger.info(f"龙虎榜 {target} 无数据（可能未发布或非交易日）")
+            return 0
+
+        # 数值清洗
+        def _num(v):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 0.0
+
+        rows = []
+        for _, r in df.iterrows():
+            sym = str(r.get("代码", "")).strip()
+            if not sym:
+                continue
+            rows.append((
+                sym,
+                str(r.get("名称", "")),
+                db_date,
+                _num(r.get("收盘价")),
+                _num(r.get("涨跌幅")),
+                _num(r.get("龙虎榜净买额")),
+                _num(r.get("龙虎榜买入额")),
+                _num(r.get("龙虎榜卖出额")),
+                _num(r.get("龙虎榜成交额")),
+                _num(r.get("市场总成交额")),
+                _num(r.get("净买额占总成交比")),
+                _num(r.get("换手率")),
+                _num(r.get("流通市值")),
+                str(r.get("上榜原因", "")),
+                str(r.get("解读", "")),
+            ))
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO lhb_detail
+                   (symbol, name, date, close, pct_chg, net_buy, buy_amount, sell_amount,
+                    total_amount, market_amount, net_ratio, turnover_rate, circ_mv,
+                    reason, interp)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+            conn.commit()
+
+        logger.info(f"龙虎榜 {db_date} 写入 {len(rows)} 行个股明细")
+        return len(rows)
+
+    def sync_lhb_seats(self, date_str: str | None = None) -> int:
+        """同步龙虎榜席位明细（买卖席位）。
+
+        需要先有 lhb_detail 才知道有哪些股票上榜。
+
+        Returns:
+            写入的席位行数。
+        """
+        import akshare as ak
+        from datetime import datetime as dt
+
+        target = date_str or dt.now().strftime("%Y%m%d")
+        db_date = f"{target[:4]}-{target[4:6]}-{target[6:8]}"
+
+        with sqlite3.connect(self.db_path) as conn:
+            # 获取当日上榜股票
+            symbols = [r[0] for r in conn.execute(
+                "SELECT symbol FROM lhb_detail WHERE date=?", (db_date,)
+            ).fetchall()]
+            # 跳过已同步席位的日期
+            seat_exists = conn.execute(
+                "SELECT COUNT(*) FROM lhb_seats WHERE date=?", (db_date,)
+            ).fetchone()[0]
+
+        if not symbols:
+            logger.info(f"龙虎榜席位：{db_date} 无上榜个股，跳过")
+            return 0
+        if seat_exists > 0:
+            logger.info(f"龙虎榜席位 {db_date} 已存在 {seat_exists} 行，跳过")
+            return seat_exists
+
+        def _num(v):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 0.0
+
+        all_rows = []
+        for sym in symbols:
+            for flag in ("买入", "卖出"):
+                try:
+                    sdf = ak.stock_lhb_stock_detail_em(
+                        symbol=sym, date=target, flag=flag
+                    )
+                except Exception as exc:
+                    logger.debug(f"席位拉取失败 {sym} {flag}: {exc}")
+                    continue
+                if sdf is None or len(sdf) == 0:
+                    continue
+                direction = "buy" if flag == "买入" else "sell"
+                for _, r in sdf.iterrows():
+                    seat = str(r.get("交易营业部名称", "")).strip()
+                    if not seat:
+                        continue
+                    all_rows.append((
+                        sym, db_date, direction, seat,
+                        _num(r.get("买入金额")),
+                        _num(r.get("卖出金额")),
+                        _num(r.get("净额")),
+                        _num(r.get("买入金额-占总成交比例")),
+                        _num(r.get("卖出金额-占总成交比例")),
+                        str(r.get("类型", "")),
+                    ))
+
+        if all_rows:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO lhb_seats
+                       (symbol, date, direction, seat_name, buy_amount, sell_amount,
+                        net_amount, buy_ratio, sell_ratio, reason)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    all_rows,
+                )
+                conn.commit()
+
+        logger.info(f"龙虎榜席位 {db_date} 写入 {len(all_rows)} 行（{len(symbols)} 只股票）")
+        return len(all_rows)
+
+    def get_lhb_date(self, date_str: str) -> list[dict]:
+        """查本地 DB 获取某日龙虎榜个股明细。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT symbol, name, close, pct_chg, net_buy, buy_amount,
+                          sell_amount, reason, interp
+                   FROM lhb_detail WHERE date=? ORDER BY net_buy DESC""",
+                (date_str,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_lhb_recent(self, days: int = 5) -> list[dict]:
+        """查本地 DB 获取近 N 日龙虎榜净买入 TOP。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT symbol, name, date, net_buy, close, pct_chg, reason
+                   FROM lhb_detail
+                   WHERE date IN (
+                       SELECT DISTINCT date FROM lhb_detail ORDER BY date DESC LIMIT ?
+                   )
+                   ORDER BY net_buy DESC LIMIT 20""",
+                (days,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_lhb_by_symbol(self, symbol: str, days: int = 30) -> list[dict]:
+        """查本地 DB 获取某只股票近 N 日龙虎榜记录。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT date, net_buy, buy_amount, sell_amount, reason, interp
+                   FROM lhb_detail WHERE symbol=?
+                   ORDER BY date DESC LIMIT ?""",
+                (symbol, days),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_lhb_latest_date(self) -> str | None:
+        """获取本地 DB 中龙虎榜的最新日期。"""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT MAX(date) FROM lhb_detail"
+            ).fetchone()
+        return row[0] if row and row[0] else None
+
+    # ------------------------------------------------------------------
+    # 主力资金流向采集（东财 clist API）
+    # ------------------------------------------------------------------
+    def sync_fund_flow(self, date_str: str | None = None) -> int:
+        """同步全市场主力资金流向到 fund_flow 表。
+
+        数据来源：东财 push2delay clist API
+        字段：f62=主力净流入, f184=主力净流入占比, f66=超大单, f72=大单, f78=中单, f81=小单
+
+        Returns:
+            写入行数。
+        """
+        import requests
+        from datetime import datetime as dt
+
+        target_date = date_str or dt.now().strftime("%Y-%m-%d")
+
+        # 建表（幂等）
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS fund_flow (
+                    symbol     TEXT    NOT NULL,
+                    date       TEXT    NOT NULL,
+                    main_net   REAL    DEFAULT 0,
+                    main_pct   REAL    DEFAULT 0,
+                    super_net  REAL    DEFAULT 0,
+                    big_net    REAL    DEFAULT 0,
+                    mid_net    REAL    DEFAULT 0,
+                    small_net  REAL    DEFAULT 0,
+                    UNIQUE (symbol, date)
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fund_flow_date ON fund_flow(date)"
+            )
+            conn.commit()
+
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/"}
+        all_rows: list[tuple] = []
+
+        for page in range(1, 30):  # 最多30页
+            try:
+                r = requests.get(
+                    "https://push2delay.eastmoney.com/api/qt/clist/get",
+                    params={
+                        "pn": page, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                        "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
+                        "fields": "f12,f14,f62,f184,f66,f72,f78,f81",
+                    },
+                    headers=headers, timeout=10,
+                )
+                data = r.json().get("data", {})
+                diff = data.get("diff", [])
+                if not diff:
+                    break
+                for item in diff:
+                    sym = str(item.get("f12", "")).strip()
+                    if not sym:
+                        continue
+                    try:
+                        all_rows.append((
+                            sym, target_date,
+                            float(item.get("f62", 0) or 0),
+                            float(item.get("f184", 0) or 0),
+                            float(item.get("f66", 0) or 0),
+                            float(item.get("f72", 0) or 0),
+                            float(item.get("f78", 0) or 0),
+                            float(item.get("f81", 0) or 0),
+                        ))
+                    except (ValueError, TypeError):
+                        continue
+                if len(all_rows) >= data.get("total", 0):
+                    break
+            except Exception as exc:
+                logger.warning(f"资金流向拉取失败 page {page}: {exc}")
+                break
+
+        if all_rows:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO fund_flow
+                       (symbol, date, main_net, main_pct, super_net, big_net, mid_net, small_net)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    all_rows,
+                )
+                conn.commit()
+
+        logger.info(f"资金流向 {target_date} 写入 {len(all_rows)} 行")
+        return len(all_rows)
+
+    def get_fund_flow(self, date_str: str | None = None) -> list[dict]:
+        """查本地资金流向（按主力净流入排序）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if date_str:
+                rows = conn.execute(
+                    """SELECT symbol, date, main_net, main_pct, super_net, big_net
+                       FROM fund_flow WHERE date=? ORDER BY main_net DESC""",
+                    (date_str,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT symbol, date, main_net, main_pct, super_net, big_net
+                       FROM fund_flow WHERE date=(
+                           SELECT MAX(date) FROM fund_flow
+                       ) ORDER BY main_net DESC""",
+                ).fetchall()
+        return [dict(r) for r in rows]

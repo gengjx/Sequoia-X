@@ -1,0 +1,337 @@
+{% extends "base.html" %}
+{% block title %}模拟盘 - Sequoia-X{% endblock %}
+{% block content %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<div class="row mb-3 align-items-center">
+    <div class="col">
+        <h3><i class="bi bi-cash-coin"></i> 模拟盘 · 10万本金全自动闭环</h3>
+        <div class="text-muted small">选股→决策→自动买入→持仓跟踪→自动卖出→绩效统计（风险预算+移动止盈+风控熔断）</div>
+    </div>
+    <div class="col-auto d-flex align-items-center gap-2">
+        <span class="badge bg-secondary" id="riskBadge">风控：-</span>
+        <button class="btn btn-primary" id="btnAutoRun" onclick="autoRun()">
+            <i class="bi bi-play-circle"></i> 一键执行闭环
+        </button>
+        <button class="btn btn-outline-danger btn-sm" onclick="resetAccount()">
+            <i class="bi bi-arrow-counterclockwise"></i> 重置
+        </button>
+    </div>
+</div>
+
+<!-- 绩效核心指标 -->
+<div class="row g-2 mb-3" id="perfCards"></div>
+
+<!-- 净值曲线 -->
+<div class="card mb-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-graph-up"></i> 净值曲线 vs 沪深300</span>
+        <span class="text-muted small" id="navRange"></span>
+    </div>
+    <div class="card-body">
+        <canvas id="navChart" height="100"></canvas>
+        <div id="navEmpty" class="text-center text-muted py-4">
+            <i class="bi bi-graph-up" style="font-size:2rem"></i>
+            <p class="mt-2 small">执行「一键闭环」后生成净值曲线</p>
+        </div>
+    </div>
+</div>
+
+<!-- 专业指标面板 -->
+<div class="row g-3 mb-3">
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">夏普比率</div>
+                <div class="fs-4 fw-bold" id="m-sharpe">-</div>
+                <div class="text-muted small">Sharpe</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">索提诺</div>
+                <div class="fs-4 fw-bold" id="m-sortino">-</div>
+                <div class="text-muted small">Sortino</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">卡玛比率</div>
+                <div class="fs-4 fw-bold" id="m-calmar">-</div>
+                <div class="text-muted small">Calmar</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">年化收益</div>
+                <div class="fs-4 fw-bold" id="m-annual">-</div>
+                <div class="text-muted small">Annualized</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">超额收益</div>
+                <div class="fs-4 fw-bold" id="m-alpha">-</div>
+                <div class="text-muted small">Alpha vs 300</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-center h-100">
+            <div class="card-body py-3">
+                <div class="text-muted small">沪深300</div>
+                <div class="fs-4 fw-bold" id="m-bench">-</div>
+                <div class="text-muted small">Benchmark</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 持仓 + 交易记录 -->
+<div class="row g-3">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-bag-check"></i> 当前持仓</div>
+            <div class="card-body p-0">
+                <table class="table table-sm table-hover mb-0" id="holdingsTable">
+                    <thead class="table-light">
+                        <tr><th>代码</th><th>名称</th><th>买入价</th><th>股数</th><th>成本</th><th>止损</th><th>评级</th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-clock-history"></i> 交易记录</div>
+            <div class="card-body p-0">
+                <table class="table table-sm table-hover mb-0" id="tradesTable">
+                    <thead class="table-light">
+                        <tr><th>日期</th><th>代码</th><th>方向</th><th>价格</th><th>股数</th><th>盈亏</th><th>原因</th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let navChart = null;
+
+function fmt(v, decimals=2) {
+    if (v === null || v === undefined) return '-';
+    return Number(v).toFixed(decimals);
+}
+function fmtPct(v) {
+    if (v === null || v === undefined) return '-';
+    const s = Number(v).toFixed(2);
+    const cls = v > 0 ? 'text-danger' : v < 0 ? 'text-success' : '';
+    return `<span class="${cls} fw-bold">${s >= 0 ? '+' : ''}${s}%</span>`;
+}
+
+async function loadAccount() {
+    const r = await fetch('/api/paper/account');
+    const d = await r.json();
+    const cards = [
+        {label:'总资产', value:'¥'+fmt(d.total_assets,0), cls:'primary'},
+        {label:'累计收益', value:fmtPct(d.total_return_pct), cls: d.total_return_pct>=0?'danger':'success'},
+        {label:'现金', value:'¥'+fmt(d.cash,0), cls:'info'},
+        {label:'持仓市值', value:'¥'+fmt(d.market_value,0), cls:'info'},
+        {label:'胜率', value:d.total_trades>0?fmt(d.win_rate,1)+'%':'-', cls:'secondary'},
+        {label:'盈亏比', value:d.profit_factor>=999?'∞':fmt(d.profit_factor), cls:'secondary'},
+        {label:'总交易', value:d.total_trades+'笔', cls:'secondary'},
+        {label:'最大回撤', value:'<span class="text-warning fw-bold">'+fmt(Math.abs(d.max_drawdown_pct))+'%</span>', cls:'warning'},
+        {label:'持仓数', value:d.holding_count+'只', cls:'secondary'},
+        {label:'平均持仓', value:d.avg_hold_days+'天', cls:'secondary'},
+    ];
+    document.getElementById('perfCards').innerHTML = cards.map(c => `
+        <div class="col">
+            <div class="card text-center border-${c.cls} border-opacity-25">
+                <div class="card-body py-2 px-1">
+                    <div class="text-muted small">${c.label}</div>
+                    <div class="fs-5 fw-bold text-${c.cls}">${c.value}</div>
+                </div>
+            </div>
+        </div>
+    `).join('');
+
+    // 风控状态
+    const rb = document.getElementById('riskBadge');
+    const rc = d.risk_circuit || '正常';
+    rb.className = 'badge ' + (rc === '正常' ? 'bg-success' : 'bg-danger');
+    rb.textContent = '风控：' + rc;
+
+    // 专业指标
+    document.getElementById('m-sharpe').textContent = d.sharpe_ratio ? d.sharpe_ratio.toFixed(2) : '-';
+    document.getElementById('m-sortino').textContent = d.sortino_ratio ? d.sortino_ratio.toFixed(2) : '-';
+    document.getElementById('m-calmar').textContent = d.calmar_ratio ? d.calmar_ratio.toFixed(2) : '-';
+    document.getElementById('m-annual').innerHTML = d.annual_return ? fmtPct(d.annual_return) : '-';
+    document.getElementById('m-alpha').innerHTML = d.alpha || d.alpha === 0 ? fmtPct(d.alpha) : '-';
+    document.getElementById('m-bench').innerHTML = d.benchmark_return || d.benchmark_return === 0 ? fmtPct(d.benchmark_return) : '-';
+}
+
+async function loadNavChart() {
+    const r = await fetch('/api/paper/nav-history?days=90');
+    const d = await r.json();
+    const nav = d.nav || [];
+    const metrics = d.metrics || {};
+    if (nav.length === 0) {
+        document.getElementById('navEmpty').style.display = 'block';
+        document.getElementById('navChart').style.display = 'none';
+        document.getElementById('navRange').textContent = '';
+        return;
+    }
+    document.getElementById('navEmpty').style.display = 'none';
+    document.getElementById('navChart').style.display = 'block';
+    document.getElementById('navRange').textContent = `${nav[0].date} ~ ${nav[nav.length-1].date} (${nav.length}天)`;
+
+    const labels = nav.map(n => n.date.slice(5));
+    const portfolio = nav.map(n => n.cum_return);
+    const benchmark = nav.map(n => n.benchmark_cum);
+
+    if (navChart) navChart.destroy();
+    const ctx = document.getElementById('navChart').getContext('2d');
+    navChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '模拟盘累计收益%',
+                    data: portfolio,
+                    borderColor: '#ff6b6b',
+                    backgroundColor: 'rgba(255,107,107,0.08)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                },
+                {
+                    label: '沪深300%',
+                    data: benchmark,
+                    borderColor: '#4ecdc4',
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    borderDash: [5, 3],
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { labels: { color: '#adb5bd' } },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => ctx.dataset.label + ': ' + (ctx.parsed.y >= 0 ? '+' : '') + ctx.parsed.y.toFixed(2) + '%',
+                    }
+                }
+            },
+            scales: {
+                x: { ticks: { color: '#666', maxRotation: 0, autoSkip: true, maxTicksLimit: 12 } },
+                y: {
+                    ticks: { color: '#666', callback: (v) => v.toFixed(1) + '%' },
+                    grid: { color: 'rgba(255,255,255,0.05)' },
+                }
+            }
+        }
+    });
+}
+
+async function loadHoldings() {
+    const r = await fetch('/api/paper/holdings');
+    const d = await r.json();
+    const tbody = document.querySelector('#holdingsTable tbody');
+    if (!d.holdings || d.holdings.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">空仓</td></tr>';
+        return;
+    }
+    tbody.innerHTML = d.holdings.map(h => `
+        <tr>
+            <td><a href="/stock-analysis?symbol=${h.symbol}" class="text-decoration-none">${h.symbol}</a></td>
+            <td>${h.name||''}</td>
+            <td>${fmt(h.entry_price)}</td>
+            <td>${h.shares}</td>
+            <td>${fmt(h.cost,0)}</td>
+            <td>${h.stop_loss?fmt(h.stop_loss):'-'}</td>
+            <td><span class="badge bg-${h.grade=='A'?'danger':h.grade=='B'?'warning':'secondary'}">${h.grade||'-'}</span></td>
+        </tr>
+    `).join('');
+}
+
+async function loadTrades() {
+    const r = await fetch('/api/paper/trades?limit=30');
+    const d = await r.json();
+    const tbody = document.querySelector('#tradesTable tbody');
+    if (!d.trades || d.trades.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">无交易记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = d.trades.map(t => {
+        const sideCls = t.side==='buy'?'danger':'success';
+        const sideIcon = t.side==='buy'?'arrow-down-circle':'arrow-up-circle';
+        return `
+        <tr>
+            <td class="small">${t.date}</td>
+            <td>${t.symbol}</td>
+            <td><i class="bi bi-${sideIcon} text-${sideCls}"></i> ${t.side==='buy'?'买':'卖'}</td>
+            <td>${fmt(t.price)}</td>
+            <td>${t.shares}</td>
+            <td>${t.side==='sell'?fmtPct(t.pnl_pct):'-'}</td>
+            <td class="small text-muted">${(t.reason||'').slice(0,30)}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function autoRun() {
+    const btn = document.getElementById('btnAutoRun');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 执行中...';
+    try {
+        const r = await fetch('/api/paper/auto-run', {method:'POST'});
+        const d = await r.json();
+        const buy = d.buy||{};
+        const sell = d.sell||{};
+        const bought = (buy.bought||[]).length;
+        const sold = (sell.sold||[]).length;
+        const ms = d.decision?.market_state||{};
+        const perf = d.performance||{};
+        let msg = `执行完成！\n卖出${sold}笔 买入${bought}只\n市场:${ms.state||'-'}(评分${ms.score||'-'})`;
+        if (perf.total_return_pct !== undefined) msg += `\n总资产 ¥${perf.total_assets?.toFixed(0)||'-'} 收益${perf.total_return_pct?.toFixed(2)||0}%`;
+        msg += `\n${buy.reason||''}`;
+        if (perf.risk_circuit && perf.risk_circuit !== '正常') msg += `\n⚠️ 风控：${perf.risk_circuit}`;
+        showToast(msg, 'success');
+        loadAccount(); loadHoldings(); loadTrades(); loadNavChart();
+    } catch(e) {
+        showToast('执行失败：'+e.message, 'error');
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-play-circle"></i> 一键执行闭环';
+}
+
+async function resetAccount() {
+    if (!confirm('确定重置模拟盘？清空所有持仓和交易记录，恢复10万本金。')) return;
+    await fetch('/api/paper/reset', {method:'POST'});
+    showToast('已重置', 'success');
+    loadAccount(); loadHoldings(); loadTrades(); loadNavChart();
+}
+
+loadAccount(); loadHoldings(); loadTrades(); loadNavChart();
+</script>
+{% endblock %}

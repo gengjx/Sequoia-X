@@ -21,16 +21,73 @@ def _to_eastmoney_secid(symbol: str) -> str:
     return f"1.{symbol}" if symbol.startswith(("6", "9", "5")) else f"0.{symbol}"
 
 
+def _fetch_minute_sina(symbol: str, klt: int = 1, datalen: int = 300) -> list[dict]:
+    """从新浪拉取分钟K线（备用源）。
+
+    新浪返回不复权数据，格式：[{day, open, high, low, close, volume}, ...]
+    """
+    import requests
+
+    sina_symbol = ("sh" if symbol.startswith(("6", "9", "5")) else "sz") + symbol
+    # 新浪 scale 参数：5→5分钟, 15→15分钟, 60→60分钟
+    scale_map = {1: 1, 5: 5, 15: 15, 60: 60}
+    scale = scale_map.get(klt, 5)
+
+    try:
+        r = requests.get(
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+            params={"symbol": sina_symbol, "scale": scale, "datalen": datalen},
+            timeout=8,
+        )
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"新浪分钟K拉取失败 {symbol}: {e!r}")
+        return []
+
+    if not data:
+        return []
+
+    rows = []
+    for item in data:
+        try:
+            rows.append({
+                "symbol": symbol,
+                "datetime": item.get("day", ""),
+                "open": float(item.get("open", 0)),
+                "high": float(item.get("high", 0)),
+                "low": float(item.get("low", 0)),
+                "close": float(item.get("close", 0)),
+                "volume": float(item.get("volume", 0)),
+                "amount": 0,  # 新浪不返回成交额
+            })
+        except (ValueError, TypeError):
+            continue
+    return rows
+
+
 def fetch_minute_klines(symbol: str, klt: int = 1, days: int = 1) -> list[dict]:
-    """从东财拉取单只股票的分钟K线。
+    """拉取单只股票的分钟K线（双源冗余：东财优先 → 新浪备用）。
 
     Args:
         symbol: 纯数字代码
         klt: K线周期 1=1分钟 5=5分钟 15=15分钟 60=小时
-        days: 拉取天数（beg=end往前推days天）
+        days: 拉取天数（东财用日期范围，新浪用datalen条数）
     Returns:
         [{symbol, datetime, open, high, low, close, volume, amount}, ...]
     """
+    # 先试东财
+    rows = _fetch_minute_eastmoney(symbol, klt, days)
+    if rows:
+        return rows
+
+    # 东财失败 → 新浪备用
+    logger.info(f"东财分钟K失败 {symbol}，切换新浪备用源")
+    datalen = {1: 240, 5: 48, 15: 16, 60: 4}.get(klt, 48) * days
+    return _fetch_minute_sina(symbol, klt, datalen)
+
+
+def _fetch_minute_eastmoney(symbol: str, klt: int = 1, days: int = 1) -> list[dict]:
+    """从东财 push2his 拉取单只股票的分钟K线（主源）。"""
     import requests
 
     secid = _to_eastmoney_secid(symbol)
@@ -112,8 +169,17 @@ def build_watchlist(db_path: str) -> list[dict]:
             if row[0]:
                 watchlist[row[0]] = watchlist.get(row[0], "持仓")
 
-        # 3. 决策A/B级（用最新的决策快照，若有缓存表）
-        # 注：决策结果目前不入库，暂只取竞价+持仓
+        # 3. 今日决策池（盘后选出的票，盘中实时监控突破/异动）
+        try:
+            for row in conn.execute(
+                "SELECT symbol, source FROM decision_pool WHERE date=? "
+                "ORDER BY score DESC", (today,)
+            ).fetchall():
+                src = row[1] or "决策"
+                watchlist[row[0]] = watchlist.get(row[0], src)
+        except sqlite3.OperationalError:
+            pass  # 表不存在时跳过
+
     result = [{"symbol": s, "source": src} for s, src in watchlist.items()]
     logger.info(f"关注池构建：{len(result)}只（竞价A+持仓）")
     return result

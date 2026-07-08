@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date
+import pandas as pd
 from typing import Any
 
 import pandas as pd
@@ -161,23 +162,48 @@ class PositionTracker:
     # ------------------------------------------------------------------
     # 行情获取（复用 K线 + 均线）
     # ------------------------------------------------------------------
-    def _get_quote_and_ma(self, symbol: str) -> dict:
-        """获取最新价 + MA10/MA20 + ATR（用本地K线，离线可用）。"""
+    def _get_quote_and_ma(self, symbol: str, realtime_price: float | None = None) -> dict:
+        """获取最新价 + MA10/MA20 + ATR（用本地K线，离线可用）。
+
+        Args:
+            realtime_price: 盘中实时真实价。传入时估算实时MA：
+                MA10 ≈ (前9日后复权close和 + 实时价/复权系数) / 10
+                让盘中价格波动即时反映到MA防守线上。
+        """
         df = self.engine.get_ohlcv(symbol)
         if df is None or len(df) < 5:
             return {}
         df = df.sort_values("date")
         close = df["close"].astype(float)
         price = round(float(close.iloc[-1]), 3)
-        ma10 = round(float(close.rolling(10).mean().iloc[-1]), 3) if len(close) >= 10 else 0
-        ma20 = round(float(close.rolling(20).mean().iloc[-1]), 3) if len(close) >= 20 else 0
+        # 实时MA估算：把今日实时价替换最后一根K线的收盘
+        ma_source = close.copy()
+        if realtime_price and realtime_price > 0 and len(close) >= 2:
+            # 用复权系数把实时真实价转为后复权口径
+            ratio = price / realtime_price if price > 0 else 1.0
+            if 0.01 < ratio < 100.0:
+                ma_source.iloc[-1] = realtime_price * ratio
+        ma10 = round(float(ma_source.rolling(10).mean().iloc[-1]), 3) if len(ma_source) >= 10 else 0
+        ma20 = round(float(ma_source.rolling(20).mean().iloc[-1]), 3) if len(ma_source) >= 20 else 0
         # ATR（14）
         atr = 0.0
         if len(df) >= 15:
             hl = df["high"].astype(float) - df["low"].astype(float)
             atr = round(float(hl.rolling(14).mean().iloc[-1]), 3)
         last_date = str(df["date"].iloc[-1])
-        return {"price": price, "ma10": ma10, "ma20": ma20, "atr": atr, "kline_date": last_date}
+        # 换手率（供量能验证规则）
+        turn = 0.0
+        turn_ma20 = 0.0
+        if "turn" in df.columns:
+            t = df["turn"].astype(float)
+            turn = round(float(t.iloc[-1]), 3) if pd.notna(t.iloc[-1]) else 0.0
+            turn_ma20 = round(float(t.rolling(20).mean().iloc[-1]), 3) if len(t) >= 20 and pd.notna(t.rolling(20).mean().iloc[-1]) else 0.0
+        # pct_chg（供相对强度规则）
+        pct_chg = 0.0
+        if "pct_chg" in df.columns:
+            pct_chg = float(df["pct_chg"].astype(float).iloc[-1]) if pd.notna(df["pct_chg"].astype(float).iloc[-1]) else 0.0
+        return {"price": price, "ma10": ma10, "ma20": ma20, "atr": atr, "kline_date": last_date,
+                "turn": turn, "turn_ma20": turn_ma20, "pct_chg": pct_chg}
 
     @staticmethod
     def _fetch_quote(symbol: str) -> tuple[float | None, float | None]:
@@ -193,8 +219,12 @@ class PositionTracker:
     # ------------------------------------------------------------------
     # 核心：单只持仓信号扫描
     # ------------------------------------------------------------------
-    def scan_one(self, h: dict) -> HoldingSignal:
-        """对单只持仓执行移动止损规则，返回信号。"""
+    def scan_one(self, h: dict, realtime_price: float | None = None) -> HoldingSignal:
+        """对单只持仓执行移动止损规则，返回信号。
+
+        Args:
+            realtime_price: 盘中实时真实价（来自东财快照），None则用日K收盘价。
+        """
         sig = HoldingSignal(
             id=h["id"], symbol=h["symbol"], name=h.get("name", ""),
             entry_price=h["entry_price"], shares=h["shares"],
@@ -203,7 +233,7 @@ class PositionTracker:
             target=h.get("target", 0), grade=h.get("grade", ""),
             cost=h.get("cost", 0),
         )
-        q = self._get_quote_and_ma(h["symbol"])
+        q = self._get_quote_and_ma(h["symbol"], realtime_price=realtime_price)
         if not q:
             sig.reasons.append("无行情数据")
             sig.action = "数据缺失"
@@ -299,20 +329,164 @@ class PositionTracker:
             sig.action = "移动止损" if sig.action == "持有" else sig.action
             sig.signal_level = "success" if sig.signal_level == "info" else sig.signal_level
 
+        # ════════ 第二层出场规则（立体风控，数据驱动）════════
+        symbol = h["symbol"]
+        # 仅在硬止损/止盈未触发时执行（不覆盖"持有"和"移动止损"的乐观判断）
+
+        # ── 规则6：逻辑证伪（入场策略不再命中）──
+        hit_strats = (h.get("hit_strategies") or "").strip()
+        if hit_strats:
+            still_active = self._check_thesis(symbol, hit_strats)
+            if not still_active:
+                if sig.action == "持有":
+                    sig.action = "逻辑减弱"
+                    sig.signal_level = "warn"
+                sig.reasons.append(f"入场策略[{hit_strats}]今日不再命中，买入逻辑减弱")
+
+        # ── 规则7：相对强度（近5日跑输大盘3%+）──
+        rs = self._check_relative_strength(symbol)
+        if rs is not None and rs <= -3.0:
+            if sig.action == "持有":
+                sig.action = "相对走弱"
+                sig.signal_level = "warn"
+            sig.reasons.append(f"近5日跑输大盘{abs(rs):.1f}%，相对强度下降")
+
+        # ── 规则8：量能异动（高位放量滞涨/疑似出货）──
+        if q.get("turn", 0) > 0 and q.get("turn_ma20", 0) > 0:
+            turn_ratio = q["turn"] / q["turn_ma20"] if q["turn_ma20"] else 0
+            if turn_ratio >= 2.0 and r_mult >= 0.5 and q.get("pct_chg", 0) < 1.0:
+                if sig.action == "持有":
+                    sig.action = "放量滞涨"
+                    sig.signal_level = "warn"
+                sig.reasons.append(
+                    f"换手{q['turn']:.1f}%是20日均{q['turn_ma20']:.1f}%的{turn_ratio:.1f}倍，"
+                    f"但价格仅涨{q.get('pct_chg',0):.1f}%，疑似高位出货"
+                )
+
+        # ── 规则9：时间止损（持仓低效）──
+        try:
+            from datetime import datetime as _dt
+            entry_dt = _dt.strptime(h["entry_date"], "%Y-%m-%d")
+            hold_days = (_dt.now() - entry_dt).days
+            if hold_days >= 20 and r_mult < 0.5 and sig.action == "持有":
+                sig.action = "持仓低效"
+                sig.signal_level = "warn"
+                sig.reasons.append(
+                    f"持仓{hold_days}天R倍数仅{r_mult}，走势迟缓占用资金，考虑换股"
+                )
+        except (ValueError, TypeError):
+            pass
+
         if not sig.reasons:
             sig.reasons.append("趋势正常，继续持有")
         return sig
 
-    def scan_all(self, apply_stop_move: bool = False) -> list[HoldingSignal]:
+    def _check_thesis(self, symbol: str, hit_strategies: str) -> bool:
+        """逻辑证伪检查：入场时命中的策略是否还选中该股。
+
+        重跑轻量策略（不依赖财报/全市场排名的纯量价策略），如果全部不再命中，
+        说明买入的技术逻辑已失效。
+
+        Args:
+            symbol: 股票代码
+            hit_strategies: 入场时命中的策略key，逗号分隔
+
+        Returns:
+            True=至少一个策略仍命中（逻辑仍在），False=全部失效（逻辑证伪）
+        """
+        try:
+            from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
+            from sequoia_x.strategy.ma_volume import MaVolumeStrategy
+            from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
+            from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
+
+            # 量价策略的快速重跑（只看该股，不做全市场排名）
+            df = self.engine.get_ohlcv(symbol)
+            if df is None or len(df) < 25:
+                return True  # 数据不足无法判断，保守认为逻辑仍在
+
+            df = df.sort_values("date").reset_index(drop=True)
+            close = df["close"].astype(float)
+            high = df["high"].astype(float)
+            volume = df["volume"].astype(float)
+            turnover = df["turnover"].astype(float) if "turnover" in df.columns else volume * close
+
+            strats = [s.strip() for s in hit_strategies.split(",") if s.strip()]
+
+            # 逐策略检查核心条件
+            for s in strats:
+                if s == "turtle":
+                    # 海龟：20日新高 + 成交过亿
+                    if len(close) >= 21 and high.iloc[-1] >= high.iloc[-21:-1].max() and turnover.iloc[-1] > 1e8:
+                        return True
+                elif s == "ma_volume":
+                    # 均线放量：MA5>MA20 + 量比>1.5
+                    if len(close) >= 21:
+                        ma5 = close.rolling(5).mean().iloc[-1]
+                        ma20 = close.rolling(20).mean().iloc[-1]
+                        vol_ma5 = volume.rolling(5).mean().iloc[-1]
+                        if ma5 > ma20 and volume.iloc[-1] > vol_ma5 * 1.5:
+                            return True
+                elif s == "pullback":
+                    # 缩量回踩：MA20上行 + 近3日缩量
+                    if len(close) >= 21:
+                        ma20 = close.rolling(20).mean()
+                        if ma20.iloc[-1] > ma20.iloc[-5] and turnover.iloc[-1] < turnover.iloc[-20:].mean():
+                            return True
+                elif s == "rps":
+                    # RPS需要全市场排名，单股无法判断，保守认为仍在
+                    return True
+                # 其他策略(multi_factor/dragon等)需全市场数据，保守不证伪
+                elif s in ("multi_factor", "dragon", "flag", "shakeout", "limit_down", "bottom"):
+                    return True
+            return False  # 所有可验证的策略都不再命中
+        except Exception:
+            return True  # 出错保守处理
+
+    def _check_relative_strength(self, symbol: str) -> float | None:
+        """相对强度：个股近5日涨幅 vs 大盘近5日涨幅的差值。
+
+        正值=跑赢大盘，负值=跑输大盘。
+        返回None表示数据不足。
+        """
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                # 个股近5日涨幅
+                rows = conn.execute(
+                    "SELECT date, close FROM stock_daily WHERE symbol=? ORDER BY date DESC LIMIT 6",
+                    (symbol,)
+                ).fetchall()
+                if len(rows) < 6:
+                    return None
+                stock_ret = (rows[0][1] / rows[5][1] - 1) * 100 if rows[5][1] else None
+                if stock_ret is None:
+                    return None
+                # 大盘近5日涨幅（用全市场等权平均近似）
+                rows2 = conn.execute(
+                    "SELECT AVG(pct_chg) FROM ("
+                    "  SELECT symbol, pct_chg FROM stock_daily WHERE date IN ("
+                    "    SELECT DISTINCT date FROM stock_daily ORDER BY date DESC LIMIT 6"
+                    "  ) AND pct_chg IS NOT NULL)"
+                ).fetchone()
+                market_ret = rows2[0] * 5 if rows2 and rows2[0] else 0  # 日均×5天近似
+                return round(stock_ret - market_ret, 1)
+        except Exception:
+            return None
+
+    def scan_all(self, apply_stop_move: bool = False,
+                 realtime_map: dict[str, float] | None = None) -> list[HoldingSignal]:
         """扫描所有 open 持仓。
 
         Args:
             apply_stop_move: True 则将移动止损后的 new_stop 写回数据库
+            realtime_map: {symbol: 实时真实价}，传入后用实时价估算MA（盘中盯盘模式）
         """
         holdings = self.list_holdings("open")
         signals = []
         for h in holdings:
-            sig = self.scan_one(h)
+            rt = realtime_map.get(h["symbol"]) if realtime_map else None
+            sig = self.scan_one(h, realtime_price=rt)
             if apply_stop_move and sig.new_stop > h.get("stop_loss", 0):
                 self.update_holding(h["id"], stop_loss=sig.new_stop)
             signals.append(sig)
@@ -320,6 +494,104 @@ class PositionTracker:
         order = {"danger": 0, "warn": 1, "success": 2, "info": 3}
         signals.sort(key=lambda s: (order.get(s.signal_level, 9), -s.pnl))
         return signals
+
+    def scan_intraday(self, notifier=None) -> list[HoldingSignal]:
+        """盘中实时盯盘：批量快照 + 实时MA估算 + 信号推送。
+
+        与 scan_all 的区别：
+          - 用东财批量快照拿实时价（毫秒级，不用逐只请求）
+          - 实时MA估算让MA防守线随盘中价格波动
+          - 仅推送新信号（同票同信号30分钟内不重复推送）
+
+        Args:
+            notifier: FeishuNotifier，传入则推送新信号
+
+        Returns:
+            所有持仓的信号列表
+        """
+        import time as _time
+        holdings = self.list_holdings("open")
+        if not holdings:
+            return []
+
+        symbols = [h["symbol"] for h in holdings]
+        spot_map = self._fetch_spot_batch(symbols)
+
+        # 构建 realtime_map
+        realtime_map: dict[str, float] = {}
+        for sym in symbols:
+            spot = spot_map.get(sym, {})
+            price = spot.get("price", 0)
+            if price > 0:
+                realtime_map[sym] = price
+
+        signals = self.scan_all(realtime_map=realtime_map)
+
+        # 推送新信号（节流：同票同action 30分钟内不重复）
+        if notifier:
+            throttle_key = f"position_throttle_{_time.strftime('%Y%m%d')}"
+            if not hasattr(self, throttle_key):
+                setattr(self, throttle_key:={})
+            throttle: dict[tuple[str, str], float] = getattr(self, throttle_key)
+            now_ts = _time.time()
+            for sig in signals:
+                if sig.signal_level not in ("danger", "warn", "success"):
+                    continue
+                if sig.action in ("持有", "数据缺失", "逻辑减弱", "相对走弱", "持仓低效"):
+                    continue  # 低优先级信号盘中不推送
+                key = (sig.symbol, sig.action)
+                if now_ts - throttle.get(key, 0) < 1800:  # 30分钟节流
+                    continue
+                self._push_position_signal(notifier, sig)
+                throttle[key] = now_ts
+
+        return signals
+
+    def _fetch_spot_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """批量拉实时快照（复用东财clist接口）。"""
+        import requests
+
+        if not symbols:
+            return {}
+        sym_set = set(symbols)
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+        result: dict[str, dict] = {}
+        try:
+            r = requests.get(
+                "https://push2delay.eastmoney.com/api/qt/clist/get",
+                params={"pn": 1, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                        "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
+                        "fields": "f12,f14,f2,f3,f60"},
+                headers=headers, timeout=8,
+            )
+            for item in r.json().get("data", {}).get("diff", []) or []:
+                sym = item.get("f12", "")
+                if sym in sym_set:
+                    try:
+                        price = float(item.get("f2", 0))
+                    except (TypeError, ValueError):
+                        price = 0
+                    result[sym] = {"price": price, "name": item.get("f14", "")}
+        except Exception as e:
+            logger.warning(f"持仓快照拉取失败：{e!r}")
+        return result
+
+    def _push_position_signal(self, notifier, sig: HoldingSignal) -> None:
+        """持仓信号飞书推送。"""
+        emoji = {"danger": "🔴", "warn": "🟡", "success": "🟢", "info": "⚪"}.get(sig.signal_level, "⚪")
+        title = f"Sequoia-X | {emoji} 持仓信号 {sig.name}({sig.symbol}) {sig.action}"
+        reasons_text = "\n".join(f"▶ {r}" for r in sig.reasons)
+        content = (
+            f"{emoji} **{sig.name}** `{sig.symbol}`\n"
+            f"▶ 现价 {sig.price:.2f}（浮盈{sig.pnl_pct:+.1f}%，{sig.r_multiple:+.1f}R）\n"
+            f"▶ 操作建议：**{sig.action}**\n"
+            f"{reasons_text}\n"
+            f"▶ 止损线 {sig.stop_loss:.2f} → 新止损 {sig.new_stop or sig.stop_loss:.2f}"
+        )
+        try:
+            notifier.send_text(title=title, content=content, webhook_key="position")
+        except Exception as e:
+            logger.warning(f"持仓信号推送失败 {sig.symbol}: {e!r}")
 
     # ------------------------------------------------------------------
     # 持仓组合摘要
