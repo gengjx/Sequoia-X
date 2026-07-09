@@ -35,6 +35,7 @@ class AuctionScheduler:
         (21, 10, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
         (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
+        (22, 0, "daily_report"),  # 每日任务执行汇总 → 飞书推送
     ]
 
     def __init__(self, settings: Settings, db_path: str) -> None:
@@ -211,6 +212,8 @@ class AuctionScheduler:
             self._sync_fund_flow()
         elif task == "refresh_factor_ic":
             self._refresh_factor_ic()
+        elif task == "daily_report":
+            self._daily_report()
 
     def _run_task_with_result(self, task: str) -> str:
         """执行任务并返回结果摘要（供日志记录）。"""
@@ -252,6 +255,80 @@ class AuctionScheduler:
             logger.info(f"龙虎榜席位同步完成：{n2} 行")
         except Exception as e:
             logger.warning(f"龙虎榜同步失败：{e!r}")
+
+    def _daily_report(self) -> str:
+        """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
+        from sequoia_x.notify.feishu import FeishuNotifier
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT task_name, status, elapsed_sec, started_at, finished_at, error_msg "
+                    "FROM task_log WHERE run_date=? ORDER BY id", (today,)
+                ).fetchall()
+
+            # 任务中文名映射
+            name_map = {
+                "auction_scan": "竞价扫描",
+                "intraday_scan_start": "盘中信号轮询",
+                "sync_daily": "日K同步",
+                "sync_lhb": "龙虎榜同步",
+                "sync_fund_flow": "资金流向同步",
+                "refresh_factor_ic": "因子IC刷新",
+                "auction_verify": "竞价T+1验证",
+                "paper_trade": "模拟盘闭环",
+            }
+
+            success = sum(1 for r in rows if r[1] == "success")
+            failed = sum(1 for r in rows if r[1] == "failed")
+            total = len(rows)
+
+            lines = [f"**📊 每日任务执行汇总（{today}）**\n"]
+            lines.append(f"总计 {total} 个任务：✅成功 {success}  ❌失败 {failed}\n")
+
+            for r in rows:
+                name = name_map.get(r[0], r[0])
+                status_icon = "✅" if r[1] == "success" else "❌"
+                elapsed = f"{r[2]:.0f}s" if r[2] else "-"
+                time_range = ""
+                if r[3] and r[4]:
+                    time_range = f" {r[3]}~{r[4]}"
+                line = f"{status_icon} {name} ({elapsed}){time_range}"
+                if r[5]:
+                    line += f"\n   ⚠️ {r[5][:80]}"
+                lines.append(line)
+
+            # 补充系统状态
+            lines.append("")
+            latest_k = ""
+            fin_cov = 0
+            total_stocks = 0
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    latest_k = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()[0] or "-"
+                    fin_cov = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_finance").fetchone()[0]
+                    total_stocks = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0]
+            except Exception:
+                pass
+            lines.append(f"---\n日K最新: {latest_k}")
+            lines.append(f"财报覆盖: {fin_cov}/{total_stocks} ({fin_cov/total_stocks*100:.0f}%)")
+
+            # 限流器状态
+            try:
+                from sequoia_x.core.rate_limiter import _rate_limiter
+                rl = _rate_limiter.baostock_status()
+                lines.append(f"baostock额度: {rl['used']}/{rl['limit']} ({rl['usage_pct']:.0f}%)")
+            except Exception:
+                pass
+
+            content = "\n".join(lines)
+            notifier = FeishuNotifier(self.settings)
+            notifier.send_text("每日任务汇总", content)
+            logger.info(f"每日汇总已推送飞书：{success}成功/{failed}失败/{total}总计")
+            return f"{success}成功/{failed}失败"
+        except Exception as e:
+            logger.warning(f"每日汇总失败：{e!r}")
+            return f"失败: {e}"
 
     def _refresh_factor_ic(self) -> None:
         """因子IC权重自动刷新（滚动6个月窗口 + 三态权重）。
