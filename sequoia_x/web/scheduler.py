@@ -47,6 +47,7 @@ class AuctionScheduler:
         self._init_task_log_table()
         self._load_last_run()
         self._cleanup_zombies()
+        self._last_wal_checkpoint = 0.0
 
     def _init_task_log_table(self) -> None:
         """创建任务执行记录表。"""
@@ -98,6 +99,24 @@ class AuctionScheduler:
                 conn.commit()
         except Exception:
             pass
+
+    def _wal_checkpoint(self) -> None:
+        """强制 WAL checkpoint：将WAL日志写入主DB文件并截断WAL。
+
+        解决两个问题：
+        1. WAL文件持续膨胀（不checkpoint会越来越大）
+        2. SQLite WAL读缓存不一致（写入后读取可能拿到旧值）
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                # result = (busy, log_frames, checkpointed_frames)
+            self._last_wal_checkpoint = time.time()
+            if result and result[1] > 0:
+                logger.info(f"WAL checkpoint: {result[1]}帧已刷新")
+        except Exception as e:
+            logger.debug(f"WAL checkpoint: {e!r}")
 
     def _cleanup_zombies(self) -> None:
         """启动时清理残留的 multiprocessing 子进程。"""
@@ -162,6 +181,10 @@ class AuctionScheduler:
                             self._log_task(task, "failed", started_at,
                                           now.strftime("%H:%M:%S"), elapsed, error=str(e))
                             logger.warning(f"定时任务 {task} 失败 ({elapsed:.0f}s)：{e!r}")
+
+            # 定时 WAL checkpoint（每30分钟，防止WAL膨胀+缓存不一致）
+            if time.time() - self._last_wal_checkpoint > 1800:
+                self._wal_checkpoint()
 
             # 每分钟检查一次
             self._stop.wait(60)

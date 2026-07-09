@@ -762,3 +762,97 @@ async def system_health(request: Request):
     }
 
     return health
+
+
+# ── 异步任务管理 ──
+
+@router.get("/task")
+async def list_tasks(request: Request, limit: int = 20):
+    """列出最近的后台任务。"""
+    services = request.app.state.services
+    return {"tasks": services.list_tasks(limit=limit)}
+
+
+@router.get("/task/{task_id}/status")
+async def task_status(request: Request, task_id: str):
+    """查询单个任务进度。"""
+    services = request.app.state.services
+    record = services.get_task_status(task_id)
+    if not record:
+        return {"error": "task not found", "task_id": task_id}
+    return {
+        "task_id": record.task_id,
+        "name": record.strategy_key,
+        "status": record.status.value,
+        "progress": record.progress,
+        "progress_msg": record.progress_msg,
+        "elapsed": record.elapsed_sec,
+        "started_at": record.started_at.isoformat() if record.started_at else None,
+        "error": record.error,
+    }
+
+
+@router.get("/task/{task_id}/result")
+async def task_result(request: Request, task_id: str):
+    """获取任务结果数据（完成后可用）。"""
+    services = request.app.state.services
+    result = services.get_task_result(task_id)
+    if not result:
+        return {"error": "task not found", "task_id": task_id}
+    return result
+
+
+# ── 重操作异步变体 ──
+
+@router.post("/decision/async")
+async def decision_async(request: Request):
+    """异步决策：立即返回 task_id，前端轮询 /task/{id}/status。"""
+    import asyncio
+    services = request.app.state.services
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+
+    task_id = services.submit_task(
+        "decision",
+        services.generate_decision,
+        body.get("strategy_keys"),
+        body.get("capital", 100000),
+        body.get("min_score", 50),
+        body.get("exclude_markets"),
+        body.get("exclude_st", True),
+        body.get("max_candidates", 60),
+        body.get("include_auction", False),
+    )
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
+@router.post("/backtest/optimal-async")
+async def optimal_async(request: Request):
+    """异步搜索最优组合。"""
+    services = request.app.state.services
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+
+    task_id = services.submit_task(
+        "find_optimal_combos",
+        services.find_optimal_combos,
+        body.get("hold_days", 20),
+        body.get("sample_size", 500),
+        body.get("max_strategies", 5),
+        body.get("top_n", 10),
+    )
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
+@router.post("/factor/evaluate-async")
+async def factor_eval_async(request: Request):
+    """异步因子IC评估。"""
+    services = request.app.state.services
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+
+    task_id = services.submit_task(
+        "evaluate_factors",
+        services.evaluate_factors,
+        body.get("hold_days", 20),
+        body.get("sample_size", 500),
+        body.get("rolling_months"),
+    )
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
