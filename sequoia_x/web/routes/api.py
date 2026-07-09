@@ -688,3 +688,77 @@ async def rate_limit_status(request: Request):
     """数据源限流状态。"""
     from sequoia_x.core.rate_limiter import _rate_limiter
     return _rate_limiter.status()
+
+
+@router.get("/system/health")
+async def system_health(request: Request):
+    """系统健康检查：DB/调度器/限流器/数据新鲜度/最近任务。"""
+    import sqlite3, os
+    from datetime import datetime
+    from sequoia_x.core.rate_limiter import _rate_limiter, RateLimiter
+
+    from sequoia_x.web.scheduler import AuctionScheduler as _SCHED
+    health: dict = {"timestamp": datetime.now().isoformat()}
+    settings = request.app.state.services.settings
+    db_path = settings.db_path
+
+    # 1. 数据库
+    try:
+        conn = sqlite3.connect(db_path)
+        db_size = os.path.getsize(db_path) / 1024 / 1024
+        latest_k = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()[0]
+        stock_cnt = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0]
+        health["database"] = {"status": "ok", "size_mb": round(db_size, 1),
+                              "latest_kline": latest_k, "stocks": stock_cnt}
+        # 2. 数据新鲜度（日K是否当天）
+        today = datetime.now().strftime("%Y-%m-%d")
+        health["data_freshness"] = {
+            "kline_date": latest_k,
+            "is_today": latest_k == today,
+            "lag_days": None if latest_k == today else "stale",
+        }
+        # 3. 最近任务执行记录
+        tasks = conn.execute(
+            "SELECT task_name, run_date, status, elapsed_sec, started_at, finished_at "
+            "FROM task_log ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        health["recent_tasks"] = [
+            {"task": t[0], "date": t[1], "status": t[2], "elapsed": t[3],
+             "started": t[4], "finished": t[5]}
+            for t in tasks
+        ]
+        # 4. 今日任务执行统计
+        today_tasks = conn.execute(
+            "SELECT status, COUNT(*) FROM task_log WHERE run_date=? GROUP BY status", (today,)
+        ).fetchall()
+        health["today_tasks"] = {s: c for s, c in today_tasks}
+        conn.close()
+    except Exception as e:
+        health["database"] = {"status": "error", "error": str(e)}
+
+    # 5. 限流器状态
+    health["rate_limiter"] = _rate_limiter.status()
+
+    # 6. 数据源可用性
+    health["data_sources"] = {
+        "baostock_remaining": _rate_limiter.baostock_status()["remaining"],
+        "eastmoney_push2his": RateLimiter.probe_eastmoney("push2his"),
+        "eastmoney_push2delay": RateLimiter.probe_eastmoney("push2delay"),
+    }
+
+    # 7. 日志文件
+    log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(db_path))), "data", "logs")
+    log_files = []
+    if os.path.exists(log_path):
+        log_files = sorted(os.listdir(log_path))[-5:]  # 最近5个日志文件
+    health["logs"] = {"dir": log_path, "recent_files": log_files}
+
+    # 8. 调度器状态
+    sched = getattr(request.app.state, "scheduler", None)
+    health["scheduler"] = {
+        "running": sched._thread.is_alive() if sched and sched._thread else False,
+        "schedule": [{"time": f"{h:02d}:{m:02d}", "task": t} for h, m, t in _SCHED.SCHEDULE]
+        if sched else None,
+    }
+
+    return health

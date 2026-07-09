@@ -10,6 +10,7 @@ A股交易时段调度（Asia/Shanghai）：
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -43,6 +44,85 @@ class AuctionScheduler:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_run: dict[str, str] = {}  # {task_name: "YYYY-MM-DD"}
+        self._init_task_log_table()
+        self._load_last_run()
+        self._cleanup_zombies()
+
+    def _init_task_log_table(self) -> None:
+        """创建任务执行记录表。"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS task_log ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "task_name TEXT NOT NULL, "
+                    "run_date TEXT NOT NULL, "
+                    "status TEXT NOT NULL, "  # running/success/failed
+                    "started_at TEXT, "
+                    "finished_at TEXT, "
+                    "elapsed_sec REAL, "
+                    "result_summary TEXT, "
+                    "error_msg TEXT)"
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"task_log 表初始化失败：{e!r}")
+
+    def _load_last_run(self) -> None:
+        """从 DB 恢复今日已执行的任务（重启不重复执行）。"""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT task_name FROM task_log "
+                    "WHERE run_date=? AND status='success'", (today,)
+                ).fetchall()
+            for r in rows:
+                self._last_run[f"{r[0]}_{today}"] = "recovered"
+            if rows:
+                logger.info(f"调度器恢复：今日已完成 {len(rows)} 个任务，跳过重跑")
+        except Exception as e:
+            logger.warning(f"调度器恢复失败：{e!r}")
+
+    def _log_task(self, task: str, status: str, started_at: str,
+                  finished_at: str, elapsed: float, summary: str = "", error: str = "") -> None:
+        """记录任务执行结果到 DB。"""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO task_log (task_name, run_date, status, started_at, finished_at, "
+                    "elapsed_sec, result_summary, error_msg) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (task, today, status, started_at, finished_at, elapsed, summary[:500], error[:500]),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    def _cleanup_zombies(self) -> None:
+        """启动时清理残留的 multiprocessing 子进程。"""
+        try:
+            import subprocess
+            # 找到属于本项目的 multiprocessing spawn/resource_tracker 进程
+            result = subprocess.run(
+                ["pgrep", "-f", "sequoia-x.*multiprocessing"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = [p.strip() for p in result.stdout.strip().split("\n") if p.strip()]
+            # 排除自己
+            my_pid = str(os.getpid())
+            killed = 0
+            for pid in pids:
+                if pid and pid != my_pid:
+                    try:
+                        os.kill(int(pid), 9)
+                        killed += 1
+                    except (ProcessLookupError, ValueError):
+                        pass
+            if killed:
+                logger.warning(f"僵尸进程清理：kill {killed} 个残留 multiprocessing 进程")
+        except Exception:
+            pass  # pgrep 不存在时静默跳过
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -68,11 +148,20 @@ class AuctionScheduler:
                 if now.hour == hour and abs(now.minute - minute) <= 10:
                     if self._is_trading_day(today):
                         logger.info(f"触发定时任务：{task}")
+                        t_start = time.time()
+                        started_at = now.strftime("%H:%M:%S")
                         try:
-                            self._run_task(task)
+                            summary = self._run_task_with_result(task)
+                            elapsed = time.time() - t_start
                             self._last_run[key] = now.strftime("%H:%M")
+                            self._log_task(task, "success", started_at,
+                                          now.strftime("%H:%M:%S"), elapsed, str(summary)[:200])
+                            logger.info(f"定时任务 {task} 完成 ({elapsed:.0f}s)")
                         except Exception as e:
-                            logger.warning(f"定时任务 {task} 失败：{e!r}")
+                            elapsed = time.time() - t_start
+                            self._log_task(task, "failed", started_at,
+                                          now.strftime("%H:%M:%S"), elapsed, error=str(e))
+                            logger.warning(f"定时任务 {task} 失败 ({elapsed:.0f}s)：{e!r}")
 
             # 每分钟检查一次
             self._stop.wait(60)
@@ -99,6 +188,11 @@ class AuctionScheduler:
             self._sync_fund_flow()
         elif task == "refresh_factor_ic":
             self._refresh_factor_ic()
+
+    def _run_task_with_result(self, task: str) -> str:
+        """执行任务并返回结果摘要（供日志记录）。"""
+        self._run_task(task)
+        return f"{task} executed"
 
     def _auction_scan(self) -> None:
         """竞价扫描 + 飞书推送。"""
