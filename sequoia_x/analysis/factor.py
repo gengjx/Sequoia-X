@@ -75,6 +75,9 @@ FACTOR_META: dict[str, dict] = {
     "gp_margin":   {"category": "质量", "desc": "毛利率"},
     "rev_growth":  {"category": "质量", "desc": "营收增速"},
     "profit_growth":{"category": "质量", "desc": "利润增速"},
+    # ── 估值(2) ──
+    "pe_ratio":    {"category": "估值", "desc": "市盈率TTM（低估值溢价）"},
+    "pb_ratio":    {"category": "估值", "desc": "市净率（低估值溢价）"},
     # ── 龙虎榜(2) ──
     "lhb_count":   {"category": "龙虎榜", "desc": "近30天上榜次数"},
     "lhb_netbuy":  {"category": "龙虎榜", "desc": "近30天龙虎榜净买入额"},
@@ -417,7 +420,8 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
 
     # 质量因子（point-in-time，从finance_series注入）
     if finance_series:
-        for qname in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"]:
+        for qname in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
+                       "pe_ratio", "pb_ratio"]:
             if qname in finance_series and len(finance_series[qname]) == len(df):
                 series[qname] = finance_series[qname]
 
@@ -597,7 +601,9 @@ def evaluate_factor_ic(
     # 加载质量因子的月度截面（按财报季度月份匹配）
     # stat_date 格式 YYYY-MM-DD，取 YYYY-MM 作为截面月份
     quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"}
+    valuation_factors = {"pe_ratio", "pb_ratio"}
     has_quality = bool(set(factor_set) & quality_factors)
+    has_valuation = bool(set(factor_set) & valuation_factors)
     finance_map: dict[str, dict] = {}  # {symbol: {roe, np_margin, ...}}
     if has_quality:
         import sqlite3 as _sq
@@ -619,6 +625,18 @@ def evaluate_factor_ic(
             logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：财报加载失败：{e!r}")
+
+    # 加载估值因子（PE/PB，来自东财快照）
+    valuation_map: dict[str, dict] = {}
+    if has_valuation:
+        import sqlite3 as _sq
+        try:
+            with _sq.connect(engine.db_path) as _conn:
+                for r in _conn.execute("SELECT symbol, pe, pb FROM stock_market_cap WHERE pe IS NOT NULL OR pb IS NOT NULL").fetchall():
+                    valuation_map[r[0]] = {"pe_ratio": r[1], "pb_ratio": r[2]}
+            logger.info(f"因子IC评估：加载估值 {len(valuation_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：估值加载失败：{e!r}")
 
     # 加载资金流向（main_net / main_pct）
     fund_flow_factors = {"main_net", "main_pct"}
@@ -675,6 +693,7 @@ def evaluate_factor_ic(
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
             ts_factors = [f for f in factor_set if f not in
                           ("roe","np_margin","gp_margin","rev_growth","profit_growth",
+                           "pe_ratio","pb_ratio",
                            "lhb_count","lhb_netbuy","main_net","main_pct")]
             series = compute_factor_series(df, ts_factors)
             dates = df["date"].astype(str).values
@@ -721,6 +740,16 @@ def evaluate_factor_ic(
                                 row[k] = float(fin.get("np_margin", 0)) if fin.get("np_margin") is not None else None
                             elif k == "gp_margin":
                                 row[k] = float(fin.get("gp_margin", 0)) if fin.get("gp_margin") is not None else None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in valuation_factors:
+                        val = valuation_map.get(sym)
+                        if val and val.get(k) is not None:
+                            v = float(val[k])
+                            if not np.isnan(v) and abs(v) < 10000:
+                                row[k] = v
                             else:
                                 row[k] = None
                         else:

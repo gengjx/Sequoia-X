@@ -248,9 +248,10 @@ class ComboBacktester:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"共振回测：采样 {len(symbols)} 只股票")
-        # 加载因子权重 + 财报（与 _collect_returns 同口径）
+        # 加载因子权重 + 财报 + 估值（与 _collect_returns 同口径）
         factor_weights = self._load_factor_weights()
         finance_map = self._load_finance_map()
+        valuation_map = self._load_valuation_map()
         cutoff_map = self.engine.get_ipo_cutoff_map()
 
         bands = {"1": {h: ([], []) for h in hold_days},
@@ -270,7 +271,8 @@ class ComboBacktester:
                 if co and "date" in df.columns:
                     df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
-                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []),
+                                                          valuation_map.get(symbol))
                 signals = _compute_signals(df, finance_series=fin_series, factor_weights=factor_weights)
                 if not signals:
                     continue
@@ -332,9 +334,10 @@ class ComboBacktester:
     def _collect_returns(self, hold_days: list[int], sample_size: int,
                          seed: int) -> dict:
         """采集每个策略的触发点收益（共享数据采集循环），含净/毛双口径。"""
-        # 加载 DB 因子权重 + 财报数据（修复：combo_backtest 之前从未传入因子权重）
+        # 加载 DB 因子权重 + 财报数据 + 估值（修复：combo_backtest 之前从未传入因子权重）
         factor_weights = self._load_factor_weights()
         finance_map = self._load_finance_map()
+        valuation_map = self._load_valuation_map()
         symbols = self.engine.get_local_symbols()
         if sample_size and len(symbols) > sample_size:
             rng = random.Random(seed)
@@ -355,7 +358,8 @@ class ComboBacktester:
                 if co and "date" in df.columns:
                     df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
-                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []),
+                                                          valuation_map.get(symbol))
                 signals = _compute_signals(df, finance_series=fin_series, factor_weights=factor_weights)
                 if not signals:
                     continue
@@ -400,10 +404,29 @@ class ComboBacktester:
             logger.warning(f"财报加载失败：{e!r}")
         return result
 
+    def _load_valuation_map(self) -> dict[str, tuple]:
+        """加载全市场PE/PB估值快照。"""
+        import sqlite3
+        result: dict[str, tuple] = {}
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, pe, pb FROM stock_market_cap WHERE pe IS NOT NULL OR pb IS NOT NULL"
+                ).fetchall()
+            for r in rows:
+                result[r[0]] = (r[1], r[2])
+            logger.info(f"组合回测估值加载：{len(result)} 只")
+        except Exception as e:
+            logger.warning(f"估值加载失败：{e!r}")
+        return result
+
     @staticmethod
-    def _build_finance_series(df: pd.DataFrame, finance_rows: list) -> dict[str, pd.Series] | None:
-        """从财报行构建 point-in-time 质量因子序列。"""
-        if not finance_rows or "date" not in df.columns:
+    def _build_finance_series(df: pd.DataFrame, finance_rows: list,
+                              valuation: tuple | None = None) -> dict[str, pd.Series] | None:
+        """从财报行构建 point-in-time 质量因子序列 + 估值快照。"""
+        if not finance_rows and not valuation:
+            return None
+        if "date" not in df.columns:
             return None
         n = len(df)
         dates = df["date"].astype(str).values
@@ -436,6 +459,14 @@ class ComboBacktester:
                          ("rev_growth", rev_growth_s), ("profit_growth", profit_growth_s)]:
             if s.notna().any():
                 result[name] = s
+        # 估值因子（快照，全序列填充为当前值）
+        if valuation:
+            pe, pb = valuation
+            n = len(df)
+            if pe is not None and pe > 0:
+                result["pe_ratio"] = pd.Series(float(pe), index=df.index)
+            if pb is not None and pb > 0:
+                result["pb_ratio"] = pd.Series(float(pb), index=df.index)
         return result if result else None
 
     @staticmethod

@@ -195,7 +195,9 @@ class StrategyEvaluator:
 
         # 预加载全市场财报（point-in-time质量因子回测）
         finance_map = self._load_finance_for_backtest()
-        # 加载DB完整IC权重（39因子，含质量+资金+结构）
+        # 加载估值快照（PE/PB）
+        valuation_map = self._load_valuation_map()
+        # 加载DB完整IC权重（含质量+资金+结构+估值）
         db_weights = self._load_db_factor_weights()
         # 加载三态市场状态权重
         state_weights = self._load_state_factor_weights()
@@ -241,7 +243,8 @@ class StrategyEvaluator:
                     bench_monthly.setdefault(m, []).append(fwd[i])
 
                 # 策略信号
-                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []),
+                                                          valuation_map.get(symbol))
                 # P1: multi_factor 按月度市场状态切换权重
                 mf_weights = self._select_month_weights(months_arr, state_weights, db_weights)
                 signals = _compute_signals(df, finance_series=fin_series, factor_weights=mf_weights)
@@ -379,8 +382,24 @@ class StrategyEvaluator:
             logger.warning(f"回测财报加载失败：{e!r}")
         return result
 
-    def _build_finance_series(self, df: pd.DataFrame, finance_rows: list) -> dict[str, pd.Series] | None:
-        """从财报行构建point-in-time质量因子序列。
+    def _load_valuation_map(self) -> dict[str, tuple]:
+        """加载全市场PE/PB估值快照。"""
+        import sqlite3
+        result: dict[str, tuple] = {}
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, pe, pb FROM stock_market_cap WHERE pe IS NOT NULL OR pb IS NOT NULL"
+                ).fetchall()
+            for r in rows:
+                result[r[0]] = (r[1], r[2])
+        except Exception:
+            pass
+        return result
+
+    def _build_finance_series(self, df: pd.DataFrame, finance_rows: list,
+                              valuation: tuple | None = None) -> dict[str, pd.Series] | None:
+        """从财报行构建point-in-time质量因子序列 + 估值快照。
 
         用 report_date 对齐K线日期，避免未来函数（报告披露后才可用）。
         """
