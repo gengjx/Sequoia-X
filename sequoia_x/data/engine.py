@@ -528,7 +528,11 @@ class DataEngine:
 
         if not all_rows:
             logger.warning("baostock无数据返回，切换东财fallback...")
-            return self.sync_today_eastmoney()
+            em_count = self.sync_today_eastmoney()
+            if em_count > 0:
+                return em_count
+            logger.warning("东财也无数据，切换腾讯第三备源...")
+            return self.sync_today_tencent()
 
         # 若baostock只拉到部分（<50%），补充东财fallback
         synced_syms = len({r[0] for r in all_rows})
@@ -567,6 +571,93 @@ class DataEngine:
         from sequoia_x.core.rate_limiter import _rate_limiter
         _rate_limiter.baostock_consume(len(tasks) * 2)
         return count
+
+    def sync_today_tencent(self) -> int:
+        """腾讯日K批量补全（第三备源：baostock额度耗尽 + 东财被封时）。
+
+        原理：腾讯 web.ifzq.gtimg.cn 前复权日K接口，
+        用 DB后复权昨收 / 腾讯前复权昨收 = 复权系数，
+        前复权今日OHLC × 系数 = 后复权今日OHLC。
+        逐只请求（无批量接口），但不限频率、不封IP，5000只约15分钟。
+        """
+        import requests as _req
+        from datetime import date as _date
+
+        today_str = _date.today().strftime("%Y-%m-%d")
+
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
+            ).fetchall()
+            last_db = dict(conn.execute("""
+                SELECT symbol, close FROM stock_daily d
+                WHERE date = (SELECT MAX(date) FROM stock_daily WHERE symbol = d.symbol)
+            """).fetchall())
+
+        missing = {sym: last for sym, last in rows if not last or last < today_str}
+        if not missing:
+            logger.info("腾讯fallback: 所有股票已是最新")
+            return 0
+
+        logger.info(f"腾讯fallback: 需补 {len(missing)} 只")
+        rows_to_insert = []
+        success = 0
+        for i, (sym, _) in enumerate(missing.items()):
+            try:
+                prefix = "sh" if sym.startswith(("6", "9")) else "sz"
+                tc_sym = f"{prefix}{sym}"
+                r = _req.get(
+                    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                    params={"param": f"{tc_sym},day,,,5,qfq"},
+                    timeout=8,
+                )
+                data = (r.json().get("data") or {}).get(tc_sym, {})
+                klines = data.get("qfqday") or data.get("day") or []
+                if not klines:
+                    continue
+
+                # 找最新一条
+                latest = klines[-1]
+                d_str = latest[0]
+                if d_str < today_str:
+                    continue  # 没有今天数据
+
+                o, c, h, l, vol = float(latest[1]), float(latest[2]), float(latest[3]), float(latest[4]), float(latest[5])
+
+                # 复权系数：DB后复权昨收 / 腾讯前复权昨收
+                db_prev = last_db.get(sym)
+                if db_prev and len(klines) >= 2:
+                    tc_prev_close = float(klines[-2][2])
+                    if tc_prev_close > 0:
+                        coef = db_prev / tc_prev_close
+                    else:
+                        coef = 1.0
+                else:
+                    coef = 1.0
+
+                rows_to_insert.append((
+                    sym, d_str, o * coef, h * coef, l * coef, c * coef,
+                    int(vol * 100), 0.0, None, None, 1, 0
+                ))
+                success += 1
+            except Exception:
+                continue
+
+            if (i + 1) % 500 == 0:
+                logger.info(f"腾讯fallback进度: {i+1}/{len(missing)}, 成功{success}")
+
+        if rows_to_insert:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO stock_daily "
+                    "(symbol, date, open, high, low, close, volume, turnover, turn, pct_chg, tradestatus, isst) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows_to_insert,
+                )
+                conn.commit()
+
+        logger.info(f"腾讯fallback完成: {success}/{len(missing)} 只")
+        return success
 
     def save_decision_pool(self, items: list[dict]) -> int:
         """决策结果落库：盘后选出的票纳入盘中关注池。
