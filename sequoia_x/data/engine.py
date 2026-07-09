@@ -513,7 +513,7 @@ class DataEngine:
             )
             return 0
 
-        n_workers = min(8, len(tasks))
+        n_workers = min(3, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
         logger.info(f"sync_today_bulk: {len(tasks)}只 分{n_workers}worker 每worker~{len(chunks[0])}只")
 

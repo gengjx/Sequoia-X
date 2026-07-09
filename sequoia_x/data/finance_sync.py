@@ -124,7 +124,7 @@ class FinanceSync:
         self.settings = settings or Settings()
         self.db_path = self.settings.db_path
 
-    def sync_all(self, n_quarters: int = 6, n_workers: int = 6,
+    def sync_all(self, n_quarters: int = 6, n_workers: int = 3,
                  batch_size: int = 50, max_stocks: int | None = None) -> dict:
         """全量采集财报。
 
