@@ -572,6 +572,83 @@ class DataEngine:
         _rate_limiter.baostock_consume(len(tasks) * 2)
         return count
 
+    def sync_valuation(self) -> int:
+        """从东财 push2delay 批量拉取全市场 PE/PB，写入 stock_market_cap 表。
+
+        东财 clist 接口返回全市场实时快照（f9=PE-TTM, f23=PB），
+        全市场3秒搞定，不依赖baostock，不限额度。
+        """
+        from sequoia_x.core.rate_limiter import _rate_limiter
+        from datetime import date as _date
+        import requests as _req
+
+        # 确保 PE/PB 列存在
+        with sqlite3.connect(self.db_path) as conn:
+            cols = {c[1] for c in conn.execute("PRAGMA table_info(stock_market_cap)").fetchall()}
+            if "pe" not in cols:
+                conn.execute("ALTER TABLE stock_market_cap ADD COLUMN pe REAL")
+            if "pb" not in cols:
+                conn.execute("ALTER TABLE stock_market_cap ADD COLUMN pb REAL")
+            conn.commit()
+
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+        all_spot: dict[str, dict] = {}
+        for page in range(1, 80):
+            if not _rate_limiter.eastmoney_acquire():
+                logger.warning("东财熔断，估值同步中止")
+                break
+            try:
+                r = _req.get(
+                    "https://push2delay.eastmoney.com/api/qt/clist/get",
+                    params={
+                        "pn": page, "pz": 200, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                        "fs": "m:0+t:6+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2",
+                        "fields": "f12,f9,f23",
+                    },
+                    headers=headers, timeout=10,
+                )
+                d = r.json().get("data") or {}
+                diff = d.get("diff") or []
+                if not diff:
+                    break
+                for item in diff:
+                    sym = item.get("f12", "")
+                    if sym and len(sym) == 6 and sym.isdigit():
+                        all_spot[sym] = item
+                _rate_limiter.eastmoney_success()
+            except Exception as e:
+                _rate_limiter.eastmoney_failure()
+                logger.debug(f"估值同步第{page}页失败: {e!r}")
+                continue
+
+        logger.info(f"估值同步：获取 {len(all_spot)} 只快照")
+
+        rows = []
+        for sym, item in all_spot.items():
+            pe = item.get("f9")
+            pb = item.get("f23")
+            if pe is not None or pb is not None:
+                rows.append((pe, pb, sym))
+
+        if rows:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "UPDATE stock_market_cap SET pe=?, pb=? WHERE symbol=?",
+                    rows,
+                )
+                # 不在 stock_market_cap 的新股也插入
+                existing = {r[0] for r in conn.execute("SELECT symbol FROM stock_market_cap").fetchall()}
+                new_rows = [(sym, None, pe, pb) for pe, pb, sym in rows if sym not in existing]
+                if new_rows:
+                    conn.executemany(
+                        "INSERT INTO stock_market_cap (symbol, circ_mv, pe, pb) VALUES (?,?,?,?)",
+                        new_rows,
+                    )
+                conn.commit()
+
+        logger.info(f"估值同步完成：{len(rows)} 只更新PE/PB")
+        return len(rows)
+
     def sync_today_tencent(self) -> int:
         """腾讯日K批量补全（第三备源：baostock额度耗尽 + 东财被封时）。
 

@@ -32,6 +32,7 @@ class AuctionScheduler:
         (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
         (21, 5, "sync_lhb"),         # 龙虎榜数据同步（紧跟日K之后）
         (21, 6, "sync_fund_flow"),   # 主力资金流向同步
+        (21, 7, "sync_valuation"),  # PE/PB估值同步（东财快照，全市场3秒）
         (21, 10, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
         (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
@@ -210,6 +211,8 @@ class AuctionScheduler:
             self._sync_lhb()
         elif task == "sync_fund_flow":
             self._sync_fund_flow()
+        elif task == "sync_valuation":
+            self._sync_valuation()
         elif task == "refresh_factor_ic":
             self._refresh_factor_ic()
         elif task == "daily_report":
@@ -352,6 +355,16 @@ class AuctionScheduler:
             logger.info(f"因子IC刷新完成：{len(effective)}/{len(factors)}个有效因子（滚动6个月）")
         except Exception as e:
             logger.warning(f"因子IC刷新失败：{e!r}")
+
+    def _sync_valuation(self) -> None:
+        """PE/PB估值同步（东财快照，全市场）。"""
+        from sequoia_x.data.engine import DataEngine
+        try:
+            engine = DataEngine(self.settings)
+            n = engine.sync_valuation()
+            logger.info(f"估值同步完成：{n} 只更新PE/PB")
+        except Exception as e:
+            logger.warning(f"估值同步失败：{e!r}")
 
     def _sync_fund_flow(self) -> None:
         """主力资金流向同步（盘后执行）+ 历史回填。"""
