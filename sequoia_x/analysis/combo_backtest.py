@@ -248,6 +248,9 @@ class ComboBacktester:
             rng = random.Random(seed)
             symbols = rng.sample(symbols, sample_size)
         logger.info(f"共振回测：采样 {len(symbols)} 只股票")
+        # 加载因子权重 + 财报（与 _collect_returns 同口径）
+        factor_weights = self._load_factor_weights()
+        finance_map = self._load_finance_map()
         cutoff_map = self.engine.get_ipo_cutoff_map()
 
         bands = {"1": {h: ([], []) for h in hold_days},
@@ -267,7 +270,8 @@ class ComboBacktester:
                 if co and "date" in df.columns:
                     df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
-                signals = _compute_signals(df)
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                signals = _compute_signals(df, finance_series=fin_series, factor_weights=factor_weights)
                 if not signals:
                     continue
                 sig_df = pd.DataFrame({k: v.fillna(False) for k, v in signals.items()})
@@ -328,6 +332,9 @@ class ComboBacktester:
     def _collect_returns(self, hold_days: list[int], sample_size: int,
                          seed: int) -> dict:
         """采集每个策略的触发点收益（共享数据采集循环），含净/毛双口径。"""
+        # 加载 DB 因子权重 + 财报数据（修复：combo_backtest 之前从未传入因子权重）
+        factor_weights = self._load_factor_weights()
+        finance_map = self._load_finance_map()
         symbols = self.engine.get_local_symbols()
         if sample_size and len(symbols) > sample_size:
             rng = random.Random(seed)
@@ -348,7 +355,8 @@ class ComboBacktester:
                 if co and "date" in df.columns:
                     df = df[df["date"].astype(str) >= co]
                 df = df.reset_index(drop=True)
-                signals = _compute_signals(df)
+                fin_series = self._build_finance_series(df, finance_map.get(symbol, []))
+                signals = _compute_signals(df, finance_series=fin_series, factor_weights=factor_weights)
                 if not signals:
                     continue
                 for skey, sig in signals.items():
@@ -361,6 +369,74 @@ class ComboBacktester:
                 continue
         logger.info(f"组合回测：处理 {processed}/{len(symbols)} 只")
         return {"returns": strategy_returns, "processed": processed}
+
+    def _load_factor_weights(self) -> dict[str, float] | None:
+        """从 DB 加载因子 IC 权重（带符号加权）。"""
+        try:
+            db_w = self.engine.load_factor_weights()
+            if db_w:
+                weights = {k: v["weight"] for k, v in db_w.items() if v.get("weight", 0) != 0}
+                logger.info(f"组合回测因子权重：{len(weights)} 个因子")
+                return weights
+        except Exception as e:
+            logger.warning(f"因子权重加载失败：{e!r}")
+        return None
+
+    def _load_finance_map(self) -> dict[str, list]:
+        """批量加载全市场财报。"""
+        import sqlite3
+        result: dict[str, list] = {}
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT symbol, stat_date, report_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni "
+                    "FROM stock_finance"
+                ).fetchall()
+            for r in rows:
+                result.setdefault(r["symbol"], []).append(dict(r))
+            logger.info(f"组合回测财报加载：{len(result)} 只")
+        except Exception as e:
+            logger.warning(f"财报加载失败：{e!r}")
+        return result
+
+    @staticmethod
+    def _build_finance_series(df: pd.DataFrame, finance_rows: list) -> dict[str, pd.Series] | None:
+        """从财报行构建 point-in-time 质量因子序列。"""
+        if not finance_rows or "date" not in df.columns:
+            return None
+        n = len(df)
+        dates = df["date"].astype(str).values
+        # 报告日期 → 对齐到K线日期（报告披露后才可用，防未来函数）
+        roe_s = pd.Series(np.nan, index=df.index)
+        np_margin_s = pd.Series(np.nan, index=df.index)
+        gp_margin_s = pd.Series(np.nan, index=df.index)
+        rev_growth_s = pd.Series(np.nan, index=df.index)
+        profit_growth_s = pd.Series(np.nan, index=df.index)
+        for row in sorted(finance_rows, key=lambda x: x.get("stat_date") or ""):
+            rd = (row.get("report_date") or row.get("stat_date") or "")[:10]
+            if not rd:
+                continue
+            # 找到 >= 报告日期的第一个K线日
+            mask = dates >= rd
+            if mask.any():
+                idx = np.argmax(mask)
+                if row.get("roe") is not None:
+                    roe_s.iloc[idx:] = float(row["roe"])
+                if row.get("np_margin") is not None:
+                    np_margin_s.iloc[idx:] = float(row["np_margin"])
+                if row.get("gp_margin") is not None:
+                    gp_margin_s.iloc[idx:] = float(row["gp_margin"])
+                if row.get("yoy_eps") is not None:
+                    rev_growth_s.iloc[idx:] = float(row["yoy_eps"])
+                if row.get("yoy_pni") is not None:
+                    profit_growth_s.iloc[idx:] = float(row["yoy_pni"])
+        result = {}
+        for name, s in [("roe", roe_s), ("np_margin", np_margin_s), ("gp_margin", gp_margin_s),
+                         ("rev_growth", rev_growth_s), ("profit_growth", profit_growth_s)]:
+            if s.notna().any():
+                result[name] = s
+        return result if result else None
 
     @staticmethod
     def _forward_returns(df: pd.DataFrame, signal: pd.Series, hold: int) -> tuple[list[float], list[float]]:

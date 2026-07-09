@@ -88,7 +88,7 @@ def fetch_minute_klines(symbol: str, klt: int = 1, days: int = 1) -> list[dict]:
 
 def _fetch_minute_eastmoney(symbol: str, klt: int = 1, days: int = 1) -> list[dict]:
     """从东财 push2his 拉取单只股票的分钟K线（主源）。"""
-    import requests
+    from sequoia_x.core.rate_limiter import em_get
 
     secid = _to_eastmoney_secid(symbol)
     today = datetime.now().strftime("%Y%m%d")
@@ -99,7 +99,7 @@ def _fetch_minute_eastmoney(symbol: str, klt: int = 1, days: int = 1) -> list[di
     klines = []
     for attempt in range(3):
         try:
-            r = requests.get(
+            r = em_get(
                 "https://push2his.eastmoney.com/api/qt/stock/kline/get",
                 params={
                     "secid": secid,

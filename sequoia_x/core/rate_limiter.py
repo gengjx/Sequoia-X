@@ -60,6 +60,7 @@ class RateLimiter:
         self._circuit_until: dict[str, float] = {}  # source -> timestamp
         self._state_lock = threading.Lock()
         self._load_state()
+        self._save_state()  # 确保状态文件存在
 
     def _load_state(self) -> None:
         """从文件恢复日额度计数。"""
@@ -70,7 +71,14 @@ class RateLimiter:
                 today = datetime.now().strftime("%Y-%m-%d")
                 if state.get("date") == today:
                     self._baostock_count = state.get("baostock_count", 0)
-                    logger.info(f"限流器恢复：baostock今日已用 {self._baostock_count}/{BAOSTOCK_DAILY_LIMIT}")
+                    self._failures["eastmoney"] = state.get("em_failures", 0)
+                    cb_until = state.get("em_circuit_until", 0)
+                    if cb_until > time.time():
+                        self._circuit_until["eastmoney"] = cb_until
+                    logger.info(
+                        f"限流器恢复：baostock今日已用 {self._baostock_count}/{BAOSTOCK_DAILY_LIMIT}"
+                        + (f"，东财熔断中(剩余{int(cb_until - time.time())}s)" if cb_until > time.time() else "")
+                    )
         except Exception:
             pass
 
@@ -82,6 +90,8 @@ class RateLimiter:
                 json.dump({
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "baostock_count": self._baostock_count,
+                    "em_failures": self._failures.get("eastmoney", 0),
+                    "em_circuit_until": self._circuit_until.get("eastmoney", 0),
                 }, f)
         except Exception:
             pass
@@ -151,6 +161,7 @@ class RateLimiter:
         """记录东财调用成功。"""
         with self._state_lock:
             self._failures["eastmoney"] = 0
+            self._save_state()
 
     def eastmoney_failure(self) -> None:
         """记录东财调用失败（达到阈值触发熔断）。"""
@@ -162,6 +173,7 @@ class RateLimiter:
                     f"东财熔断：连续失败 {self._failures['eastmoney']} 次，"
                     f"冷却 {CIRCUIT_BREAKER_COOLDOWN // 60} 分钟"
                 )
+            self._save_state()
 
     # ════════════════════════════════════════
     # 通用熔断
@@ -198,6 +210,56 @@ class RateLimiter:
                 "circuit_breaker": self._is_circuit_breaker("eastmoney"),
             },
         }
+
+    @staticmethod
+    def probe_eastmoney(endpoint: str = "push2his") -> bool:
+        """探测东财某接口是否可用（发1个轻量请求）。
+
+        Args:
+            endpoint: "push2his" | "push2delay"
+
+        Returns:
+            True=可用, False=被封
+        """
+        import requests as _req
+        if endpoint == "push2his":
+            url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+            params = {"secid": "1.600519", "klt": "101", "fqt": "1", "beg": "20260101", "end": "20260102", "fields1": "f1", "fields2": "f51"}
+        else:
+            url = "https://push2delay.eastmoney.com/api/qt/stock/get"
+            params = {"secid": "0.000001", "fields": "f43"}
+        try:
+            r = _req.get(url, params=params, timeout=6)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+
+def em_get(url: str, **kwargs) -> "requests.Response":
+    """东财 HTTP GET 封装：自动频率控制 + 熔断 + 失败计数。
+
+    所有东财请求都应走这个函数，统一限流。
+
+    Raises:
+        ConnectionError: 熔断中
+        requests.RequestException: 底层请求失败
+    """
+    import requests as _req
+    if not _rate_limiter.eastmoney_acquire():
+        raise ConnectionError("东财熔断中，请稍后重试")
+    kwargs.setdefault("timeout", 10)
+    try:
+        resp = _req.get(url, **kwargs)
+        if resp.status_code == 200:
+            _rate_limiter.eastmoney_success()
+            return resp
+        else:
+            _rate_limiter.eastmoney_failure()
+            resp.raise_for_status()
+            return resp
+    except Exception:
+        _rate_limiter.eastmoney_failure()
+        raise
 
 
 # 全局单例

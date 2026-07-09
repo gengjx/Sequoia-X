@@ -97,6 +97,12 @@ def backfill_fund_flow_history(db_path: str, symbols: list[str],
     failed = 0
     all_rows: list[tuple] = []
 
+    # 探测东财 push2his 是否可用
+    from sequoia_x.core.rate_limiter import RateLimiter
+    if not RateLimiter.probe_eastmoney("push2his"):
+        logger.error("东财 push2his 被封，资金流向回填取消（push2delay仍可用，稍后重试）")
+        return {"total": total, "success": 0, "failed": total, "rows": 0, "elapsed": 0, "blocked": True}
+
     logger.info(f"资金流向历史回填：{total}只，{days}天，{n_workers}线程")
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:

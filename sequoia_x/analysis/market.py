@@ -514,7 +514,7 @@ class MarketAnalyzer:
         push2delay 强制每页上限 100 条（total≈5800），故按页全量分页拉取；
         端点为延迟行情，盘后稳定可用。字段：f12=代码, f21=流通市值。
         """
-        import requests
+        from sequoia_x.core.rate_limiter import em_get
 
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
         base_url = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -528,7 +528,7 @@ class MarketAnalyzer:
                 "fid": "f3", "fs": fs, "fields": "f12,f21",
             }
             try:
-                r = requests.get(base_url, params=params, headers=headers, timeout=10)
+                r = em_get(base_url, params=params, headers=headers, timeout=10)
                 data = r.json().get("data") or {}
                 diff = data.get("diff", []) or []
                 total = data.get("total", 0)
@@ -620,7 +620,7 @@ class MarketAnalyzer:
                 "fid": "f3", "fs": "m:90 t:2", "fields": "f12,f14,f104,f105",
             }
             try:
-                r = requests.get(base_url, params=params, headers=headers, timeout=10)
+                r = em_get(base_url, params=params, headers=headers, timeout=10)
                 diff = (r.json().get("data") or {}).get("diff", []) or []
             except Exception:
                 diff = []
@@ -646,7 +646,7 @@ class MarketAnalyzer:
                     "fid": "f3", "fs": f"b:{code}", "fields": "f12",
                 }
                 try:
-                    r = requests.get(base_url, params=params, headers=headers, timeout=10)
+                    r = em_get(base_url, params=params, headers=headers, timeout=10)
                     diff = (r.json().get("data") or {}).get("diff", []) or []
                 except Exception:
                     diff = []

@@ -162,6 +162,36 @@ class FinanceSync:
             ).fetchall()}
 
         missing = [s for s in all_symbols if s not in have]
+
+        # ── baostock 额度预算保护 ──
+        # 每只股票 = n_quarters 季度 × 3 类财报(profit/growth/operation) = 18 次查询
+        from sequoia_x.core.rate_limiter import _rate_limiter
+        calls_per_stock = n_quarters * 3
+        rl_status = _rate_limiter.baostock_status()
+        budget_stocks = rl_status["remaining"] // calls_per_stock if calls_per_stock > 0 else 0
+        if budget_stocks == 0:
+            logger.error(
+                f"baostock 额度已耗尽，财报采集取消。"
+                f"已用 {rl_status['used']}/{rl_status['limit']}，"
+                f"明天自动重置"
+            )
+            return {
+                "total": len(all_symbols),
+                "fetched": 0,
+                "skipped": len(all_symbols) - len(missing),
+                "failed": len(missing),
+                "elapsed": 0,
+                "rate_limited": True,
+            }
+        if max_stocks is None or max_stocks > budget_stocks:
+            if len(missing) > budget_stocks:
+                logger.warning(
+                    f"额度保护：需采集 {len(missing)} 只 × {calls_per_stock} 次查询，"
+                    f"超出 baostock 剩余额度({rl_status['remaining']})，"
+                    f"截断为 {budget_stocks} 只，剩余明天继续"
+                )
+            max_stocks = min(max_stocks or budget_stocks, budget_stocks)
+
         if max_stocks:
             missing = missing[:max_stocks]
 
@@ -203,6 +233,10 @@ class FinanceSync:
                 )
 
         elapsed = time.time() - t0
+
+        # 消耗 baostock 额度计数（实际采集数 × 每只查询次数）
+        from sequoia_x.core.rate_limiter import _rate_limiter as _rl2
+        _rl2.baostock_consume(len(missing) * calls_per_stock)
 
         # 验证
         with sqlite3.connect(self.db_path) as conn:
