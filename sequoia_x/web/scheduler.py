@@ -182,6 +182,8 @@ class AuctionScheduler:
                             elapsed = time.time() - t_start
                             self._log_task(task, "failed", started_at,
                                           now.strftime("%H:%M:%S"), elapsed, error=str(e))
+                            # 标记已尝试，避免在时间窗口内每分钟重复失败
+                            self._last_run[key] = now.strftime("%H:%M")
                             logger.warning(f"定时任务 {task} 失败 ({elapsed:.0f}s)：{e!r}")
 
             # 定时 WAL checkpoint（每30分钟，防止WAL膨胀+缓存不一致）
@@ -416,14 +418,14 @@ class AuctionScheduler:
         流程：持仓扫描卖出 → 全策略决策 → 自动买入 → 绩效快照 → 飞书推送。
         """
         from sequoia_x.core.config import Settings
-        from sequoia_x.web.services import Services
+        from sequoia_x.web.services import WebServices
         from sequoia_x.notify.feishu import FeishuNotifier
 
         try:
             settings = self.settings
             engine_mod = __import__("sequoia_x.data.engine", fromlist=["DataEngine"])
             data_engine = engine_mod.DataEngine(settings)
-            services = Services(settings, data_engine)
+            services = WebServices(settings, data_engine)
             notifier = FeishuNotifier(settings)
 
             # Step1: 持仓扫描 → 自动卖出
