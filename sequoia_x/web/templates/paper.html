@@ -302,27 +302,60 @@ async function loadTrades() {
 async function autoRun() {
     const btn = document.getElementById('btnAutoRun');
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 执行中...';
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 提交中...';
     try {
-        const r = await fetch('/api/paper/auto-run', {method:'POST'});
-        const d = await r.json();
-        const buy = d.buy||{};
-        const sell = d.sell||{};
-        const bought = (buy.bought||[]).length;
-        const sold = (sell.sold||[]).length;
-        const ms = d.decision?.market_state||{};
-        const perf = d.performance||{};
-        let msg = `执行完成！\n卖出${sold}笔 买入${bought}只\n市场:${ms.state||'-'}(评分${ms.score||'-'})`;
-        if (perf.total_return_pct !== undefined) msg += `\n总资产 ¥${perf.total_assets?.toFixed(0)||'-'} 收益${perf.total_return_pct?.toFixed(2)||0}%`;
-        msg += `\n${buy.reason||''}`;
-        if (perf.risk_circuit && perf.risk_circuit !== '正常') msg += `\n⚠️ 风控：${perf.risk_circuit}`;
-        showToast(msg, 'success');
-        loadAccount(); loadHoldings(); loadTrades(); loadNavChart();
+        // 异步提交，立即返回 task_id
+        const sr = await fetch('/api/paper/auto-run-async', {method:'POST'});
+        const sd = await sr.json();
+        const taskId = sd.task_id;
+        if (!taskId) throw new Error('提交失败');
+
+        // 轮询进度
+        const steps = ['持仓扫描...', '全策略选股(约60s)...', '自动买入...', '完成'];
+        let stepIdx = 0;
+        btn.innerHTML = `<span class="spinner-border spinner-border-sm"></span> ${steps[0]}`;
+
+        const poll = async () => {
+            const pr = await fetch(`/api/task/${taskId}/status`);
+            const pd = await pr.json();
+            if (pd.status === 'running') {
+                stepIdx = Math.min(stepIdx + 1, steps.length - 2);
+                btn.innerHTML = `<span class="spinner-border spinner-border-sm"></span> ${steps[stepIdx]} (${pd.elapsed||0}s)`;
+                setTimeout(poll, 3000);
+                return;
+            }
+            // 完成（success 或 error）
+            if (pd.status === 'error' || pd.error) {
+                showToast('执行失败：'+(pd.error||'未知错误'), 'error');
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-play-circle"></i> 一键执行闭环';
+                return;
+            }
+            // 获取结果
+            const rr = await fetch(`/api/task/${taskId}/result`);
+            const rd = await rr.json();
+            const d = rd.result || {};
+            const buy = d.buy||{};
+            const sell = d.sell||{};
+            const bought = (buy.bought||[]).length;
+            const sold = (sell.sold||[]).length;
+            const ms = d.decision?.market_state||{};
+            const perf = d.performance||{};
+            let msg = `执行完成！\n卖出${sold}笔 买入${bought}只\n市场:${ms.state||'-'}(评分${ms.score||'-'})`;
+            if (perf.total_return_pct !== undefined) msg += `\n总资产 ¥${perf.total_assets?.toFixed(0)||'-'} 收益${perf.total_return_pct?.toFixed(2)||0}%`;
+            msg += `\n${buy.reason||''}`;
+            if (perf.risk_circuit && perf.risk_circuit !== '正常') msg += `\n⚠️ 风控：${perf.risk_circuit}`;
+            showToast(msg, 'success');
+            loadAccount(); loadHoldings(); loadTrades(); loadNavChart();
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-play-circle"></i> 一键执行闭环';
+        };
+        setTimeout(poll, 2000);
     } catch(e) {
         showToast('执行失败：'+e.message, 'error');
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-play-circle"></i> 一键执行闭环';
     }
-    btn.disabled = false;
-    btn.innerHTML = '<i class="bi bi-play-circle"></i> 一键执行闭环';
 }
 
 async function resetAccount() {

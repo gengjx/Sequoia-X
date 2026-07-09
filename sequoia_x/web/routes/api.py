@@ -648,6 +648,45 @@ async def paper_auto_run(request: Request):
     }
 
 
+@router.post("/paper/auto-run-async")
+async def paper_auto_run_async(request: Request):
+    """异步一键闭环：立即返回 task_id，前端轮询进度。
+
+    完整流程在后台线程执行：
+      1. 持仓扫描 → 自动卖出
+      2. 全策略决策（最慢，约60-120秒）
+      3. 自动买入
+      4. 记录NAV + 绩效
+    """
+    import asyncio
+    services = request.app.state.services
+
+    def _full_cycle():
+        """在后台线程中同步执行完整闭环。"""
+        pos_signals = services.scan_positions(False)
+        sell_result = services.paper_auto_sell(pos_signals.get("signals", []))
+        decision = services.generate_decision(
+            None, 100000, 50, None, True, 60, False
+        )
+        buy_result = services.paper_auto_buy(decision)
+        nav_result = services.paper_record_nav()
+        perf = services.paper_performance()
+        return {
+            "sell": sell_result,
+            "nav": nav_result,
+            "decision": {
+                "buy_list_count": len(decision.get("buy_list", [])),
+                "pool_size": decision.get("pool_size", 0),
+                "market_state": decision.get("market_state", {}),
+            },
+            "buy": buy_result,
+            "performance": vars(perf),
+        }
+
+    task_id = services.submit_task("paper_auto_run", _full_cycle)
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
 @router.post("/paper/reset")
 async def paper_reset(request: Request):
     """重置模拟盘。"""
