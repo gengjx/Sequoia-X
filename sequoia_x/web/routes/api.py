@@ -648,6 +648,58 @@ async def paper_auto_run(request: Request):
     }
 
 
+@router.get("/paper/decision-log")
+async def paper_decision_log(request: Request, limit: int = 30):
+    """每日决策记录：展示每天闭环执行的状态（即使没有买入）。"""
+    import sqlite3 as _sql
+    from sequoia_x.core.config import Settings as _S
+    db_path = _S().db_path
+    with _sql.connect(db_path) as conn:
+        conn.row_factory = _sql.Row
+        rows = conn.execute(
+            "SELECT * FROM paper_decision_log ORDER BY run_date DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return {"log": [dict(r) for r in rows]}
+
+
+def _log_paper_decision(sell_result, decision, buy_result, perf):
+    """记录每日决策快照到 paper_decision_log 表。"""
+    import sqlite3 as _sql
+    from datetime import datetime as _dt
+    from sequoia_x.core.config import Settings as _S
+    try:
+        db_path = _S().db_path
+        today = _dt.now().strftime("%Y-%m-%d")
+        now = _dt.now().isoformat()
+        ms = decision.get("market_state", {})
+        buy = buy_result or {}
+        sell = sell_result or {}
+        bought_syms = ",".join([b.get("symbol","") for b in (buy.get("bought") or [])])
+        with _sql.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO paper_decision_log "
+                "(run_date, market_state, market_score, pool_size, buy_count, bought_stocks, "
+                "sell_count, total_assets, total_return_pct, reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    today,
+                    ms.get("state", ""),
+                    ms.get("score", 0),
+                    decision.get("pool_size", 0),
+                    len(buy.get("bought") or []),
+                    bought_syms,
+                    len(sell.get("sold") or []),
+                    perf.total_assets,
+                    perf.total_return_pct,
+                    buy.get("reason", ""),
+                    now,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 @router.post("/paper/auto-run-async")
 async def paper_auto_run_async(request: Request):
     """异步一键闭环：立即返回 task_id，前端轮询进度。
@@ -671,7 +723,7 @@ async def paper_auto_run_async(request: Request):
         buy_result = services.paper_auto_buy(decision)
         nav_result = services.paper_record_nav()
         perf = services.paper_performance()
-        return {
+        result = {
             "sell": sell_result,
             "nav": nav_result,
             "decision": {
@@ -682,6 +734,9 @@ async def paper_auto_run_async(request: Request):
             "buy": buy_result,
             "performance": vars(perf),
         }
+        # 记录每日决策快照（即使没有买入也记录）
+        _log_paper_decision(sell_result, decision, buy_result, perf)
+        return result
 
     task_id = services.submit_task("paper_auto_run", _full_cycle)
     return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
