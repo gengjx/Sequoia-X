@@ -147,11 +147,37 @@ async def factor_page(request: Request):
         context={},
     )
 
+@router.get("/backtest-validate")
+async def backtest_validate_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="backtest_validate.html",
+        context={},
+    )
+
 
 @router.get("/paper")
 async def paper_page(request: Request):
     templates = request.app.state.templates
     return templates.TemplateResponse(
         request=request, name="paper.html",
+        context={},
+    )
+
+
+@router.get("/attribution")
+async def attribution_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="attribution.html",
+        context={},
+    )
+
+
+@router.get("/paper-replay")
+async def paper_replay_page(request: Request):
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request=request, name="paper_replay.html",
         context={},
     )

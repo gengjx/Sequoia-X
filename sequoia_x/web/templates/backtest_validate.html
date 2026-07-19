@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block title %}回测可信度验证 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+        <h2 class="mb-1"><i class="bi bi-shield-check"></i> 回测可信度验证</h2>
+        <p class="text-muted mb-0">Walk-forward + 参数敏感性 + Bootstrap + PSR → 判断年化收益是否可信还是过拟合</p>
+    </div>
+    <button class="btn btn-primary" id="runBtn" onclick="runValidation()"><i class="bi bi-play-fill"></i> 开始验证</button>
+</div>
+
+<div id="result-area"></div>
+<div id="loading-area" class="d-none text-center py-5">
+    <div class="spinner-border text-primary" style="width:3rem;height:3rem"></div>
+    <p class="mt-3 text-muted" id="progress-text">正在验证…约2-5分钟</p>
+</div>
+
+<div id="intro-area" class="card bg-dark">
+    <div class="card-body">
+        <h5><i class="bi bi-info-circle"></i> 为什么需要验证？</h5>
+        <p class="text-muted">回测显示多因子年化30.7%，但这个数字可能只是过拟合产物。本模块通过4个维度检验策略是否真实有效：</p>
+        <div class="row g-3 mt-1">
+            <div class="col-md-3">
+                <div class="card border-info h-100"><div class="card-body">
+                    <h6 class="text-info">① Walk-Forward</h6>
+                    <p class="small text-muted mb-0">滚动训练→预测，看样本外是否稳定。衰减率&lt;50%说明策略失效。</p>
+                </div></div>
+            </div>
+            <div class="col-md-3">
+                <div class="card border-warning h-100"><div class="card-body">
+                    <h6 class="text-warning">② 参数敏感性</h6>
+                    <p class="small text-muted mb-0">扫描持有期5~60天，alpha是否稳定。只在特定参数好=过拟合。</p>
+                </div></div>
+            </div>
+            <div class="col-md-3">
+                <div class="card border-success h-100"><div class="card-body">
+                    <h6 class="text-success">③ Bootstrap</h6>
+                    <p class="small text-muted mb-0">月度收益重采样1000次，年化收益95%下界&gt;0=统计显著。</p>
+                </div></div>
+            </div>
+            <div class="col-md-3">
+                <div class="card border-danger h-100"><div class="card-body">
+                    <h6 class="text-danger">④ PSR检验</h6>
+                    <p class="small text-muted mb-0">Deflated Sharpe修正，排除偏度峰度影响，PSR&gt;0.95=夏普可信。</p>
+                </div></div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function runValidation() {
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('intro-area').classList.add('d-none');
+    document.getElementById('loading-area').classList.remove('d-none');
+    document.getElementById('result-area').innerHTML = '';
+
+    try {
+        const { task_id } = await api('/api/backtest/validate-async', { method: 'POST' });
+        const result = await pollTask(task_id, (d) => {
+            if (d.progress_msg) document.getElementById('progress-text').textContent = d.progress_msg;
+        });
+        document.getElementById('loading-area').classList.add('d-none');
+        document.getElementById('runBtn').disabled = false;
+
+        if (result.status === 'done') {
+            // result_data 可能在顶层或嵌套
+            const data = result.result_data || result;
+            if (data.tests) {
+                renderResult(data);
+            } else if (result.error) {
+                document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">验证失败: ${result.error}</div>`;
+            } else {
+                document.getElementById('result-area').innerHTML = `<div class="alert alert-warning">验证完成但无结果数据</div>`;
+            }
+        } else if (result.error) {
+            document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">验证失败: ${result.error}</div>`;
+        } else {
+            document.getElementById('result-area').innerHTML = `<div class="alert alert-warning">验证异常: ${JSON.stringify(result).substring(0, 200)}</div>`;
+        }
+    } catch (e) {
+        document.getElementById('loading-area').classList.add('d-none');
+        document.getElementById('runBtn').disabled = false;
+        document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">请求失败: ${e.message}</div>`;
+    }
+}
+
+function renderResult(data) {
+    const score = data.overall_score || 0;
+    const passed = data.overall_passed;
+    const badge = score >= 75 ? 'success' : score >= 50 ? 'warning' : 'danger';
+    const icon = score >= 75 ? '✅' : score >= 50 ? '⚠️' : '❌';
+
+    let html = `
+    <div class="card border-start border-4 border-${badge} mb-3">
+        <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center">
+                <h4 class="mb-0">${icon} ${data.summary || '验证完成'}</h4>
+                <div class="text-end">
+                    <span class="badge bg-${badge} fs-5">${score.toFixed(0)}分</span>
+                    <div class="text-muted small">${data.passed_count||0}/${data.total_count||4}项通过</div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+
+    const tests = data.tests || {};
+    const labels = {
+        walk_forward: ['Walk-Forward滚动验证', 'info', 'bi-arrow-repeat'],
+        parameter_sensitivity: ['参数敏感性测试', 'warning', 'bi-sliders'],
+        bootstrap: ['Bootstrap置信区间', 'success', 'bi-shuffle'],
+        psr: ['PSR过拟合检验', 'danger', 'bi-shield-exclamation'],
+    };
+
+    for (const [key, val] of Object.entries(tests)) {
+        const [title, color, icon] = labels[key] || [key, 'secondary', 'bi-question'];
+        const tp = val.passed ? '✅ 通过' : '❌ 未通过';
+        const tpColor = val.passed ? 'success' : 'danger';
+        html += renderTestCard(key, title, color, icon, tp, tpColor, val);
+    }
+
+    document.getElementById('result-area').innerHTML = html;
+}
+
+function renderTestCard(key, title, color, icon, tp, tpColor, val) {
+    const d = val.detail || {};
+    let body = '';
+
+    if (key === 'walk_forward') {
+        const rows = (d.detail || []).map(r => `<tr>
+            <td>${r.strategy}</td><td>${r.period}</td>
+            <td class="text-end">${r.train_return > 0 ? '+' : ''}${r.train_return}%</td>
+            <td class="text-end ${r.test_return > 0 ? 'text-danger' : 'text-success'}">${r.test_return > 0 ? '+' : ''}${r.test_return}%</td>
+            <td class="text-end">${(r.decay * 100).toFixed(0)}%</td>
+        </tr>`).join('');
+        body = `
+            <p>中位衰减率: <b>${(d.median_decay * 100).toFixed(0)}%</b> | 样本外正收益占比: <b>${(d.positive_test_ratio * 100).toFixed(0)}%</b></p>
+            <table class="table table-sm table-dark table-striped"><thead><tr><th>策略</th><th>窗口</th><th class="text-end">训练收益</th><th class="text-end">预测收益</th><th class="text-end">衰减率</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } else if (key === 'parameter_sensitivity') {
+        const rows = (d.params || []).map(p => `<tr>
+            <td>${p.hold_days}天</td>
+            <td class="text-end ${p.multi_factor_annual > 0 ? 'text-danger' : 'text-success'}">${p.multi_factor_annual > 0 ? '+' : ''}${p.multi_factor_annual}%</td>
+            <td class="text-end">${p.benchmark > 0 ? '+' : ''}${p.benchmark}%</td>
+            <td class="text-end ${p.alpha > 0 ? 'text-danger' : ''}">${p.alpha > 0 ? '+' : ''}${p.alpha}%</td>
+        </tr>`).join('');
+        body = `
+            <p>Alpha均值: <b>${d.alpha_mean > 0 ? '+' : ''}${d.alpha_mean}%</b> | 标准差: <b>${d.alpha_std}%</b> | 正alpha占比: <b>${(d.positive_ratio * 100).toFixed(0)}%</b></p>
+            <table class="table table-sm table-dark table-striped"><thead><tr><th>持有期</th><th class="text-end">多因子年化</th><th class="text-end">基准年化</th><th class="text-end">Alpha</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } else if (key === 'bootstrap') {
+        const mf = d.multi_factor || {};
+        const all = d.all_strategies || {};
+        const rows = Object.entries(all).map(([k, v]) => `<tr>
+            <td>${k}</td>
+            <td class="text-end ${v.ci_lower > 0 ? 'text-danger' : 'text-success'}">${v.ci_lower.toFixed(1)}%</td>
+            <td class="text-end">${v.median.toFixed(1)}%</td>
+            <td class="text-end">${v.ci_upper.toFixed(1)}%</td>
+            <td class="text-end">${(v.prob_positive * 100).toFixed(0)}%</td>
+        </tr>`).join('');
+        body = `
+            <p>多因子95%置信区间: <b>[${(mf.ci_lower||0).toFixed(1)}%, ${(mf.ci_upper||0).toFixed(1)}%]</b> | P(年化>0): <b>${((mf.prob_positive||0)*100).toFixed(0)}%</b></p>
+            <table class="table table-sm table-dark table-striped"><thead><tr><th>策略</th><th class="text-end">95%下界</th><th class="text-end">中位数</th><th class="text-end">95%上界</th><th class="text-end">P>0</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } else if (key === 'psr') {
+        const mf = d.multi_factor || {};
+        const all = d.all_strategies || {};
+        const rows = Object.entries(all).map(([k, v]) => `<tr>
+            <td>${k}</td>
+            <td class="text-end">${v.sharpe}</td>
+            <td class="text-end ${v.psr > 0.95 ? 'text-danger' : v.psr < 0.5 ? 'text-success' : ''}">${v.psr}</td>
+            <td class="text-end">${v.skew}</td>
+            <td class="text-end">${v.kurtosis}</td>
+            <td>${v.psr > 0.95 ? '✅' : '❌'}</td>
+        </tr>`).join('');
+        body = `
+            <p>多因子PSR: <b>${mf.psr||0}</b> (基准夏普${d.benchmark_sharpe||0.5}) | 偏度${mf.skew||0} 峰度${mf.kurtosis||0}</p>
+            <p class="small text-muted">PSR&gt;0.95=夏普统计显著；PSR&lt;0.50=不可信（运气成分大）</p>
+            <table class="table table-sm table-dark table-striped"><thead><tr><th>策略</th><th class="text-end">夏普</th><th class="text-end">PSR</th><th class="text-end">偏度</th><th class="text-end">峰度</th><th>显著</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    return `
+    <div class="card border-${color} mb-3">
+        <div class="card-header bg-transparent d-flex justify-content-between">
+            <span><i class="bi ${icon}"></i> ${title} <span class="badge bg-${tpColor}">${tp}</span></span>
+            <span class="badge bg-${val.score >= 60 ? 'success' : 'danger'}">${val.score.toFixed(0)}分</span>
+        </div>
+        <div class="card-body">${body}</div>
+    </div>`;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}收益归因分析 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+        <h2 class="mb-1"><i class="bi bi-graph-up-arrow"></i> 收益归因分析</h2>
+        <p class="text-muted mb-0">分解多因子策略的超额收益来源 → 识别哪些因子真正驱动Alpha</p>
+    </div>
+    <button class="btn btn-primary" id="runBtn" onclick="runAttribution()"><i class="bi bi-play-fill"></i> 开始归因</button>
+</div>
+
+<div id="result-area"></div>
+<div id="loading-area" class="d-none text-center py-5">
+    <div class="spinner-border text-primary" style="width:3rem;height:3rem"></div>
+    <p class="mt-3 text-muted" id="progress-text">正在归因分析…采样500只×全周期</p>
+</div>
+
+<div id="intro-area" class="card bg-dark">
+    <div class="card-body">
+        <h5><i class="bi bi-info-circle"></i> 什么是收益归因？</h5>
+        <p class="text-muted">多因子策略年化+22.6%，超额基准+6.4%。这6.4%的Alpha到底是哪些因子贡献的？归因分析把超额收益拆解到每个因子：</p>
+        <div class="row g-3 mt-1">
+            <div class="col-md-4">
+                <div class="card border-info h-100"><div class="card-body">
+                    <h6 class="text-info">① 因子IC</h6>
+                    <p class="small text-muted mb-0">因子值与未来收益的秩相关系数，IC&gt;0.02=有预测力</p>
+                </div></div>
+            </div>
+            <div class="col-md-4">
+                <div class="card border-success h-100"><div class="card-body">
+                    <h6 class="text-success">② 因子权重</h6>
+                    <p class="small text-muted mb-0">三态市场状态下该因子的IC加权权重，反映策略实际赋予的权重</p>
+                </div></div>
+            </div>
+            <div class="col-md-4">
+                <div class="card border-warning h-100"><div class="card-body">
+                    <h6 class="text-warning">③ 暴露差异</h6>
+                    <p class="small text-muted mb-0">Top组合 vs 全市场在该因子上的均值差，反映策略的超配方向</p>
+                </div></div>
+            </div>
+        </div>
+        <p class="text-muted mt-3 mb-0">贡献度 = 权重 × IC × 100。正值=驱动收益，负值=拖累收益。</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function runAttribution() {
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('intro-area').classList.add('d-none');
+    document.getElementById('loading-area').classList.remove('d-none');
+
+    try {
+        const resp = await fetch('/api/attribution/run-async', {method: 'POST'});
+        const data = await resp.json();
+        if (data.task_id) {
+            await pollTask(data.task_id);
+        }
+    } catch(e) {
+        document.getElementById('loading-area').classList.add('d-none');
+        document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">启动失败: ${e}</div>`;
+        document.getElementById('runBtn').disabled = false;
+    }
+}
+
+async function pollTask(taskId) {
+    const maxWait = 180000; // 3分钟
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+            const resp = await fetch(`/api/tasks/${taskId}`);
+            const data = await resp.json();
+            if (data.status === 'done' && data.result_data) {
+                document.getElementById('loading-area').classList.add('d-none');
+                renderResult(data.result_data);
+                document.getElementById('runBtn').disabled = false;
+                return;
+            }
+            if (data.status === 'error') {
+                throw new Error(data.error || '分析失败');
+            }
+            if (data.progress_msg) {
+                document.getElementById('progress-text').textContent = data.progress_msg;
+            }
+        } catch(e) {
+            document.getElementById('loading-area').classList.add('d-none');
+            document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">${e}</div>`;
+            document.getElementById('runBtn').disabled = false;
+            return;
+        }
+    }
+    document.getElementById('loading-area').classList.add('d-none');
+    document.getElementById('result-area').innerHTML = '<div class="alert alert-warning">超时，请稍后重试</div>';
+    document.getElementById('runBtn').disabled = false;
+}
+
+function fmt(v, d=2) { return v != null ? Number(v).toFixed(d) : '-'; }
+function badgeClass(s) {
+    if (s.includes('核心')) return 'bg-success';
+    if (s.includes('有效')) return 'bg-info';
+    if (s.includes('反转') || s.includes('⚠')) return 'bg-danger';
+    if (s.includes('无效') || s.includes('过低')) return 'bg-secondary';
+    return 'bg-warning';
+}
+
+function renderResult(data) {
+    if (data.error) {
+        document.getElementById('result-area').innerHTML = `<div class="alert alert-warning">${data.error}</div>`;
+        return;
+    }
+    const top = data.top_drivers || [];
+    const drags = data.top_drags || [];
+    let html = `
+    <div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">策略年化</h6>
+            <h3 class="text-success">${fmt(data.strategy_annual_return)}%</h3>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">基准年化</h6>
+            <h3 class="text-warning">${fmt(data.benchmark_annual_return)}%</h3>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">超额Alpha</h6>
+            <h3 class="text-${data.alpha > 0 ? 'success' : 'danger'}">${data.alpha > 0 ? '+' : ''}${fmt(data.alpha)}%</h3>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">回测月数</h6>
+            <h3>${data.months}</h3>
+            <small class="text-muted">${data.processed}只 × ${data.hold_days}日持有</small>
+        </div></div></div>
+    </div>`;
+
+    // 类别汇总
+    if (data.category_summary && data.category_summary.length) {
+        html += '<h5 class="mb-2"><i class="bi bi-bar-chart"></i> 因子类别贡献汇总</h5><div class="row g-2 mb-3">';
+        for (const c of data.category_summary) {
+            const cls = c.total_contribution > 0 ? 'success' : 'danger';
+            html += `<div class="col-md-3"><div class="card bg-dark h-100"><div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <span class="text-muted">${c.category || '其他'}</span>
+                    <span class="text-${cls} fw-bold">${c.total_contribution > 0 ? '+' : ''}${fmt(c.total_contribution, 3)}</span>
+                </div>
+                <small class="text-muted">${c.effective}/${c.count}个有效因子</small>
+            </div></div></div>`;
+        }
+        html += '</div>';
+    }
+
+    // 核心驱动 vs 拖累
+    if (top.length || drags.length) {
+        html += '<div class="row g-3 mb-3">';
+        if (top.length) {
+            html += `<div class="col-md-6"><div class="card bg-dark border-success"><div class="card-body">
+                <h6 class="text-success"><i class="bi bi-arrow-up-circle"></i> 核心收益驱动因子</h6>
+                <div>${top.map(f => `<span class="badge bg-success me-1 mb-1">${f}</span>`).join('')}</div>
+            </div></div></div>`;
+        }
+        if (drags.length) {
+            html += `<div class="col-md-6"><div class="card bg-dark border-danger"><div class="card-body">
+                <h6 class="text-danger"><i class="bi bi-arrow-down-circle"></i> 收益拖累因子</h6>
+                <div>${drags.map(f => `<span class="badge bg-danger me-1 mb-1">${f}</span>`).join('')}</div>
+            </div></div></div>`;
+        }
+        html += '</div>';
+    }
+
+    // 因子明细表
+    html += `<div class="card bg-dark"><div class="card-body">
+        <h6><i class="bi bi-table"></i> 因子贡献度明细（Top15）</h6>
+        <div class="table-responsive"><table class="table table-dark table-sm">
+        <thead><tr>
+            <th>因子</th><th>类别</th><th>IC</th><th>权重</th>
+            <th>暴露差</th><th class="text-end">贡献度</th><th>评估</th>
+        </tr></thead><tbody>`;
+    for (const f of (data.factor_contributions || [])) {
+        const cls = f.contribution > 0 ? 'text-success' : 'text-danger';
+        html += `<tr>
+            <td><span class="text-info">${f.name}</span><br><small class="text-muted">${f.desc || ''}</small></td>
+            <td><small>${f.category || '-'}</small></td>
+            <td>${fmt(f.ic_mean, 4)}</td>
+            <td>${fmt(f.weight, 4)}</td>
+            <td>${fmt(f.exposure_gap, 4)}</td>
+            <td class="text-end fw-bold ${cls}">${f.contribution > 0 ? '+' : ''}${fmt(f.contribution, 4)}</td>
+            <td><span class="badge ${badgeClass(f.assessment)}">${f.assessment}</span></td>
+        </tr>`;
+    }
+    html += '</tbody></table></div>';
+    html += `<small class="text-muted">共分析${data.all_factors_count}个因子，展示Top15</small>`;
+    html += '</div></div>';
+
+    document.getElementById('result-area').innerHTML = html;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,368 @@
+{% extends "base.html" %}
+{% block title %}模拟盘回放 - Sequoia-X{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+        <h2 class="mb-1"><i class="bi bi-arrow-repeat"></i> 模拟盘历史回放</h2>
+        <p class="text-muted mb-0">用完整5.3年日K逐日重放多因子选股→持仓管理→止损止盈，验证策略实盘可信度</p>
+    </div>
+    <div class="d-flex gap-2">
+        <button class="btn btn-primary" id="runBtn" onclick="runReplay()"><i class="bi bi-play-fill"></i> 开始回放</button>
+        <button class="btn btn-warning" id="sweepBtn" onclick="runSweep()"><i class="bi bi-tuning"></i> 参数扫描</button>
+    </div>
+</div>
+
+<div class="card bg-dark mb-3">
+    <div class="card-body">
+        <div class="row g-2 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label small text-muted">起始日期</label>
+                <input type="date" class="form-control form-control-sm" id="startDate" value="">
+                <small class="text-muted">留空=最近250交易日</small>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small text-muted">结束日期</label>
+                <input type="date" class="form-control form-control-sm" id="endDate" value="">
+                <small class="text-muted">留空=最新数据日</small>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label small text-muted">初始资金</label>
+                <input type="number" class="form-control form-control-sm" id="capital" value="100000">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label small text-muted">采样股票</label>
+                <input type="number" class="form-control form-control-sm" id="sampleSize" value="500">
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="result-area"></div>
+<div id="loading-area" class="d-none text-center py-5">
+    <div class="spinner-border text-primary" style="width:3rem;height:3rem"></div>
+    <p class="mt-3 text-muted" id="progress-text">正在回放…</p>
+</div>
+
+<div id="intro-area" class="card bg-dark">
+    <div class="card-body">
+        <h5><i class="bi bi-info-circle"></i> 什么是历史回放？</h5>
+        <p class="text-muted">当前模拟盘只有2天交易记录，无法验证策略长期效果。历史回放用已有5.3年日K数据，逐日模拟完整决策链路：</p>
+        <div class="row g-3 mt-1">
+            <div class="col-md-3"><div class="card border-info h-100"><div class="card-body">
+                <h6 class="text-info">① 选股</h6>
+                <p class="small text-muted mb-0">每日用截至当日的数据算因子截面，杜绝前视偏差</p>
+            </div></div></div>
+            <div class="col-md-3"><div class="card border-success h-100"><div class="card-body">
+                <h6 class="text-success">② 仓位管理</h6>
+                <p class="small text-muted mb-0">市场状态自适应仓位，单票15%上限，最多8只持仓</p>
+            </div></div></div>
+            <div class="col-md-3"><div class="card border-warning h-100"><div class="card-body">
+                <h6 class="text-warning">③ 止损止盈</h6>
+                <p class="small text-muted mb-0">止损-8%，止盈+20%，移动止损-5%，超时30天卖出</p>
+            </div></div></div>
+            <div class="col-md-3"><div class="card border-danger h-100"><div class="card-body">
+                <h6 class="text-danger">④ 极端风控</h6>
+                <p class="small text-muted mb-0">熊市中位收益<-5%时空仓，系统性风险保护</p>
+            </div></div></div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function runReplay() {
+    const startDate = document.getElementById('startDate').value;
+    const endDate = document.getElementById('endDate').value;
+    const capital = document.getElementById('capital').value;
+    const sampleSize = document.getElementById('sampleSize').value;
+
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('intro-area').classList.add('d-none');
+    document.getElementById('loading-area').classList.remove('d-none');
+
+    try {
+        const resp = await fetch('/api/paper/replay-async', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({start_date: startDate, end_date: endDate, initial_capital: parseFloat(capital), sample_size: parseInt(sampleSize)})
+        });
+        const data = await resp.json();
+        if (data.task_id) await pollTask(data.task_id);
+    } catch(e) {
+        document.getElementById('loading-area').classList.add('d-none');
+        document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">${e}</div>`;
+        document.getElementById('runBtn').disabled = false;
+    }
+}
+
+async function pollTask(taskId) {
+    const maxWait = 300000;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+            const resp = await fetch(`/api/tasks/${taskId}`);
+            const data = await resp.json();
+            if (data.status === 'done' && data.result_data) {
+                document.getElementById('loading-area').classList.add('d-none');
+                renderResult(data.result_data);
+                document.getElementById('runBtn').disabled = false;
+                return;
+            }
+            if (data.status === 'error') throw new Error(data.error || '回放失败');
+            if (data.progress_msg) document.getElementById('progress-text').textContent = data.progress_msg;
+        } catch(e) {
+            document.getElementById('loading-area').classList.add('d-none');
+            document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">${e}</div>`;
+            document.getElementById('runBtn').disabled = false;
+            return;
+        }
+    }
+    document.getElementById('loading-area').classList.add('d-none');
+    document.getElementById('result-area').innerHTML = '<div class="alert alert-warning">超时</div>';
+    document.getElementById('runBtn').disabled = false;
+}
+
+function fmt(v, d=2) { return v != null ? Number(v).toFixed(d) : '-'; }
+
+function renderResult(data) {
+    const m = data.metrics || {};
+    const cfg = data.config || {};
+    let html = `
+    <div class="row g-3 mb-3">
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">最终净值</h6><h3 class="text-${m.final_nav >= 1 ? 'success' : 'danger'}">${fmt(m.final_nav,4)}</h3>
+        </div></div></div>
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">总收益</h6><h3 class="text-${m.total_return >= 0 ? 'success' : 'danger'}">${m.total_return >= 0 ? '+' : ''}${fmt(m.total_return)}%</h3>
+        </div></div></div>
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">年化收益</h6><h3 class="text-${m.annual_return >= 0 ? 'success' : 'danger'}">${m.annual_return >= 0 ? '+' : ''}${fmt(m.annual_return)}%</h3>
+        </div></div></div>
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">最大回撤</h6><h3 class="text-warning">${fmt(m.max_drawdown)}%</h3>
+        </div></div></div>
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">夏普比率</h6><h3 class="${m.sharpe >= 1 ? 'text-success' : m.sharpe >= 0.5 ? 'text-warning' : 'text-danger'}">${fmt(m.sharpe)}</h3>
+        </div></div></div>
+        <div class="col-md-2"><div class="card bg-dark text-center"><div class="card-body">
+            <h6 class="text-muted">胜率</h6><h3>${fmt(m.win_rate,1)}%</h3>
+            <small class="text-muted">${m.total_trades}笔交易</small>
+        </div></div></div>
+    </div>`;
+
+    // 对比基准
+    html += `<div class="row g-3 mb-3">
+        <div class="col-md-3"><div class="card bg-dark border-info"><div class="card-body">
+            <h6 class="text-info">基准（等权全市场）</h6>
+            <div>年化：<span class="text-warning">${fmt(m.benchmark_annual)}%</span></div>
+            <div>总收益：<span class="text-warning">${fmt(m.benchmark_total)}%</span></div>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark border-success"><div class="card-body">
+            <h6 class="text-success">超额Alpha</h6>
+            <div class="fs-4 text-${m.alpha >= 0 ? 'success' : 'danger'}">${m.alpha >= 0 ? '+' : ''}${fmt(m.alpha)}%</div>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark"><div class="card-body">
+            <h6 class="text-muted">Calmar比率</h6>
+            <div class="fs-4">${fmt(m.calmar)}</div>
+        </div></div></div>
+        <div class="col-md-3"><div class="card bg-dark"><div class="card-body">
+            <h6 class="text-muted">月度胜率</h6>
+            <div class="fs-4">${fmt(m.monthly_win_rate,1)}%</div>
+            <small class="text-muted">平均持仓${fmt(m.avg_hold_days,0)}天</small>
+        </div></div></div>
+    </div>`;
+
+    // 净值曲线（简易文本图）
+    const navCurve = data.nav_curve || [];
+    const benchCurve = data.benchmark || [];
+    if (navCurve.length > 1) {
+        html += '<div class="card bg-dark mb-3"><div class="card-body">';
+        html += '<h6><i class="bi bi-graph-up"></i> 净值曲线</h6>';
+        html += '<div class="d-flex gap-3 mb-2"><span class="text-success">■ 策略</span><span class="text-warning">■ 基准</span></div>';
+        html += '<canvas id="navChart" height="120"></canvas>';
+        html += '</div></div>';
+    }
+
+    // 交易明细
+    const trades = data.trades || [];
+    if (trades.length) {
+        html += `<div class="card bg-dark"><div class="card-body">
+            <h6><i class="bi bi-list-ul"></i> 交易明细（最近20笔）</h6>
+            <div class="table-responsive"><table class="table table-dark table-sm">
+            <thead><tr><th>日期</th><th>代码</th><th>方向</th><th>价格</th><th>股数</th><th>金额</th><th>盈亏</th><th>盈亏%</th><th>持仓</th><th>原因</th></tr></thead><tbody>`;
+        for (const t of trades.slice(-20).reverse()) {
+            const pnlCls = t.pnl >= 0 ? 'text-success' : 'text-danger';
+            const sideCls = t.side === 'buy' ? 'text-info' : 'text-warning';
+            html += `<tr>
+                <td>${t.date}</td><td>${t.symbol}</td>
+                <td class="${sideCls}">${t.side === 'buy' ? '买入' : '卖出'}</td>
+                <td>${fmt(t.price)}</td><td>${t.shares}</td><td>${fmt(t.amount,0)}</td>
+                <td class="${pnlCls}">${t.side === 'sell' ? (t.pnl >= 0 ? '+' : '') + fmt(t.pnl,0) : '-'}</td>
+                <td class="${pnlCls}">${t.side === 'sell' ? (t.pnl_pct >= 0 ? '+' : '') + fmt(t.pnl_pct) + '%' : '-'}</td>
+                <td>${t.hold_days}天</td><td><small>${t.reason}</small></td>
+            </tr>`;
+        }
+        html += '</tbody></table></div>';
+        html += `<small class="text-muted">共${trades.length}笔交易（买${trades.filter(t=>t.side==='buy').length} 卖${trades.filter(t=>t.side==='sell').length}）</small>`;
+        html += '</div></div>';
+    }
+
+    // 配置参数
+    html += `<details class="mt-3"><summary class="text-muted">回放配置</summary><pre class="text-muted small mt-2">${JSON.stringify(cfg, null, 2)}</pre></details>`;
+
+    document.getElementById('result-area').innerHTML = html;
+
+    // 绘制净值曲线
+    if (navCurve.length > 1) drawChart(navCurve, benchCurve);
+}
+
+function drawChart(navCurve, benchCurve) {
+    const canvas = document.getElementById('navChart');
+    if (!canvas || !canvas.getContext) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.offsetWidth;
+    const h = canvas.height = 120;
+    ctx.clearRect(0, 0, w, h);
+
+    const allNavs = [...navCurve.map(d=>d.nav), ...benchCurve.map(d=>d.nav)];
+    const minV = Math.min(...allNavs);
+    const maxV = Math.max(...allNavs);
+    const range = maxV - minV || 1;
+    const n = navCurve.length;
+
+    function draw(data, color) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        data.forEach((d, i) => {
+            const x = (i / (n - 1)) * w;
+            const y = h - ((d.nav - minV) / range) * (h - 10) - 5;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }
+    draw(navCurve, '#28a745');
+    draw(benchCurve, '#ffc107');
+}
+
+async function runSweep() {
+    document.getElementById('sweepBtn').disabled = true;
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('intro-area').classList.add('d-none');
+    document.getElementById('loading-area').classList.remove('d-none');
+    document.getElementById('progress-text').textContent = '参数扫描中…预计算选股+遍历12组参数';
+
+    try {
+        const resp = await fetch('/api/paper/sweep-async', {method: 'POST'});
+        const data = await resp.json();
+        if (data.task_id) await pollSweep(data.task_id);
+    } catch(e) {
+        document.getElementById('loading-area').classList.add('d-none');
+        document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">${e}</div>`;
+        document.getElementById('sweepBtn').disabled = false;
+        document.getElementById('runBtn').disabled = false;
+    }
+}
+
+async function pollSweep(taskId) {
+    const maxWait = 300000;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+            const resp = await fetch(`/api/tasks/${taskId}`);
+            const data = await resp.json();
+            if (data.status === 'done' && data.result_data) {
+                document.getElementById('loading-area').classList.add('d-none');
+                renderSweep(data.result_data);
+                document.getElementById('sweepBtn').disabled = false;
+                document.getElementById('runBtn').disabled = false;
+                return;
+            }
+            if (data.status === 'error') throw new Error(data.error || '扫描失败');
+            if (data.progress_msg) document.getElementById('progress-text').textContent = data.progress_msg;
+        } catch(e) {
+            document.getElementById('loading-area').classList.add('d-none');
+            document.getElementById('result-area').innerHTML = `<div class="alert alert-danger">${e}</div>`;
+            document.getElementById('sweepBtn').disabled = false;
+            document.getElementById('runBtn').disabled = false;
+            return;
+        }
+    }
+    document.getElementById('loading-area').classList.add('d-none');
+    document.getElementById('result-area').innerHTML = '<div class="alert alert-warning">超时</div>';
+    document.getElementById('sweepBtn').disabled = false;
+    document.getElementById('runBtn').disabled = false;
+}
+
+function renderSweep(data) {
+    const configs = data.configs || [];
+    const best = data.best || {};
+    const baseline = data.baseline || {};
+    const period = data.period || {};
+
+    let html = '<h4><i class="bi bi-tuning"></i> 参数扫描结果</h4>';
+    html += `<p class="text-muted">区间 ${period.start}~${period.end}（${period.days}天），采样${data.sample_size||0}只，预计算${data.selections_computed||0}个截面</p>`;
+
+    // 最优 vs 基线对比
+    html += `<div class="row g-3 mb-3">
+        <div class="col-md-6"><div class="card bg-dark border-success"><div class="card-body">
+            <h6 class="text-success"><i class="bi bi-trophy"></i> 最优参数（夏普排序）</h6>
+            <div>年化：<b class="text-success">${best.annual_return||'-'}%</b> | 夏普：<b>${best.sharpe||'-'}</b></div>
+            <div>回撤：${best.max_drawdown||'-'}% | 胜率：${best.win_rate||'-'}%</div>
+            <div class="small text-muted mt-1">
+                止损${best.stop_loss}% | 止盈${best.take_profit||'∞'}% | 移动${best.trailing_stop}% |
+                调仓${best.rebalance_interval}天 | ${best.max_holdings}只 | 仓位${(best.max_total_pct*100).toFixed(0)}%
+            </div>
+        </div></div></div>
+        <div class="col-md-6"><div class="card bg-dark border-warning"><div class="card-body">
+            <h6 class="text-warning"><i class="bi bi-arrow-repeat"></i> 当前基线参数</h6>
+            <div>年化：<b class="text-warning">${baseline.annual_return||'-'}%</b> | 夏普：<b>${baseline.sharpe||'-'}</b></div>
+            <div>回撤：${baseline.max_drawdown||'-'}% | 胜率：${baseline.win_rate||'-'}%</div>
+            <div class="small text-muted mt-1">
+                止损${baseline.stop_loss}% | 止盈${baseline.take_profit||'∞'}% | 移动${baseline.trailing_stop}% |
+                调仓${baseline.rebalance_interval}天 | ${baseline.max_holdings}只 | 仓位${(baseline.max_total_pct*100).toFixed(0)}%
+            </div>
+        </div></div></div>
+    </div>`;
+
+    // 参数对比表
+    html += '<div class="card bg-dark"><div class="card-body">';
+    html += '<h6><i class="bi bi-table"></i> 全部参数组合对比（按夏普降序）</h6>';
+    html += '<div class="table-responsive"><table class="table table-dark table-sm">';
+    html += '<thead><tr><th>#</th><th>止损%</th><th>止盈%</th><th>移动%</th><th>调仓天</th><th>持仓</th><th>仓位%</th>';
+    html += '<th class="text-end">年化%</th><th class="text-end">回撤%</th><th class="text-end">夏普</th>';
+    html += '<th class="text-end">Calmar</th><th class="text-end">胜率%</th><th class="text-end">交易</th></tr></thead><tbody>';
+
+    configs.forEach((c, i) => {
+        const isBest = c.config_id === best.config_id;
+        const isBase = c.config_id === baseline.config_id;
+        const rowCls = isBest ? 'table-success' : (isBase ? 'table-warning' : '');
+        const tag = isBest ? '🏆' : (isBase ? '📍基线' : '');
+        html += `<tr class="${rowCls}">
+            <td>${i+1} ${tag}</td>
+            <td>${c.stop_loss}</td>
+            <td>${c.take_profit || '∞'}</td>
+            <td>${c.trailing_stop}</td>
+            <td>${c.rebalance_interval}</td>
+            <td>${c.max_holdings}</td>
+            <td>${(c.max_total_pct*100).toFixed(0)}</td>
+            <td class="text-end ${c.annual_return>=0?'text-success':'text-danger'}">${c.annual_return>=0?'+':''}${c.annual_return||'-'}</td>
+            <td class="text-end text-warning">${c.max_drawdown||'-'}</td>
+            <td class="text-end fw-bold">${c.sharpe||'-'}</td>
+            <td class="text-end">${c.calmar||'-'}</td>
+            <td class="text-end">${c.win_rate||'-'}</td>
+            <td class="text-end">${c.total_trades||0}</td>
+        </tr>`;
+    });
+    html += '</tbody></table></div>';
+    html += '<small class="text-muted">🏆=夏普最优 📍=当前基线参数。止盈∞=不主动止盈，只靠止损/超时退出。</small>';
+    html += '</div></div>';
+
+    document.getElementById('result-area').innerHTML = html;
+}
+
+</script>
+{% endblock %}

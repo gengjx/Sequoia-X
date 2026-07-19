@@ -36,12 +36,15 @@ async def get_task(task_id: str, request: Request):
     return {
         "task_id": record.task_id,
         "strategy_key": record.strategy_key,
-        "status": record.status,
+        "status": record.status.value if hasattr(record.status, 'value') else record.status,
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "finished_at": record.finished_at.isoformat() if record.finished_at else None,
         "result_count": len(record.results),
         "results": record.results,
         "error": record.error,
+        "progress": record.progress,
+        "progress_msg": record.progress_msg,
+        "result_data": record.result_data,
     }
 
 
@@ -134,6 +137,72 @@ async def strategy_evaluate(request: Request):
     import asyncio
     services = request.app.state.services
     return await asyncio.to_thread(services.evaluate_strategies)
+
+
+@router.post("/backtest/validate-async")
+async def backtest_validate_async(request: Request):
+    """回测可信度验证：Walk-forward + 参数敏感性 + Bootstrap + PSR。
+
+    完整验证约2-5分钟，异步执行。
+    """
+    services = request.app.state.services
+
+    existing = services.has_running_task("backtest_validate")
+    if existing:
+        return {"task_id": existing, "poll_url": f"/api/task/{existing}/status",
+                "message": "已有验证任务正在执行"}
+
+    def _run_validation():
+        from sequoia_x.analysis.strategy_eval import StrategyEvaluator
+        from sequoia_x.analysis.backtest_validation import BacktestValidator
+
+        svc = services
+        ev = StrategyEvaluator(svc.engine, svc.settings)
+        validator = BacktestValidator(ev)
+        return validator.validate_all(sample_size=300, hold_days=20)
+
+    task_id = services.submit_task("backtest_validate", _run_validation)
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
+@router.get("/portfolio/risk")
+async def portfolio_risk(request: Request):
+    """组合风控分析：Beta + 集中度 + VaR + 回撤。"""
+    import asyncio
+    services = request.app.state.services
+
+    def _run():
+        from sequoia_x.analysis.portfolio_risk import PortfolioRiskMonitor
+        # 获取现金
+        import sqlite3
+        with sqlite3.connect(services.engine.db_path) as conn:
+            row = conn.execute(
+                "SELECT cash FROM paper_account WHERE id=1"
+            ).fetchone()
+        cash = row[0] if row else 0
+        monitor = PortfolioRiskMonitor(services.engine.db_path)
+        report = monitor.analyze(cash=cash)
+        return report.to_dict()
+
+    return await asyncio.to_thread(_run)
+
+
+@router.post("/ml-factor/evaluate-async")
+async def ml_factor_evaluate_async(request: Request):
+    """ML因子评估：Ridge因子合成，约30-60秒。"""
+    services = request.app.state.services
+
+    existing = services.has_running_task("ml_factor")
+    if existing:
+        return {"task_id": existing, "poll_url": f"/api/task/{existing}/status",
+                "message": "已有ML因子评估在执行"}
+
+    def _run_ml():
+        svc = services
+        return svc.evaluate_ml_factor()
+
+    task_id = services.submit_task("ml_factor", _run_ml)
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
 
 
 @router.get("/factor/weights")
@@ -444,8 +513,9 @@ async def delete_position(hid: int, request: Request):
 @router.post("/positions/scan")
 async def scan_positions(request: Request, apply_stop_move: bool = False):
     """扫描所有持仓，返回移动止损/减仓/止盈信号 + 组合摘要。"""
+    import asyncio
     services = request.app.state.services
-    return services.scan_positions(apply_stop_move=apply_stop_move)
+    return await asyncio.to_thread(services.scan_positions, apply_stop_move)
 
 
 @router.get("/positions/intraday")
@@ -713,23 +783,51 @@ async def paper_auto_run_async(request: Request):
     import asyncio
     services = request.app.state.services
 
+    # ── 互斥保护：已有闭环在跑则直接返回已有 task_id ──
+    existing = services.has_running_task("paper_auto_run")
+    if existing:
+        return {
+            "task_id": existing,
+            "poll_url": f"/api/task/{existing}/status",
+            "message": "已有闭环任务正在执行，复用同一任务",
+        }
+
     def _full_cycle():
         """在后台线程中同步执行完整闭环。"""
-        pos_signals = services.scan_positions(False)
-        sell_result = services.paper_auto_sell(pos_signals.get("signals", []))
-        decision = services.generate_decision(
+        svc = services
+        svc.update_task_progress("paper_auto_run", 10, "同步持仓...")
+        # 同步 paper_holdings → portfolio_holding（PositionTracker 读后者）
+        svc.sync_paper_to_portfolio()
+        svc.update_task_progress("paper_auto_run", 15, "持仓扫描中...")
+        pos_signals = svc.scan_positions(False)
+
+        svc.update_task_progress("paper_auto_run", 20, "自动卖出检查...")
+        sell_result = svc.paper_auto_sell(pos_signals.get("signals", []))
+
+        svc.update_task_progress("paper_auto_run", 30, "全策略决策中（最慢步骤）...")
+        decision = svc.generate_decision(
             None, 100000, 50, None, True, 60, False
         )
-        buy_result = services.paper_auto_buy(decision)
-        nav_result = services.paper_record_nav()
-        perf = services.paper_performance()
+
+        svc.update_task_progress("paper_auto_run", 75, "自动买入执行...")
+        buy_result = svc.paper_auto_buy(decision)
+
+        # 买入后再同步一次：paper_holdings → portfolio_holding（确保持仓跟踪拿到最新数据）
+        svc.sync_paper_to_portfolio()
+
+        svc.update_task_progress("paper_auto_run", 85, "记录净值快照...")
+        nav_result = svc.paper_record_nav()
+
+        svc.update_task_progress("paper_auto_run", 92, "计算绩效...")
+        perf = svc.paper_performance()
         result = {
             "sell": sell_result,
             "nav": nav_result,
             "decision": {
                 "buy_list_count": len(decision.get("buy_list", [])),
-                "pool_size": decision.get("pool_size", 0),
-                "market_state": decision.get("market_state", {}),
+                "buy_list": decision.get("buy_list", []),
+                "decision_summary": decision.get("summary"),
+                "strategies": decision.get("strategies_run"),
             },
             "buy": buy_result,
             "performance": vars(perf),
@@ -883,6 +981,7 @@ async def task_status(request: Request, task_id: str):
         "elapsed": record.elapsed_sec,
         "started_at": record.started_at.isoformat() if record.started_at else None,
         "error": record.error,
+        "result_data": record.result_data,
     }
 
 
@@ -949,4 +1048,100 @@ async def factor_eval_async(request: Request):
         body.get("sample_size", 500),
         body.get("rolling_months"),
     )
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+@router.post("/attribution/run-async")
+async def attribution_run_async(request: Request):
+    """收益归因分析：分解多因子策略超额收益来源。
+
+    采样500只×1336交易日，约1-2分钟，异步执行。
+    """
+    services = request.app.state.services
+
+    existing = services.has_running_task("attribution")
+    if existing:
+        return {"task_id": existing, "poll_url": f"/api/task/{existing}/status",
+                "message": "已有归因分析正在执行"}
+
+    def _run_attribution():
+        from sequoia_x.analysis.attribution import AttributionAnalyzer
+        analyzer = AttributionAnalyzer(services.engine, services.settings)
+        return analyzer.analyze(hold_days=20, sample_size=500)
+
+    task_id = services.submit_task("attribution", _run_attribution)
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
+@router.post("/paper/replay-async")
+async def paper_replay_async(request: Request):
+    """模拟盘历史回放：用完整日K数据逐日重放多因子选股+持仓管理。
+
+    回放约1-3分钟（取决于区间长度），异步执行。
+    """
+    services = request.app.state.services
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    existing = services.has_running_task("paper_replay")
+    if existing:
+        return {"task_id": existing, "poll_url": f"/api/task/{existing}/status",
+                "message": "已有回放任务正在执行"}
+
+    start_date = body.get("start_date", "")
+    end_date = body.get("end_date", "")
+    initial_capital = body.get("initial_capital", 100000)
+    sample_size = body.get("sample_size", 500)
+
+    def _run_replay():
+        from sequoia_x.analysis.paper_replay import PaperReplayEngine
+        engine = PaperReplayEngine(services.engine.db_path)
+
+        def _progress(cur, total, msg):
+            services.update_task_progress("paper_replay", int(cur / total * 100), msg)
+
+        result = engine.replay(
+            start_date=start_date, end_date=end_date,
+            initial_capital=initial_capital, sample_size=sample_size,
+            progress_callback=_progress,
+        )
+
+        # 闭环2：回放交易明细反馈因子权重
+        try:
+            feedback = engine.feedback_factor_weights(result.get("trades", []))
+            result["weight_feedback"] = feedback
+        except Exception as e:
+            result["weight_feedback"] = []
+
+        return result
+
+    task_id = services.submit_task("paper_replay", _run_replay)
+    return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}
+
+
+@router.post("/paper/sweep-async")
+async def paper_sweep_async(request: Request):
+    """参数扫描：预计算选股截面一次，遍历止损/止盈/调仓/仓位组合找最优参数。"""
+    services = request.app.state.services
+
+    existing = services.has_running_task("paper_sweep")
+    if existing:
+        return {"task_id": existing, "poll_url": f"/api/task/{existing}/status",
+                "message": "已有扫描任务正在执行"}
+
+    def _run_sweep():
+        from sequoia_x.analysis.paper_replay import PaperReplayEngine
+        engine = PaperReplayEngine(services.engine.db_path)
+
+        def _progress(cur, total, msg):
+            services.update_task_progress("paper_sweep", cur, msg)
+
+        return engine.sweep(
+            start_date="", end_date="", initial_capital=100000,
+            sample_size=300, progress_callback=_progress,
+        )
+
+    task_id = services.submit_task("paper_sweep", _run_sweep)
     return {"task_id": task_id, "poll_url": f"/api/task/{task_id}/status"}

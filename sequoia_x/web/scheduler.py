@@ -28,7 +28,7 @@ class AuctionScheduler:
     # 定时任务表：(hour, minute, task_name)
     SCHEDULE = [
         (9, 25, "auction_scan"),
-        (9, 30, "intraday_scan_start"),  # 启动盘中轮询
+        (9, 30, "intraday_scan_start"),  # 启动盘中持仓监控
         (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
         (21, 5, "sync_lhb"),         # 龙虎榜数据同步（紧跟日K之后）
         (21, 6, "sync_fund_flow"),   # 主力资金流向同步
@@ -37,6 +37,7 @@ class AuctionScheduler:
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
         (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
         (22, 0, "daily_report"),  # 每日任务执行汇总 → 飞书推送
+        (22, 30, "monthly_sweep"),  # 每月1号参数扫描验证（非1号自动跳过）
     ]
 
     def __init__(self, settings: Settings, db_path: str) -> None:
@@ -157,17 +158,26 @@ class AuctionScheduler:
         self._stop.set()
 
     def _loop(self) -> None:
+        from datetime import timedelta as _td
         while not self._stop.is_set():
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
+            today = datetime.now().strftime("%Y-%m-%d")
 
             for hour, minute, task in self.SCHEDULE:
                 key = f"{task}_{today}"
                 if self._last_run.get(key):
                     continue
-                # 命中调度时间窗口（±10分钟容忍，避免错过）
-                if now.hour == hour and abs(now.minute - minute) <= 10:
-                    if self._is_trading_day(today):
+                # 每个任务独立刷新now（前序长任务可能阻塞数十分钟）
+                now = datetime.now()
+                sched_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                in_window = now.hour == hour and abs(now.minute - minute) <= 10
+                # 补跑：任务时间已过>10min但今日未执行（被前序长任务阻塞）
+                # 排除时效性任务（竞价扫描/盘中轮询不应补跑）
+                is_overdue = (
+                    now > sched_dt + _td(minutes=10)
+                    and task not in ("auction_scan", "intraday_scan_start")
+                    and now < sched_dt + _td(hours=2)
+                )
+                if (in_window or is_overdue) and self._is_trading_day(today):
                         logger.info(f"触发定时任务：{task}")
                         t_start = time.time()
                         started_at = now.strftime("%H:%M:%S")
@@ -219,6 +229,8 @@ class AuctionScheduler:
             self._refresh_factor_ic()
         elif task == "daily_report":
             self._daily_report()
+        elif task == "monthly_sweep":
+            self._monthly_sweep()
 
     def _run_task_with_result(self, task: str) -> str:
         """执行任务并返回结果摘要（供日志记录）。"""
@@ -239,11 +251,14 @@ class AuctionScheduler:
             logger.info(f"竞价扫描完成并推送：A{result.get('grade_a',0)} B{result.get('grade_b',0)}")
 
     def _sync_daily(self) -> None:
-        """日K数据自动同步。"""
+        """日K数据自动同步：东财批量优先(3秒)，baostock兜底。"""
         from sequoia_x.data.engine import DataEngine
         try:
             engine = DataEngine(self.settings)
-            n = engine.sync_today_bulk()
+            n = engine.sync_today_eastmoney()
+            if n < 100:
+                logger.warning(f"东财增量仅{n}只，切换baostock兜底...")
+                n = engine.sync_today_bulk()
             logger.info(f"定时数据同步完成：写入 {n} 只")
         except Exception as e:
             logger.warning(f"定时数据同步失败：{e!r}")
@@ -261,6 +276,44 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"龙虎榜同步失败：{e!r}")
 
+    def _monthly_sweep(self) -> None:
+        """闭环3：每月1号自动跑参数扫描，验证当前参数是否仍最优。
+
+        非每月1号自动跳过。扫描结果写入DB日志，如最优参数变化则飞书通知。
+        """
+        today = datetime.now()
+        if today.day != 1:
+            return  # 非每月1号跳过
+
+        logger.info("月度参数扫描：开始验证当前模拟盘参数是否仍最优...")
+        try:
+            from sequoia_x.analysis.paper_replay import PaperReplayEngine
+            engine = PaperReplayEngine(self.db_path)
+            result = engine.sweep(sample_size=300, progress_callback=None)
+
+            best = result.get("best", {})
+            baseline = result.get("baseline", {})
+
+            # 如果最优参数与当前基线差异大，飞书通知
+            sharpe_diff = best.get("sharpe", 0) - baseline.get("sharpe", 0)
+            if sharpe_diff > 0.3:
+                from sequoia_x.notify.feishu import FeishuNotifier
+                notifier = FeishuNotifier(self.settings)
+                notifier.send(
+                    f"📊 月度参数扫描完成\n"
+                    f"当前参数夏普: {baseline.get('sharpe', '?')}\n"
+                    f"最优参数夏普: {best.get('sharpe', '?')}\n"
+                    f"提升: +{sharpe_diff:.2f}\n"
+                    f"建议参数: 止损{best.get('stop_loss')}% 止盈{best.get('take_profit', '∞')}% "
+                    f"调仓{best.get('rebalance_interval')}天\n"
+                    f"年化: {baseline.get('annual_return', '?')}% → {best.get('annual_return', '?')}%"
+                )
+                logger.info(f"月度扫描：发现更优参数，已飞书通知（夏普+{sharpe_diff:.2f}）")
+            else:
+                logger.info(f"月度扫描：当前参数仍接近最优（夏普差{sharpe_diff:.2f}），无需调整")
+        except Exception as e:
+            logger.warning(f"月度参数扫描失败：{e!r}")
+
     def _daily_report(self) -> str:
         """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
         from sequoia_x.notify.feishu import FeishuNotifier
@@ -275,7 +328,7 @@ class AuctionScheduler:
             # 任务中文名映射
             name_map = {
                 "auction_scan": "竞价扫描",
-                "intraday_scan_start": "盘中信号轮询",
+                "intraday_scan_start": "盘中持仓监控",
                 "sync_daily": "日K同步",
                 "sync_lhb": "龙虎榜同步",
                 "sync_fund_flow": "资金流向同步",
@@ -349,7 +402,7 @@ class AuctionScheduler:
             from sequoia_x.analysis.factor import evaluate_factor_ic
             engine = DataEngine(self.settings)
             result = evaluate_factor_ic(
-                engine, hold_days=20, sample_size=500, rolling_months=6
+                engine, hold_days=20, sample_size=500, rolling_months=12
             )
             factors = result.get("factors", [])
             effective = [f for f in factors if abs(f.get("ic_mean", 0)) > 0.015
@@ -432,15 +485,19 @@ class AuctionScheduler:
             pos_result = services.scan_positions(apply_stop_move=False)
             sell_result = services.paper_auto_sell(pos_result.get("signals", []))
 
-            # Step2: 全策略决策
+            # Step2: 多因子为核心的决策（废弃策略已自动排除）
+            from sequoia_x.web.services import ALL_ACTIVE_KEYS
             decision = services.generate_decision(
-                strategy_keys=None, capital=100000, min_score=50,
+                strategy_keys=ALL_ACTIVE_KEYS, capital=100000, min_score=50,
                 exclude_markets=None, exclude_st=True,
                 max_candidates=60, include_auction=False,
             )
 
             # Step3: 自动买入
             buy_result = services.paper_auto_buy(decision)
+
+            # 买入后同步：paper_holdings → portfolio_holding
+            services.sync_paper_to_portfolio()
 
             # Step4: 记录日度净值
             try:
@@ -468,16 +525,51 @@ class AuctionScheduler:
                 notifier.send_text(summary)
             except Exception:
                 pass
+
+            # 记录每日决策快照到 paper_decision_log
+            try:
+                import sqlite3 as _sql
+                from datetime import datetime as _dt
+                today_str = _dt.now().strftime("%Y-%m-%d")
+                now_str = _dt.now().isoformat()
+                ms = decision.get("market_state", {})
+                bought_syms = ",".join([b.get("symbol", "") for b in (buy_result.get("bought") or [])])
+                with _sql.connect(self.db_path) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO paper_decision_log "
+                        "(run_date, market_state, market_score, pool_size, buy_count, bought_stocks, "
+                        "sell_count, total_assets, total_return_pct, reason, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            today_str,
+                            ms.get("state", ""),
+                            ms.get("score", 0),
+                            decision.get("pool_size", 0),
+                            len(buy_result.get("bought") or []),
+                            bought_syms,
+                            len(sell_result.get("sold") or []),
+                            perf.total_assets,
+                            perf.total_return_pct,
+                            buy_result.get("reason", ""),
+                            now_str,
+                        ),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+
             logger.info(f"模拟盘执行完成：买{len(buy_result.get('bought',[]))} 卖{len(sell_result.get('sold',[]))} 收益{perf.total_return_pct}%")
         except Exception as e:
             logger.warning(f"模拟盘自动执行失败：{e!r}")
 
     def _intraday_loop(self) -> None:
-        """盘中信号轮询：9:30-15:00 每60秒扫描关注池。"""
-        from sequoia_x.analysis.intraday_scanner import IntradayScanner
+        """盘中持仓监控：9:30-15:00 每60秒扫描模拟盘持仓，触发止损/止盈/减仓。
+
+        已移除关注池信号扫描（IntradayScanner），仅保留持仓盯盘+自动卖出。
+        原因：关注池扫描消耗大量东财请求且信号质量低，盘中核心需求是持仓风控。
+        """
         from sequoia_x.notify.feishu import FeishuNotifier
         try:
-            scanner = IntradayScanner(self.db_path)
             notifier = FeishuNotifier(self.settings)
             count = 0
             while not self._stop.is_set():
@@ -490,33 +582,76 @@ class AuctionScheduler:
                         break  # 收盘退出
                     self._stop.wait(60)
                     continue
-                try:
-                    signals = scanner.scan_once(notifier=notifier)
-                    count += len(signals)
-                except Exception as e:
-                    logger.warning(f"盘中扫描异常：{e!r}")
 
-                # 持仓盘中盯盘（每轮同步扫描，复用同一循环）
+                # 持仓盘中盯盘：止损/止盈/减仓 → 自动卖出 + 飞书推送
                 try:
                     self._position_monitor(notifier)
+                    count += 1
                 except Exception as e:
                     logger.warning(f"持仓监控异常：{e!r}")
 
                 self._stop.wait(60)  # 每60秒一轮
-            logger.info(f"盘中轮询结束，累计推送信号 {count} 个")
+            logger.info(f"盘中持仓监控结束，共执行 {count} 轮")
         except Exception as e:
-            logger.warning(f"盘中轮询启动失败：{e!r}")
+            logger.warning(f"盘中持仓监控启动失败：{e!r}")
 
     def _position_monitor(self, notifier=None) -> None:
-        """持仓盘中实时盯盘：批量快照 + 实时MA + 信号推送。"""
+        """持仓盘中实时盯盘：批量快照 + 实时MA + 信号推送 + 自动卖出。
+
+        danger 信号（止损清仓/止盈/减仓）→ 自动执行模拟盘卖出 + 飞书推送。
+        """
         from sequoia_x.analysis.position import PositionTracker
         try:
             from sequoia_x.data.engine import DataEngine
+            from sequoia_x.analysis.paper_trade import PaperTradeEngine
             engine = DataEngine(self.settings)
             tracker = PositionTracker(engine, self.settings)
             signals = tracker.scan_intraday(notifier=notifier)
-            danger = [s for s in signals if s.signal_level == "danger"]
-            if danger:
-                logger.warning(f"持仓盘中预警：{len(danger)}只触发止损/清仓信号")
+            # danger=止损/止盈（清仓），warn=弱信号（减仓）
+            danger = [s for s in signals if s.signal_level in ("danger", "warn")
+                       and s.action not in ("持有", "数据缺失", "移动止损")]
+            if not danger:
+                return
+
+            logger.warning(f"持仓盘中预警：{len(danger)}只触发止损/清仓信号")
+
+            # ── 盘中实时卖出：danger 信号 → 模拟盘执行 ──
+            sell_signals = []
+            for sig in danger:
+                action = sig.action
+                if action in ("止损清仓", "止盈", "减仓/清仓", "减仓半仓"):
+                    sell_signals.append({
+                        "symbol": sig.symbol,
+                        "action": action,
+                        "shares": sig.shares,
+                        "new_stop": sig.new_stop,
+                        "reasons": sig.reasons,
+                        "realtime_price": getattr(sig, "price", 0),
+                    })
+
+            if sell_signals:
+                pe = PaperTradeEngine(self.settings)
+                result = pe.auto_sell_intraday(sell_signals)
+                if result.get("sold"):
+                    sold_list = result["sold"]
+                    logger.info(f"盘中实时卖出执行：{len(sold_list)}笔")
+                    # 同步 paper_holdings → portfolio_holding（保持两表一致）
+                    try:
+                        from sequoia_x.data.engine import DataEngine as _DE
+                        from sequoia_x.web.services import WebServices as _WS
+                        _svc = _WS(self.settings, _DE(self.settings))
+                        _svc.sync_paper_to_portfolio()
+                    except Exception:
+                        pass
+                    # 飞书推送卖出结果
+                    if notifier:
+                        for s in sold_list:
+                            notifier.send(
+                                f"🔴 盘中实时卖出 `{s['symbol']}`\n"
+                                f"▶ 卖出价 {s['price']}\n"
+                                f"▶ {s['shares']}股 金额{s['amount']:.0f}元\n"
+                                f"▶ 盈亏{s.get('pnl',0):+.0f}({s.get('pnl_pct',0):+.1f}%)\n"
+                                f"▶ 原因：{', '.join(s.get('reasons', [])[:2])}"
+                            )
         except Exception as e:
             logger.warning(f"持仓监控失败：{e!r}")

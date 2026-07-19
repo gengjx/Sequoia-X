@@ -8,6 +8,10 @@
         <button class="btn btn-primary btn-sm" onclick="runFactorEval()" id="btn-factor">
             <i class="bi bi-play-fill"></i> 运行因子评估
         </button>
+        <button class="btn btn-success btn-sm ms-2" onclick="runMLFactor()" id="btn-ml">
+            <i class="bi bi-cpu"></i> ML因子合成
+        </button>
+        <div id="ml-result" class="ms-2 small"></div>
         <span class="text-muted small ms-3" id="factor-meta"></span>
     </div>
     <div class="alert alert-info small mb-3">
@@ -139,6 +143,29 @@ function renderFactorEval(data) {
             });
         }
     }
+}
+
+async function runMLFactor() {
+    const btn = document.getElementById('btn-ml');
+    const result = document.getElementById('ml-result');
+    btn.disabled = true;
+    result.innerHTML = '<span class="spinner-border spinner-border-sm"></span> ML因子合成中…约30秒';
+    try {
+        const { task_id } = await api('/api/ml-factor/evaluate-async', { method: 'POST' });
+        const r = await pollTask(task_id);
+        if (r.status === 'done' && r.result_data) {
+            const d = r.result_data;
+            const icon = d.valid ? '✅' : '❌';
+            result.innerHTML = icon + ' ML因子 IC=' + d.ic_mean + ' ICIR=' + d.icir + ' 胜率=' + d.win_rate + '% (' + d.n_months + '月验证)';
+            if (d.valid) showToast('ML因子有效！IC=' + d.ic_mean + ' 已写入因子库');
+            else showToast('ML因子IC不足', 'warning');
+        } else {
+            result.innerHTML = '<span class="text-danger">失败: ' + (r.error||'未知') + '</span>';
+        }
+    } catch(e) {
+        result.innerHTML = '<span class="text-danger">请求失败: ' + e.message + '</span>';
+    }
+    btn.disabled = false;
 }
 </script>
 {% endblock %}

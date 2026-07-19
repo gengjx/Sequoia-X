@@ -40,14 +40,18 @@ function showToast(message, type = 'success') {
 /**
  * 轮询任务状态直到完成
  */
-async function pollTask(taskId, onProgress) {
+async function pollTask(taskId, onProgress, timeoutMs = 180000) {
+    const start = Date.now();
     while (true) {
         const data = await api(`/api/tasks/${taskId}`);
         if (onProgress) onProgress(data);
         if (data.status === 'done' || data.status === 'error') {
             return data;
         }
-        await new Promise(r => setTimeout(r, 1500));
+        if (Date.now() - start > timeoutMs) {
+            return { status: 'error', error: '任务超时（3分钟）' };
+        }
+        await new Promise(r => setTimeout(r, 2000));
     }
 }
 
