@@ -20,18 +20,7 @@ from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.notify.feishu import FeishuNotifier
-from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
-from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
-from sequoia_x.strategy.dragon_head import DragonHeadStrategy
-from sequoia_x.strategy.volume_extreme import VolumeExtremeStrategy
-from sequoia_x.strategy.bottom_volume import BottomVolumeStrategy
+from sequoia_x.strategy.registry import STRATEGY_REGISTRY, STRATEGY_META, RETIRED_STRATEGY_KEYS
 
 
 def _run_web(args: argparse.Namespace) -> None:
@@ -89,20 +78,17 @@ def main() -> None:
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 只股票")
 
-        # 4. 策略列表（新增策略在此追加即可）
-        strategies: list[BaseStrategy] = [
-            MaVolumeStrategy(engine=engine, settings=settings),
-            TurtleTradeStrategy(engine=engine, settings=settings),
-            HighTightFlagStrategy(engine=engine, settings=settings),
-            LimitUpShakeoutStrategy(engine=engine, settings=settings),
-            UptrendLimitDownStrategy(engine=engine, settings=settings),
-            RpsBreakoutStrategy(engine=engine, settings=settings),
-            PrivatePlacementStrategy(engine=engine, settings=settings),
-            ShrinkPullbackStrategy(engine=engine, settings=settings),
-            DragonHeadStrategy(engine=engine, settings=settings),
-            BottomVolumeStrategy(engine=engine, settings=settings),
-            VolumeExtremeStrategy(engine=engine, settings=settings),
+        # 4. 策略列表：从注册中心取所有非 retired 策略（含此前漏推的 core 策略）
+        # 新增策略只需 @register_strategy 装饰，无需改动此处
+        strategies = [
+            cls(engine=engine, settings=settings)
+            for key, cls in STRATEGY_REGISTRY.items()
+            if key not in RETIRED_STRATEGY_KEYS
         ]
+        logger.info(
+            f"待推送策略 {len(strategies)} 个："
+            f"{[k for k in STRATEGY_REGISTRY if k not in RETIRED_STRATEGY_KEYS]}"
+        )
 
         notifier = FeishuNotifier(settings)
 

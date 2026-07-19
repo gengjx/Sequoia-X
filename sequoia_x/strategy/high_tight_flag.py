@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("flag")
 class HighTightFlagStrategy(BaseStrategy):
     """高旗形整理策略。
 
@@ -20,7 +22,6 @@ class HighTightFlagStrategy(BaseStrategy):
         webhook_key: 路由到 'flag' 专属飞书机器人。
     """
 
-    webhook_key: str = "flag"
     _MIN_BARS: int = 40  # 至少需要 40 根 K 线
 
     def run(self) -> list[str]:

@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("pullback")
 class ShrinkPullbackStrategy(BaseStrategy):
     """缩量回踩选股策略。
 
@@ -26,7 +28,6 @@ class ShrinkPullbackStrategy(BaseStrategy):
         webhook_key: 路由到 'pullback' 专属飞书机器人。
     """
 
-    webhook_key: str = "pullback"
     _MIN_BARS: int = 20  # 至少需要 20 根 K 线（MA20 + 5日量窗）
 
     def run(self) -> list[str]:

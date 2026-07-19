@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("turtle")
 class TurtleTradeStrategy(BaseStrategy):
     """海龟交易策略（A股防诱多改良版）。
 
@@ -20,7 +22,6 @@ class TurtleTradeStrategy(BaseStrategy):
         webhook_key: 路由到 'turtle' 专属飞书机器人。
     """
 
-    webhook_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:

@@ -6,6 +6,7 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
@@ -13,6 +14,7 @@ _BOARD_TABLE = "stock_board_em"
 _MARKET_CAP_TABLE = "stock_market_cap"
 
 
+@register_strategy("dragon")
 class DragonHeadStrategy(BaseStrategy):
     """龙头选股策略。
 
@@ -32,7 +34,6 @@ class DragonHeadStrategy(BaseStrategy):
         webhook_key: 路由到 'dragon' 专属飞书机器人。
     """
 
-    webhook_key: str = "dragon"
     _MIN_BARS: int = 2
     _TOP_BOARDS: int = 10  # 取领涨板块数
     _TOP_STOCKS_PER_BOARD: int = 3  # 每板块取龙头数

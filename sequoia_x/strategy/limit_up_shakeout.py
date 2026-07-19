@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("shakeout")
 class LimitUpShakeoutStrategy(BaseStrategy):
     """涨停洗盘策略。
 
@@ -21,7 +23,6 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         webhook_key: 路由到 'shakeout' 专属飞书机器人。
     """
 
-    webhook_key: str = "shakeout"
     _MIN_BARS: int = 3  # 至少需要 3 根 K 线（前日、昨日、今日）
 
     def run(self) -> list[str]:

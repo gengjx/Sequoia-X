@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("ma_volume")
 class MaVolumeStrategy(BaseStrategy):
     """均线+成交量选股策略。
 
@@ -19,7 +21,6 @@ class MaVolumeStrategy(BaseStrategy):
         webhook_key: 路由到 'ma_volume' 专属飞书机器人。
     """
 
-    webhook_key: str = "ma_volume"
 
     def run(self) -> list[str]:
         """

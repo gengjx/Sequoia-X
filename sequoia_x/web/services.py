@@ -2,6 +2,7 @@
 
 import collections
 import logging
+import threading
 import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -24,110 +25,14 @@ from sequoia_x.analysis.factor import evaluate_factor_ic
 from sequoia_x.notify.feishu import FeishuNotifier
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
-from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
-from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
-from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
-from sequoia_x.strategy.shrink_pullback import ShrinkPullbackStrategy
-from sequoia_x.strategy.dragon_head import DragonHeadStrategy
-from sequoia_x.strategy.bottom_volume import BottomVolumeStrategy
-from sequoia_x.strategy.multi_factor import MultiFactorStrategy
-from sequoia_x.strategy.volume_extreme import VolumeExtremeStrategy
-
-
-# ---------------------------------------------------------------------------
-# Strategy registry & metadata
-# ---------------------------------------------------------------------------
-
-STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
-    cls.webhook_key: cls
-    for cls in [
-        MaVolumeStrategy,
-        TurtleTradeStrategy,
-        HighTightFlagStrategy,
-        LimitUpShakeoutStrategy,
-        UptrendLimitDownStrategy,
-        RpsBreakoutStrategy,
-        ShrinkPullbackStrategy,
-        DragonHeadStrategy,
-        BottomVolumeStrategy,
-        MultiFactorStrategy,
-        VolumeExtremeStrategy,
-    ]
-}
-
-STRATEGY_META: dict[str, dict] = {
-    "multi_factor": {
-        "name": "MultiFactor",
-        "name_cn": "多因子选股",
-        "description": "30因子IC加权合成综合分，选全市场Top50（数据驱动，非规则式）",
-        "min_bars": 60,
-        "category": "量化因子",
-    },
-    "ma_volume": {
-        "name": "MaVolume",
-        "name_cn": "均线放量",
-        "description": "5日均线上穿20日均线（金叉）且成交量放大1.5倍",
-        "min_bars": 20,
-    },
-    "turtle": {
-        "name": "TurtleTrade",
-        "name_cn": "海龟突破",
-        "description": "20日新高突破 + 成交额过亿 + 阳线防诱多",
-        "min_bars": 21,
-    },
-    "flag": {
-        "name": "HighTightFlag",
-        "name_cn": "高位旗形",
-        "description": "40日涨幅>60% + 10日窄幅震荡 + 缩量整理",
-        "min_bars": 40,
-    },
-    "shakeout": {
-        "name": "LimitUpShakeout",
-        "name_cn": "涨停洗盘",
-        "description": "昨日涨停 + 今日阴线放量 + 不破涨停支撑",
-        "min_bars": 5,
-    },
-    "limit_down": {
-        "name": "UptrendLimitDown",
-        "name_cn": "上升趋势跌停",
-        "description": "MA20>MA60上升趋势 + 今日跌停 + 放量",
-        "min_bars": 60,
-    },
-    "rps": {
-        "name": "RpsBreakout",
-        "name_cn": "RPS相对强度",
-        "description": "120日涨幅排名前10% + 接近120日新高",
-        "min_bars": 120,
-    },
-    "pullback": {
-        "name": "ShrinkPullback",
-        "name_cn": "缩量回踩",
-        "description": "上升趋势回踩均线支撑 + 缩量企稳，右侧低吸买点",
-        "min_bars": 20,
-    },
-    "dragon": {
-        "name": "DragonHead",
-        "name_cn": "板块龙头",
-        "description": "领涨板块内跑赢板块+成交过亿的强势龙头",
-        "min_bars": 2,
-    },
-    "bottom": {
-        "name": "BottomVolume",
-        "name_cn": "底部放量",
-        "description": "超跌15%+异动放量3倍+下影线阳线，左侧反转信号",
-        "min_bars": 20,
-    },
-    "volume_extreme": {
-        "name": "VolumeExtreme",
-        "name_cn": "地量见底",
-        "description": "换手率创60日新低+价格企稳+非涨停，地量地价左侧反转",
-        "min_bars": 60,
-        "category": "量能择时",
-    },
-}
+from sequoia_x.strategy.registry import (
+    STRATEGY_REGISTRY,
+    STRATEGY_META,
+    ACTIVE_STRATEGY_KEYS,
+    ALL_ACTIVE_KEYS,
+    CORE_STRATEGY_KEYS,
+    RETIRED_STRATEGY_KEYS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +108,27 @@ class WebServices:
         self._decision_cache_ts: float = 0.0
         self._backtest_cache: dict | None = None
         self._position_tracker: PositionTracker | None = None
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(max_workers=8)
+        # ── 互斥锁：防止重复提交 + 并发决策去重 ──
+        self._decision_lock = threading.Lock()   # generate_decision 串行化
+        self._paper_lock = threading.Lock()       # paper_auto_run 全局互斥
 
     # -- Strategy methods --
 
     def list_strategies(self) -> list[dict]:
+        # 加载策略回测绩效（quality_score）用于排序
+        scores: dict[str, int] = {}
+        try:
+            import sqlite3 as _sql
+            with _sql.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT strategy_key, quality_score, annual_return FROM strategy_weights"
+                ).fetchall()
+                scores = {r[0]: r[1] for r in rows}
+                annuals = {r[0]: r[2] for r in rows}
+        except Exception:
+            pass
+
         result = []
         for key, meta in STRATEGY_META.items():
             webhook_url = self.settings.get_webhook_url(key)
@@ -221,7 +142,12 @@ class WebServices:
                 "webhook_url": webhook_url,
                 "latest_result_count": len(self._result_cache.get(key, ("", []))[1]),
                 "last_run_at": None,
+                "quality_score": scores.get(key, 0),
+                "annual_return": round(annuals.get(key, 0), 1),
+                "role": meta.get("role", "active"),  # core/active/demoted/retired
             })
+        # 排序：废弃排最后，其余按质量分降序
+        result.sort(key=lambda x: (x.get("role") == "retired", -x["quality_score"]))
         return result
 
     def get_strategy_class(self, key: str) -> type[BaseStrategy] | None:
@@ -276,6 +202,23 @@ class WebServices:
         self._task_store[task_id] = record
         self._executor.submit(self._run_generic_task, task_id, task_name, fn, args, kwargs)
         return task_id
+
+    def has_running_task(self, task_name: str) -> str | None:
+        """检查指定名称的任务是否正在运行，返回 task_id 或 None。"""
+        for tid, t in self._task_store.items():
+            if t.strategy_key == task_name and t.status == TaskStatus.RUNNING:
+                return tid
+        return None
+
+    def update_task_progress(self, task_name: str, progress: int, msg: str = "") -> None:
+        """更新当前运行任务的进度（供后台函数调用）。"""
+        for t in self._task_store.values():
+            if t.strategy_key == task_name and t.status == TaskStatus.RUNNING:
+                t.progress = progress
+                if msg:
+                    t.progress_msg = msg
+                return
+
 
     def _run_generic_task(self, task_id: str, task_name: str,
                           fn: callable, args: tuple, kwargs: dict) -> None:
@@ -550,77 +493,87 @@ class WebServices:
         mc = max_candidates or 60
         cache_key = f"{','.join(sorted(strategy_keys or []))}|{capital}|{min_score}|{','.join(sorted(exclude_markets or []))}|{exclude_st}|mc{mc}|au{int(include_auction)}"
         data_date = self._data_date()
+        # 快速检查缓存（无锁）
         cached = self._decision_cache.get(cache_key)
         if cached and cached[0].get("data_date") == data_date:
             return cached[1]
-        if strategy_keys is None:
-            strategy_keys = list(STRATEGY_REGISTRY.keys())
+        # Double-checked locking：并发请求只跑一次，后续命中缓存
+        with self._decision_lock:
+            # 锁内二次检查（前一个请求可能已完成写入缓存）
+            cached = self._decision_cache.get(cache_key)
+            if cached and cached[0].get("data_date") == data_date:
+                return cached[1]
+            if strategy_keys is None:
+                # 默认：多因子为核心（5.3年回测年化+22.6%，唯一穿越牛熊）
+                # 废弃策略不纳入默认决策池
+                strategy_keys = [k for k in STRATEGY_REGISTRY.keys()
+                                 if k not in RETIRED_STRATEGY_KEYS]
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
-        # 每策略独立读K线+结果缓存；共享DF实测在3M行下groupby慢+内存复制开销，无净收益
-        strategy_results: dict[str, list[str]] = {}
+            # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
+            # 每策略独立读K线+结果缓存；共享DF实测在3M行下groupby慢+内存复制开销，无净收益
+            strategy_results: dict[str, list[str]] = {}
 
-        def _run_strategy(key: str) -> tuple[str, list[str]]:
-            # 缓存命中：同一data_date内策略结果不变（K线数据没变，选股结果一致）
-            cached = self._result_cache.get(key)
-            if cached and cached[0] == data_date:
-                return key, cached[1]
-            cls = STRATEGY_REGISTRY.get(key)
-            if not cls:
-                return key, []
-            try:
-                strat = cls(engine=self.engine, settings=self.settings)
-                results = strat.run()
-                self._result_cache[key] = (data_date, results)
-                return key, results
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"策略 {key} 运行失败：{e!r}")
-                return key, []
+            def _run_strategy(key: str) -> tuple[str, list[str]]:
+                # 缓存命中：同一data_date内策略结果不变（K线数据没变，选股结果一致）
+                cached = self._result_cache.get(key)
+                if cached and cached[0] == data_date:
+                    return key, cached[1]
+                cls = STRATEGY_REGISTRY.get(key)
+                if not cls:
+                    return key, []
+                try:
+                    strat = cls(engine=self.engine, settings=self.settings)
+                    results = strat.run()
+                    self._result_cache[key] = (data_date, results)
+                    return key, results
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"策略 {key} 运行失败：{e!r}")
+                    return key, []
 
-        workers = min(4, len(strategy_keys) or 1)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_run_strategy, k) for k in strategy_keys]
-            for fut in as_completed(futs):
-                k, syms = fut.result()
-                strategy_results[k] = syms
+            workers = min(4, len(strategy_keys) or 1)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_run_strategy, k) for k in strategy_keys]
+                for fut in as_completed(futs):
+                    k, syms = fut.result()
+                    strategy_results[k] = syms
 
-        # Step2-4: 决策引擎融合
-        analyzer = self._get_stock_analyzer()
-        engine = DecisionEngine(self.engine, self.settings)
-        # 大盘状态择时：复用已缓存的market报告；无缓存则实时分析并自动缓存（绑定data_date）
-        # 大盘分析需拉东财496板块数据~30s，决策内缓存后同data_date复用秒级
-        def _market_fn():
-            report = self._market_report_cache.get(data_date)
-            if report:
+            # Step2-4: 决策引擎融合
+            analyzer = self._get_stock_analyzer()
+            engine = DecisionEngine(self.engine, self.settings)
+            # 大盘状态择时：复用已缓存的market报告；无缓存则实时分析并自动缓存（绑定data_date）
+            # 大盘分析需拉东财496板块数据~30s，决策内缓存后同data_date复用秒级
+            def _market_fn():
+                report = self._market_report_cache.get(data_date)
+                if report:
+                    return report
+                report = self._get_analyzer().analyze()
+                if report and report.get("date"):
+                    self._market_report_cache[report["date"]] = report
+                    logging.getLogger(__name__).info("大盘分析已完成并缓存，后续决策复用")
                 return report
-            report = self._get_analyzer().analyze()
-            if report and report.get("date"):
-                self._market_report_cache[report["date"]] = report
-                logging.getLogger(__name__).info("大盘分析已完成并缓存，后续决策复用")
-            return report
-        # 竞价→决策联动：纳入今日竞价A级票作为盘中候选（竞价定方向+技术面确认）
-        if include_auction:
-            auction_syms = self._get_auction_a_grade()
-            if auction_syms:
-                strategy_results["auction"] = auction_syms
-                logging.getLogger(__name__).info(f"竞价联动：注入{len(auction_syms)}只A级票到决策池")
+            # 竞价→决策联动：纳入今日竞价A级票作为盘中候选（竞价定方向+技术面确认）
+            if include_auction:
+                auction_syms = self._get_auction_a_grade()
+                if auction_syms:
+                    strategy_results["auction"] = auction_syms
+                    logging.getLogger(__name__).info(f"竞价联动：注入{len(auction_syms)}只A级票到决策池")
 
-        result = engine.generate(
-            strategy_results=strategy_results,
-            analyze_fn=self.analyze_stock,
-            capital=capital,
-            min_score=min_score,
-            exclude_markets=exclude_markets,
-            exclude_st=exclude_st,
-            market_fn=_market_fn,
-            max_candidates=max_candidates or 60,
-        )
-        result["strategies_run"] = {
-            k: len(v) for k, v in strategy_results.items()
-        }
-        self._decision_cache[cache_key] = ({"data_date": data_date}, result)
+            result = engine.generate(
+                strategy_results=strategy_results,
+                analyze_fn=self.analyze_stock,
+                capital=capital,
+                min_score=min_score,
+                exclude_markets=exclude_markets,
+                exclude_st=exclude_st,
+                market_fn=_market_fn,
+                max_candidates=max_candidates or 60,
+            )
+            result["strategies_run"] = {
+                k: len(v) for k, v in strategy_results.items()
+            }
+            self._decision_cache[cache_key] = ({"data_date": data_date}, result)
         logging.getLogger(__name__).info('决策缓存写入 key=' + cache_key[:40])
         logging.getLogger(__name__).info(
             f"决策生成完成：候选{result['pool_size']}只 → 买入{result['summary']['buy_count']}只"
@@ -645,6 +598,51 @@ class WebServices:
         hold_days = hold_days or [5, 10, 20]
         bt = ComboBacktester(self.engine, self.settings)
         return bt.run_resonance(hold_days=hold_days)
+
+    def evaluate_ml_factor(self) -> dict:
+        """评估ML因子（Ridge因子合成）。"""
+        from sequoia_x.analysis.ml_factor import MLFactorEngine
+        engine = MLFactorEngine(self.engine.db_path)
+        result = engine.compute_ml_score()
+        # 如果有效，写入全局因子权重表
+        if result.get("valid"):
+            ic = result["ic_mean"]
+            icir = result["icir"]
+            wr = result["win_rate"]
+            weight = ic / max(abs(icir), 0.01) * icir  # 符号IC权重
+            self.engine.save_factor_weights([{
+                "factor_name": "ml_score",
+                "category": "ML因子",
+                "ic_mean": ic,
+                "icir": icir,
+                "win_rate": wr,
+                "weight": weight,
+            }])
+            # 同时写入三态权重表（所有市场状态使用相同权重，因为ML因子是自适应的）
+            import sqlite3
+            ml_entry = [{
+                "factor_name": "ml_score",
+                "category": "ML因子",
+                "ic_mean": ic,
+                "icir": icir,
+                "win_rate": wr,
+                "weight": abs(ic),
+            }]
+            with sqlite3.connect(self.engine.db_path) as conn:
+                for state in ("bull", "neutral", "bear"):
+                    from datetime import datetime as _dt
+                    now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO market_factor_weights "
+                        "(market_state, factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
+                        "VALUES (?, 'ml_score', 'ML因子', ?, ?, ?, ?, ?)",
+                        (state, ic, icir, wr, abs(ic), now_str),
+                    )
+                conn.commit()
+            logging.getLogger(__name__).info(
+                f"ML因子已写入全局+三态权重表（IC={ic} ICIR={icir}）"
+            )
+        return result
 
     def evaluate_strategies(self, hold_days: int = 20, sample_size: int = 500) -> dict:
         """策略评估：时间序列净值 + 全维度评分卡 + 基准对比。"""
@@ -716,6 +714,37 @@ class WebServices:
 
     def delete_holding(self, hid: int) -> bool:
         return self.positions.delete_holding(hid)
+
+    def sync_paper_to_portfolio(self) -> None:
+        """同步 paper_holdings → portfolio_holding（PositionTracker 读后者）。
+
+        清空 portfolio_holding 的 open 记录，用 paper_holdings 当前持仓覆盖。
+        """
+        import sqlite3
+        try:
+            with sqlite3.connect(self.settings.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # 取 paper_holdings 当前持仓
+                rows = conn.execute("SELECT * FROM paper_holdings").fetchall()
+                # 清空 portfolio_holding 的 open 记录
+                conn.execute("DELETE FROM portfolio_holding WHERE status='open'")
+                # 写入
+                for r in rows:
+                    d = dict(r)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO portfolio_holding "
+                        "(symbol, name, entry_price, shares, entry_date, stop_loss, "
+                        "initial_stop, target, grade, hit_strategies, cost, status) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?, 'open')",
+                        (d["symbol"], d.get("name",""), d["entry_price"], d["shares"],
+                         d.get("entry_date",""), d.get("stop_loss",0), d.get("initial_stop",0),
+                         d.get("target",0), d.get("grade",""), d.get("hit_strategies",""),
+                         d.get("cost",0))
+                    )
+                conn.commit()
+                logging.getLogger(__name__).info(f"持仓同步: paper_holdings → portfolio_holding ({len(rows)}只)")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"持仓同步失败: {e!r}")
 
     def scan_positions(self, apply_stop_move: bool = False) -> dict:
         """扫描所有持仓，返回信号列表 + 组合摘要。"""

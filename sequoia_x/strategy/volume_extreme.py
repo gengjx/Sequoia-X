@@ -11,10 +11,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("volume_extreme")
 class VolumeExtremeStrategy(BaseStrategy):
     """地量/天量策略：换手率极值择时。
 
@@ -22,7 +24,6 @@ class VolumeExtremeStrategy(BaseStrategy):
         webhook_key: 路由到 'volume_extreme' 专属飞书机器人。
     """
 
-    webhook_key: str = "volume_extreme"
     _MIN_BARS: int = 60  # 至少60根K线（需要60日换手率数据）
 
     def run(self) -> list[str]:

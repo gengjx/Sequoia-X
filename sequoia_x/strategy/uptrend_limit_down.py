@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("limit_down")
 class UptrendLimitDownStrategy(BaseStrategy):
     """上升趋势跌停策略。
 
@@ -20,7 +22,6 @@ class UptrendLimitDownStrategy(BaseStrategy):
         webhook_key: 路由到 'limit_down' 专属飞书机器人。
     """
 
-    webhook_key: str = "limit_down"
     _MIN_BARS: int = 60  # 至少需要 60 根 K 线（60日均线）
 
     def run(self) -> list[str]:

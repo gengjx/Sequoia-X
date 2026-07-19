@@ -4,10 +4,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("bottom")
 class BottomVolumeStrategy(BaseStrategy):
     """底部放量选股策略。
 
@@ -26,7 +28,6 @@ class BottomVolumeStrategy(BaseStrategy):
         webhook_key: 路由到 'bottom' 专属飞书机器人。
     """
 
-    webhook_key: str = "bottom"
     _MIN_BARS: int = 20  # 至少需要 20 根 K 线
 
     def run(self) -> list[str]:

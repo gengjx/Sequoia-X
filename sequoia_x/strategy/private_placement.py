@@ -6,10 +6,12 @@ import pandas as pd
 
 from sequoia_x.core.logger import get_logger
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
 
+@register_strategy("private_placement")
 class PrivatePlacementStrategy(BaseStrategy):
     """定增公告监控策略。
 
@@ -20,7 +22,6 @@ class PrivatePlacementStrategy(BaseStrategy):
         webhook_key: 路由到 'private_placement' 飞书机器人。
     """
 
-    webhook_key: str = "private_placement"
     _LOOKBACK_DAYS: int = 7  # 回看天数，覆盖一周内的新公告
 
     def run(self) -> list[str]:

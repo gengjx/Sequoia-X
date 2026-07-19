@@ -1,15 +1,16 @@
 import pandas as pd
 import sqlite3
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
 
 
+@register_strategy("rps")
 class RpsBreakoutStrategy(BaseStrategy):
     """RPS 极强动量突破策略"""
 
-    webhook_key: str = "rps"
     rps_period: int = 120
     rps_threshold: int = 90
 

@@ -16,6 +16,7 @@ from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
+from sequoia_x.strategy.registry import register_strategy
 
 logger = get_logger(__name__)
 
@@ -41,6 +42,7 @@ _DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 }
 
 
+@register_strategy("multi_factor")
 class MultiFactorStrategy(BaseStrategy):
     """多因子IC加权选股策略。
 
@@ -54,7 +56,6 @@ class MultiFactorStrategy(BaseStrategy):
         webhook_key: 'multi_factor'，路由到专属飞书机器人。
     """
 
-    webhook_key: str = "multi_factor"
     _TOP_N: int = 50  # 选入数量（与规则式策略平均选股量可比）
 
     def __init__(self, engine: DataEngine, settings: Settings,

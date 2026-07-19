@@ -69,7 +69,7 @@ def quality_bonus(hit_strategies: list[str]) -> float:
     """
     # hit_strategies 存中文展示名，需反查英文key再查STRATEGY_QUALITY
     try:
-        from sequoia_x.web.services import STRATEGY_META
+        from sequoia_x.strategy.registry import STRATEGY_META
         name_to_key = {meta.get("name_cn", k): k for k, meta in STRATEGY_META.items()}
     except Exception:
         name_to_key = {}
@@ -193,7 +193,7 @@ class DecisionEngine:
             {buy_list, watch_list, reject_list, summary}
         """
         # ── Step 1: 多策略汇总去重 ──
-        from sequoia_x.web.services import STRATEGY_META
+        from sequoia_x.strategy.registry import STRATEGY_META
         pool: dict[str, list[str]] = {}   # {symbol: [英文策略key]} 用于查STRATEGY_QUALITY
         for skey, symbols in strategy_results.items():
             for sym in symbols:
