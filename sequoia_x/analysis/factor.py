@@ -84,7 +84,9 @@ FACTOR_META: dict[str, dict] = {
     # ── 资金流近似(3)（用日K构建，无需外部接口）──
     "flow_strength":  {"category": "资金流", "desc": "上涨日成交额占比"},
     "flow_weighted":  {"category": "资金流", "desc": "涨跌幅加权资金流"},
-    "flow_trend":     {"category": "资金流", "desc": "5日vs20日资金流趋势"},
+    "flow_trend":       {"category": "资金流", "desc": "5日vs20日资金流趋势"},
+    "flow_super_ratio": {"category": "资金流", "desc": "超大单占比（机构资金方向）"},
+    "flow_intensity":   {"category": "资金流", "desc": "主力资金净流入强度"},
 }
 
 
@@ -234,8 +236,15 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
     if fund_flow:
         factors["main_net"] = _safe_float(fund_flow.get("main_net"))
         factors["main_pct"] = _safe_float(fund_flow.get("main_pct"))
+        # 复合资金流因子：超大单占比（机构资金方向）
+        super_net = _safe_float(fund_flow.get("super_net"))
+        big_net = _safe_float(fund_flow.get("big_net"))
+        total_flow = abs(super_net) + abs(big_net) + 1
+        factors["flow_super_ratio"] = float(super_net / total_flow)
+        # 资金流强度（主力净流入绝对值 / 成交额）
+        factors["flow_intensity"] = float(abs(_safe_float(fund_flow.get("main_net"))) / (turnover.iloc[-1] + 1))
     else:
-        for k in ["main_net", "main_pct"]:
+        for k in ["main_net", "main_pct", "flow_super_ratio", "flow_intensity"]:
             factors[k] = np.nan
 
     # ════════ 龙虎榜(2) ════════
@@ -834,7 +843,7 @@ def evaluate_factor_ic(
             ic_std = float(np.std(ics))
             icir = ic_mean / ic_std if ic_std > 0 else 0
             win_rate = float((np.array(ics) > 0).mean() * 100)
-            if abs(ic_mean) > 0.015 and abs(icir) > 0.3:
+            if abs(ic_mean) > 0.025 and abs(icir) > 0.3:  # 提高门槛：剔除弱噪声因子，集中权重给强因子
                 state_reports.append({
                     "factor_name": f,
                     "category": FACTOR_META.get(f, {}).get("category", ""),

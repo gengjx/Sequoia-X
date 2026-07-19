@@ -254,7 +254,7 @@ def _bs_fetch_batch(tasks: list) -> list:
                     start_date=start,
                     end_date=end,
                     frequency="d",
-                    adjustflag="1",  # 后复权
+                    adjustflag="2",  # 前复权（最新价≈真实交易价，K线连续）
                 )
                 if rs.error_code != "0":
                     continue
@@ -471,8 +471,8 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+    def sync_today_bulk(self, force_full: bool = False) -> int:
+        """多进程并行通过 baostock 拉取日K数据（前复权），写入 SQLite。"""
         from datetime import date, timedelta
         from multiprocessing import Pool
 
@@ -492,7 +492,9 @@ class DataEngine:
             if last_date and last_date >= today_str:
                 continue
             start = today_str
-            if last_date:
+            if force_full:
+                start = self.start_date  # 全量刷新：从最早日期开始
+            elif last_date:
                 start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
             tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
 
@@ -701,19 +703,10 @@ class DataEngine:
 
                 o, c, h, l, vol = float(latest[1]), float(latest[2]), float(latest[3]), float(latest[4]), float(latest[5])
 
-                # 复权系数：DB后复权昨收 / 腾讯前复权昨收
-                db_prev = last_db.get(sym)
-                if db_prev and len(klines) >= 2:
-                    tc_prev_close = float(klines[-2][2])
-                    if tc_prev_close > 0:
-                        coef = db_prev / tc_prev_close
-                    else:
-                        coef = 1.0
-                else:
-                    coef = 1.0
+                # 腾讯返回qfq前复权数据，直接使用（无需复权因子）
 
                 rows_to_insert.append((
-                    sym, d_str, o * coef, h * coef, l * coef, c * coef,
+                    sym, d_str, o, h, l, c,
                     int(vol * 100), 0.0, None, None, 1, 0
                 ))
                 success += 1
@@ -854,15 +847,12 @@ class DataEngine:
 
             if raw_close <= 0 or vol <= 0:
                 continue
-            hfq_yest = last_hfq.get(sym)
-            if not hfq_yest or raw_yest <= 0:
-                continue
-            factor = hfq_yest / raw_yest
+            # 前复权：今日价=真实交易价，直接使用东财raw（无需复权因子）
 
             rows_to_insert.append((
                 sym, today_str,
-                round(raw_open * factor, 6), round(raw_high * factor, 6),
-                round(raw_low * factor, 6), round(raw_close * factor, 6),
+                round(raw_open, 4), round(raw_high, 4),
+                round(raw_low, 4), round(raw_close, 4),
                 round(vol * 100, 2), round(amt, 2),
                 round(turn, 4) if turn > 0 else None,         # 换手率
                 round(pct_chg, 4) if pct_chg != 0 else None,  # 涨跌幅
@@ -954,7 +944,7 @@ class DataEngine:
                             start_date=start,
                             end_date=today_str,
                             frequency="d",
-                            adjustflag="1",  # 后复权
+                            adjustflag="2",  # 前复权（最新价≈真实交易价，K线连续）
                         )
 
                         if rs.error_code != "0":

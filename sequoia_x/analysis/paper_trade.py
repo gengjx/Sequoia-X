@@ -34,19 +34,35 @@ MAX_DRAWDOWN_CIRCUIT = 0.15   # 最大回撤>15%触发熔断（暂停开新仓�
 MAX_CONSEC_LOSS = 3           # 连续亏损≥3笔降仓
 CONSEC_LOSS_SCALE = 0.5       # 连亏时仓位缩放比例
 MAX_DAILY_LOSS_PCT = 3.0      # 单日亏损>3%停止开仓
+# ── 板块集中度限制 ──
+MAX_BOARD_PCT = {
+    "gem": 0.30,      # 创业板(30x)：±20%涨跌停，高波动，上限30%
+    "star": 0.30,     # 科创板(688)：±20%涨跌停，高波动，上限30%
+    "main": 0.60,     # 主板(60x/00x)：±10%，流动性好，上限60%
+}
+# ── 市场状态自适应风控 ──
+# bear市场：提高评分门槛、降低总仓位、排除高波动板块
+MARKET_ADAPTIVE = {
+    "bull":    {"min_score": 50, "position_scale": 1.0, "exclude_high_volatility": False, "label": "牛市正常买入"},
+    "neutral": {"min_score": 55, "position_scale": 0.7, "exclude_high_volatility": False, "label": "中性谨慎建仓"},
+    "bear":    {"min_score": 65, "position_scale": 0.4, "exclude_high_volatility": True,  "label": "熊市仅主板+低仓位"},
+}
+BEAR_NO_BUY_SCORE = 30  # 极端弱市(评分<30)空仓不买
 # ── 仓位管理参数 ──
 BASE_RISK_PCT = 0.02          # 单笔风险占总资产2%（风险预算）
 MAX_RISK_PCT = 0.04           # 单笔最大风险4%
 SCORE_POWER = 1.5             # 评分→仓位幂次（评分越高仓位越大）
 # ── 止盈参数 ──
-PARTIAL_TP_PCT = 5.0          # 浮盈>5%减仓一半
-FULL_TP_PCT = 10.0            # 浮盈>10%全部止盈
-TRAILING_START_PCT = 7.0      # 浮盈>7%启动移动止盈
-TRAILING_PULLBACK = 2.5       # 移动止盈回撤2.5%
-MAX_HOLD_DAYS = 20            # 持仓超20天强制平仓
+PARTIAL_TP_PCT = 15.0         # 浮盈>15%减仓一半（扫描最优：放宽止盈）
+FULL_TP_PCT = 30.0            # 浮盈>30%全部止盈（扫描最优：让赢家跑更远）
+TRAILING_START_PCT = 12.0     # 浮盈>12%启动移动止盈（扫描最优）
+TRAILING_PULLBACK = 8.0       # 移动止盈回撤8%（扫描最优：避免假止损）
+MAX_HOLD_DAYS = 60            # 持仓超60天强制平仓（扫描最优：降低换手）
 
 
 @dataclass
+
+
 class PaperPerformance:
     """模拟盘绩效快照（专业量化指标）。"""
     initial_capital: float = 0
@@ -76,6 +92,17 @@ class PaperPerformance:
     benchmark_return: float = 0    # 沪深300同期收益率%
     consec_loss: int = 0           # 当前连续亏损笔数
     risk_circuit: str = "正常"     # 风控状态
+
+
+
+def _classify_board(symbol: str) -> str:
+    """根据股票代码判断板块。"""
+    sym = str(symbol).strip()
+    if sym.startswith("30"):
+        return "gem"
+    if sym.startswith("688"):
+        return "star"
+    return "main"
 
 
 class PaperTradeEngine:
@@ -161,6 +188,14 @@ class PaperTradeEngine:
         market = decision_result.get("market_state", {})
         market_score = market.get("score", 50)
         market_state = market.get("state", "neutral")
+        # ── 自适应风控参数 ──
+        adaptive = MARKET_ADAPTIVE.get(market_state, MARKET_ADAPTIVE["neutral"])
+        min_score_eff = max(MIN_BUY_SCORE, adaptive["min_score"])
+        position_scale_eff = adaptive["position_scale"]
+        exclude_hv = adaptive["exclude_high_volatility"]
+        logger.info(f"模拟盘自适应风控：市场={market_state}({market_score}分) → "
+                     f"门槛{min_score_eff} 仓位×{position_scale_eff} "
+                     f"{'排除高波动板块' if exclude_hv else '不排除'} ({adaptive['label']})")
         position_scale = market.get("position_scale", 0.8)
 
         if market_state == "bear" and market_score < BEAR_NO_BUY_SCORE:
@@ -173,6 +208,20 @@ class PaperTradeEngine:
             logger.warning(f"模拟盘风控熔断：{circuit['reason']}，暂停开新仓")
             return {"bought": [], "skipped": [], "reason": circuit["reason"]}
 
+        # ── 组合级风控检查（Beta/VaR/回撤/集中度）──
+        try:
+            from sequoia_x.analysis.portfolio_risk import PortfolioRiskMonitor
+            risk_monitor = PortfolioRiskMonitor(self.db_path)
+            risk_report = risk_monitor.analyze(cash=cash)
+            if risk_report.risk_score < 40:
+                danger_alerts = [a for a in risk_report.alerts if a.level == "danger"]
+                if danger_alerts:
+                    reasons = "; ".join(a.message for a in danger_alerts[:2])
+                    logger.warning(f"模拟盘组合风控拦截：风险评分{risk_report.risk_score}，{reasons}")
+                    return {"bought": [], "skipped": [], "reason": f"组合风控拦截({risk_report.risk_score}分)：{reasons}"}
+        except Exception as e:
+            logger.warning(f"组合风控检查跳过：{e!r}")
+
         # 当前持仓总市值
         holdings = self.get_holdings()
         holding_symbols = {h["symbol"] for h in holdings}
@@ -183,23 +232,49 @@ class PaperTradeEngine:
             return {"bought": [], "skipped": [], "reason": "决策无买入清单"}
 
         # 按评分排序（高分优先）
-        buy_sorted = sorted(buy_list, key=lambda x: x.get("score", 0), reverse=True)
+        # 排序：评分→板块偏好(主板优先)→低价优先(买得起整手)
+        def _sort_key(x):
+            sym = x.get("symbol", "")
+            score = x.get("score", 0)
+            board = _classify_board(sym)
+            # 主板+0.5分加权、创业板/科创板不加权，确保同评分主板优先
+            board_bonus = 0.5 if board == "main" else 0
+            return -(score + board_bonus)
+        buy_sorted = sorted(buy_list, key=_sort_key)
 
         bought = []
         skipped = []
         today = datetime.now().strftime("%Y-%m-%d")
-        max_total = initial * MAX_TOTAL_PCT
+        max_total = initial * MAX_TOTAL_PCT * position_scale_eff  # 自适应缩放
 
         for item in buy_sorted:
             sym = item.get("symbol", "")
             score = item.get("score", 0)
-            if score < MIN_BUY_SCORE:
+            if score < min_score_eff:  # 自适应门槛
                 skipped.append({"symbol": sym, "reason": f"评分{score}<{MIN_BUY_SCORE}"})
                 continue
 
             # 已持有跳过
             if sym in holding_symbols:
                 skipped.append({"symbol": sym, "reason": "已持有"})
+                continue
+
+            # bear市场排除高波动板块（创业板/科创板）
+            board = _classify_board(sym)
+            if exclude_hv and board in ("gem", "star"):
+                skipped.append({"symbol": sym, "reason": f"熊市排除高波动板块({board})"})
+                continue
+
+            # 板块集中度风控：限制单一板块持仓占比
+            board_pct_limit = MAX_BOARD_PCT.get(board, 0.30)
+            board_value = sum(
+                h2["shares"] * h2["entry_price"]
+                for h2 in holdings
+                if _classify_board(h2.get("symbol", "")) == board
+            )
+            board_pct_now = board_value / initial if initial else 0
+            if board_pct_now >= board_pct_limit:
+                skipped.append({"symbol": sym, "reason": f"板块({board})仓位{board_pct_now:.0%}≥上限{board_pct_limit:.0%}"})
                 continue
 
             # 仓位计算：风险预算（信号置信度×波动率调整）
@@ -210,7 +285,6 @@ class PaperTradeEngine:
             )
             target_amount = initial * position_pct
 
-            # 可用资金约束
             if cash < target_amount * 0.5:
                 skipped.append({"symbol": sym, "reason": f"现金不足(需{target_amount:.0f}/有{cash:.0f})"})
                 continue
@@ -225,6 +299,12 @@ class PaperTradeEngine:
             if not price or price <= 0:
                 skipped.append({"symbol": sym, "reason": "无成交价"})
                 continue
+
+            # 高价股补救：目标仓位不足1手但1手在单票上限内 → 最低建仓1手
+            one_lot_cost = price * 100
+            max_per_lot = initial * MAX_POSITION_PCT
+            if target_amount < one_lot_cost <= max_per_lot:
+                target_amount = one_lot_cost
 
             # 计算股数（整手100股）
             shares = int(target_amount / price / 100) * 100
@@ -267,8 +347,13 @@ class PaperTradeEngine:
 
     def _execute_buy(self, symbol: str, name: str, price: float, shares: int,
                      amount: float, date: str, stop_loss: float, target: float,
-                     grade: str, hit_strategies: str, reason: str) -> None:
+                     grade: str, hit_strategies, reason: str) -> None:
         """执行买入：扣现金 + 写持仓 + 写交易记录。"""
+        # hit_strategies 可能为 list，SQLite 不支持绑定 list，需转为字符串
+        if isinstance(hit_strategies, (list, tuple)):
+            hit_strategies = ", ".join(str(s) for s in hit_strategies)
+        elif hit_strategies is None:
+            hit_strategies = ""
         now = datetime.now().isoformat()
         with self._conn() as conn:
             # 扣现金
@@ -318,7 +403,8 @@ class PaperTradeEngine:
         today = datetime.now().strftime("%Y-%m-%d")
 
         sell_actions = {"止损清仓", "止盈", "减仓/清仓"}
-        half_actions = {"减仓半仓"}
+        # 弱信号也触发减仓半仓：主动调仓换股
+        half_actions = {"减仓半仓", "相对走弱", "逻辑减弱", "放量滞涨", "持仓低效"}
 
         # ── 增强卖出信号：遍历当前持仓，检查止盈/移动止损/到期 ──
         enhanced_signals = self._generate_enhanced_sells(position_signals, today)
@@ -339,7 +425,11 @@ class PaperTradeEngine:
                 price = self._get_close_price(sym, today)
                 if not price:
                     continue
-                result = self._execute_sell(sym, price, sig.get("shares", 0) // 2, today, action, sig.get("reasons", []), partial=True)
+                # 减仓半仓：卖出一半，向下取整到100的倍数
+                half = (sig.get("shares", 0) // 2 // 100) * 100
+                if half <= 0:
+                    continue
+                result = self._execute_sell(sym, price, half, today, action, sig.get("reasons", []), partial=True)
                 if result:
                     sold.append(result)
             elif action == "移动止损" and sig.get("new_stop", 0) > 0:
@@ -353,6 +443,73 @@ class PaperTradeEngine:
             "reason": f"卖出{len(sold)}笔，更新止损{len(updated)}只",
         }
 
+    def auto_sell_intraday(self, sell_signals: list[dict]) -> dict:
+        """盘中实时卖出：用信号中的实时价格执行。
+
+        与 auto_sell 的区别：
+          - 用实时快照价（sell_signals[].realtime_price）而非昨日收盘价
+          - 不重新生成增强信号（盘中扫描已包含）
+          - 立即执行，不等待盘后闭环
+        """
+        sold = []
+        updated = []
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        timestamp = now.strftime("%H:%M:%S")
+
+        sell_actions = {"止损清仓", "止盈", "减仓/清仓"}
+        # 弱信号盘中也触发减仓半仓
+        half_actions = {"减仓半仓", "相对走弱", "逻辑减弱", "放量滞涨", "持仓低效"}
+
+        for sig in sell_signals:
+            sym = sig.get("symbol", "")
+            action = sig.get("action", "")
+            realtime_price = sig.get("realtime_price", 0)
+
+            if not sym or not realtime_price or realtime_price <= 0:
+                continue
+
+            # 止损清仓/止盈 → 全部卖出
+            if action in sell_actions:
+                result = self._execute_sell(
+                    sym, realtime_price, sig.get("shares", 0),
+                    today, action, sig.get("reasons", [])
+                )
+                if result:
+                    result["timestamp"] = timestamp
+                    sold.append(result)
+                    logger.info(
+                        f"盘中实时卖出：{sym} {result['shares']}股@{realtime_price:.2f}"
+                        f"={result['amount']:.0f}元 盈亏{result['pnl']:+.0f}"
+                        f"({result['pnl_pct']:+.1f}%) [{timestamp}]"
+                    )
+
+            # 减仓半仓 → 卖一半
+            elif action in half_actions:
+                # 减仓半仓：向下取整到100的倍数
+                half_shares = (sig.get("shares", 0) // 2 // 100) * 100
+                if half_shares > 0:
+                    result = self._execute_sell(
+                        sym, realtime_price, half_shares,
+                        today, action, sig.get("reasons", [])
+                    )
+                    if result:
+                        result["timestamp"] = timestamp
+                        sold.append(result)
+
+            # 移动止损 → 只更新止损价
+            elif action == "移动止损" and sig.get("new_stop", 0) > 0:
+                self._update_stop(sym, sig["new_stop"])
+                updated.append({"symbol": sym, "new_stop": sig["new_stop"]})
+
+        if sold:
+            logger.warning(f"盘中实时卖出完成：{len(sold)}笔")
+        return {
+            "sold": sold,
+            "updated": updated,
+            "reason": f"盘中卖出{len(sold)}笔，更新止损{len(updated)}只",
+        }
+
     def _execute_sell(self, symbol: str, price: float, shares: int,
                       date: str, reason: str, reasons: list, partial: bool = False) -> dict | None:
         """执行卖出：加现金 + 删/改持仓 + 写交易记录（含盈亏）。"""
@@ -364,7 +521,9 @@ class PaperTradeEngine:
                 return None
             h = dict(h)
 
+            # 整手处理：卖出股数向下取整到100的倍数（A股最小交易单位1手=100股）
             sell_shares = min(shares, h["shares"])
+            sell_shares = (sell_shares // 100) * 100
             if sell_shares <= 0:
                 return None
 
@@ -433,6 +592,7 @@ class PaperTradeEngine:
         holdings = self.get_holdings()
         sig_map = {s["symbol"]: s for s in base_signals}
         result = list(base_signals)
+        sell_actions = {"止损清仓", "止盈", "减仓/清仓"}
 
         for h in holdings:
             sym = h["symbol"]
@@ -622,28 +782,61 @@ class PaperTradeEngine:
     # ════════════════════════════════════════
 
     def _get_close_price(self, symbol: str, date_str: str | None = None) -> float | None:
-        """获取收盘价（后复权→真实价转换）。
+        """获取收盘价：优先日K最新价，日K滞后时fallback东财实时价。
 
-        paper_holdings的entry_price是真实价，这里也用真实价。
+        paper_holdings的entry_price是东财实时价（真实价），因此卖出时也
+        需要用真实价而非后复权价。当日K数据未更新到目标日期时，从东财
+        push2接口获取实时价格，避免卖出价=买入价导致pnl恒为0。
         """
+        from datetime import date as _date
+
+        # Step 1: 从DB获取最新日K日期和收盘价
         with self._conn() as conn:
             if date_str:
                 row = conn.execute(
-                    "SELECT close FROM stock_daily WHERE symbol=? AND date<=? "
+                    "SELECT date, close FROM stock_daily WHERE symbol=? AND date<=? "
                     "ORDER BY date DESC LIMIT 1", (symbol, date_str)
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT close FROM stock_daily WHERE symbol=? ORDER BY date DESC LIMIT 1",
-                    (symbol,)
+                    "SELECT date, close FROM stock_daily WHERE symbol=? "
+                    "ORDER BY date DESC LIMIT 1", (symbol,)
                 ).fetchone()
-            if not row:
-                return None
-            hfq_close = row["close"]
-            # 后复权→真实价：需要复权系数
-            # 简化：用东财快照的真实价，或用最近真实价/后复价比近似
-            # 这里直接用后复权价（不影响相对盈亏计算，因为entry也是同口径）
-            return round(hfq_close, 3)
+
+        target = date_str or _date.today().strftime("%Y-%m-%d")
+
+        if row:
+            db_date = row["date"]
+            # 日K数据已是目标日期 → 直接用
+            if db_date >= target:
+                return round(row["close"], 3)
+            # 日K滞后 → fallback东财实时价
+            rt = self._fetch_realtime_price(symbol)
+            if rt and rt > 0:
+                return round(rt, 3)
+            # 东财也失败 → 用DB最近的（至少不为None）
+            return round(row["close"], 3)
+        return None
+
+    def _fetch_realtime_price(self, symbol: str) -> float | None:
+        """从东财push2接口获取单只股票实时价格。"""
+        import requests
+        market = "1" if symbol.startswith(("6", "9")) else "0"
+        secid = f"{market}.{symbol}"
+        try:
+            resp = requests.get(
+                "http://push2delay.eastmoney.com/api/qt/stock/get",
+                params={"secid": secid, "fields": "f43"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            data = resp.json().get("data", {})
+            price = data.get("f43", 0)
+            if price and price > 0:
+                return float(price) / 100
+        except Exception:
+            pass
+        return None
 
     def _calc_holding_value(self, holdings: list[dict]) -> float:
         """计算持仓总市值。"""

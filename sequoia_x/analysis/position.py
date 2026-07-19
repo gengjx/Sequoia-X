@@ -240,22 +240,17 @@ class PositionTracker:
             sig.signal_level = "warn"
             return sig
 
-        # 后复权K线价 → 真实价转换（entry/stop/target 均为真实价，须统一空间）
-        # 复权系数用 prev_close(与DB同日真实价) / hfq_price(后复权)，纯系数不混入当日涨跌幅
-        hfq_price = q["price"]
+        # 前复权数据：DB收盘价≈真实交易价，entry/stop/target 同为真实价，无需复权转换
         latest_price, prev_close = self._fetch_quote(h["symbol"])
-        price_source = "hfq"
-        if prev_close and hfq_price and prev_close > 0:
-            ratio = prev_close / hfq_price  # 纯复权系数（同日）
-            price = round(latest_price if latest_price else prev_close, 3)  # 展示用实时价
-            ma10 = round(q["ma10"] * ratio, 3) if q["ma10"] else 0
-            ma20 = round(q["ma20"] * ratio, 3) if q["ma20"] else 0
-            atr = round((q["atr"] or h["entry_price"] * 0.03) * ratio, 3)
+        price_source = "db"
+        if latest_price and latest_price > 0:
+            price = round(latest_price, 3)  # 展示用实时价
             price_source = "real"
         else:
-            price = hfq_price
-            ma10, ma20 = q["ma10"], q["ma20"]
-            atr = q["atr"] or h["entry_price"] * 0.03
+            price = q["price"]  # fallback 用DB收盘价
+        ma10 = q["ma10"] or 0
+        ma20 = q["ma20"] or 0
+        atr = q["atr"] or h["entry_price"] * 0.03
         entry = h["entry_price"]
         risk = entry - sig.initial_stop
         if risk <= 0:
@@ -531,7 +526,7 @@ class PositionTracker:
         if notifier:
             throttle_key = f"position_throttle_{_time.strftime('%Y%m%d')}"
             if not hasattr(self, throttle_key):
-                setattr(self, throttle_key:={})
+                setattr(self, throttle_key, {})
             throttle: dict[tuple[str, str], float] = getattr(self, throttle_key)
             now_ts = _time.time()
             for sig in signals:

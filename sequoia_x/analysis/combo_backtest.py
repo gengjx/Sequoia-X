@@ -32,6 +32,8 @@ logger = get_logger(__name__)
 SIGNAL_FUNCS = {
     "ma_volume", "turtle", "pullback", "bottom", "rps",
     "flag", "shakeout", "limit_down", "multi_factor",
+    "volume_extreme", "dragon",
+    "lhb_follow", "sector_rotation",
 }
 
 # 策略显示名
@@ -40,6 +42,8 @@ STRATEGY_LABELS = {
     "bottom": "底部放量", "rps": "RPS强势",
     "flag": "高位旗形", "shakeout": "涨停洗盘", "limit_down": "上升趋势跌停",
     "multi_factor": "多因子选股",
+    "volume_extreme": "地量见底", "dragon": "板块龙头",
+    "lhb_follow": "龙虎榜跟买", "sector_rotation": "板块轮动",
 }
 
 
@@ -124,13 +128,13 @@ def _compute_signals(df: pd.DataFrame, finance_series: dict[str, pd.Series] | No
     shrink = recent_vol < vol_ma20 * 0.7
     signals["pullback"] = uptrend & near_ma5 & shrink
 
-    # 底部放量：超跌 + 放量3倍 + 下影阳线
+    # 底部放量：超跌 + 放量2倍 + 阳线（放宽下影线要求，增加信号量）
     drawdown = (high_20b - close) / high_20b * 100
     body = (close - df["open"]).abs()
     lower_shadow = df[["open", "close"]].min(axis=1) - low
     signals["bottom"] = (
-        (drawdown > 15) & (volume > vol_ma5 * 3) & (close > df["open"])
-        & (body > 0) & (lower_shadow > body * 2)
+        (drawdown > 12) & (volume > vol_ma5 * 2) & (close > df["open"])
+        & (body > 0) & (lower_shadow > body * 0.5)
     )
 
     # RPS强势：120日涨幅>50% + 接近新高
@@ -174,6 +178,24 @@ def _compute_signals(df: pd.DataFrame, finance_series: dict[str, pd.Series] | No
     else:
         signals["limit_down"] = pd.Series(False, index=df.index)
 
+    # 地量见底：换手率创60日新低 + 价格企稳 + 流动性
+    if "turn" in df.columns and len(df) >= 60:
+        turn = df["turn"].astype(float)
+        turn_min60 = turn.shift(1).rolling(60).min()
+        is_extreme_low = (turn <= turn_min60 * 1.1) & (turn_min60 > 0)
+        ret_5d = close / close.shift(5) - 1
+        is_stable = ret_5d > -0.03
+        liquid = turnover > 50_000_000
+        not_limit = (df.get("pct_chg", pd.Series(0, index=df.index)) < 9.5) if "pct_chg" in df.columns else True
+        signals["volume_extreme"] = is_extreme_low & is_stable & liquid
+    else:
+        signals["volume_extreme"] = pd.Series(False, index=df.index)
+
+    # 板块龙头代理信号：单日涨幅>5% + 成交额>2亿 + 5日动量>8%（近似龙头启动）
+    ret_1d = close / close.shift(1) - 1
+    ret_5d_mom = close / close.shift(5) - 1
+    signals["dragon"] = (ret_1d > 0.05) & (turnover > 2e8) & (ret_5d_mom > 0.08)
+
     # 多因子选股：综合因子分Top20%分位 = 触发信号
     try:
         from sequoia_x.analysis.factor import compute_composite_score
@@ -183,6 +205,29 @@ def _compute_signals(df: pd.DataFrame, finance_series: dict[str, pd.Series] | No
         signals["multi_factor"] = composite >= threshold
     except Exception:
         signals["multi_factor"] = pd.Series(False, index=df.index)
+
+    # 龙虎榜跟买代理信号：大单净流入+涨幅温和+趋势确认
+    # （回测中无真实龙虎榜数据，用"放量上涨+温和涨幅+趋势确认"近似）
+    if len(df) >= 60:
+        ma60_lb = close.rolling(60).mean()
+        trend_ok = (ma20 > ma60_lb) & (close > ma20)
+        vol_surge_lb = volume > vol_ma20 * 2.0  # 放量2倍
+        mild_gain = (close / close.shift(1) - 1 > 0.02) & (close / close.shift(1) - 1 < 0.095)
+        liquid_lb = turnover > 2e8
+        signals["lhb_follow"] = trend_ok & vol_surge_lb & mild_gain & liquid_lb
+    else:
+        signals["lhb_follow"] = pd.Series(False, index=df.index)
+
+    # 板块轮动代理信号：20日动量Top + 趋势确认 + 放量突破
+    if len(df) >= 60:
+        ma60_sr = close.rolling(60).mean()
+        ret_20d_sr = close / close.shift(20) - 1
+        strong_momentum = ret_20d_sr > 0.10  # 20日涨幅>10%
+        trend_sr = (ma20 > ma60_sr) & (close > ma20)
+        breakout_sr = close > high.shift(1).rolling(20).max()
+        signals["sector_rotation"] = strong_momentum & trend_sr & breakout_sr
+    else:
+        signals["sector_rotation"] = pd.Series(False, index=df.index)
 
     return signals
 

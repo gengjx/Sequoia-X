@@ -112,6 +112,9 @@ class MultiFactorStrategy(BaseStrategy):
         """执行多因子选股，返回综合因子分Top N的股票代码。"""
         symbols = list(self._shared_daily.keys()) if self._shared_daily else self.engine.get_local_symbols()
 
+        # ── 选股池硬过滤：ST/退市预警 ──
+        symbols = self._filter_universe(symbols)
+
         # P1: 市场状态自适应——根据当前市场状态选择对应权重
         market_state = self._detect_market_state()
         active_weights = self.get_weights_for_state(market_state)
@@ -123,11 +126,12 @@ class MultiFactorStrategy(BaseStrategy):
         # 预加载龙虎榜（近30天上榜次数+净买入额）
         lhb_map = self._load_lhb_map()
 
-        # 采集全市场因子截面（含质量因子+资金因子）
+        # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
+        trend_info: dict[str, dict] = {}
         for sym in symbols:
             df = self.get_daily(sym)
-            if df is None or len(df) < 20:
+            if df is None or len(df) < 60:
                 continue
             try:
                 factors = compute_factors(
@@ -138,6 +142,20 @@ class MultiFactorStrategy(BaseStrategy):
                 )
                 factors["symbol"] = sym
                 rows.append(factors)
+
+                # 趋势确认指标（避免纯反转因子选出的"飞刀"股）
+                close = df["close"]
+                ma20 = close.iloc[-20:].mean()
+                ma60 = close.iloc[-60:].mean()
+                ret_5d = close.iloc[-1] / close.iloc[-6] - 1 if len(close) >= 6 else 0
+                ret_20d = close.iloc[-1] / close.iloc[-21] - 1 if len(close) >= 21 else 0
+                trend_info[sym] = {
+                    "above_ma20": close.iloc[-1] > ma20,
+                    "ma20_above_ma60": ma20 > ma60,
+                    "ret_5d": float(ret_5d) if ret_5d == ret_5d else 0,
+                    "ret_20d": float(ret_20d) if ret_20d == ret_20d else 0,
+                    "stabilized": float(ret_5d) > -0.03 if ret_5d == ret_5d else False,
+                }
             except Exception:
                 continue
         if not rows:
@@ -146,20 +164,56 @@ class MultiFactorStrategy(BaseStrategy):
 
         df_factors = pd.DataFrame(rows).set_index("symbol")
 
+        # ── 注入ML因子分（如果权重中包含ml_score）──
+        if "ml_score" in active_weights:
+            ml_scores = self._compute_ml_scores(df_factors.index.tolist())
+            if ml_scores:
+                ml_series = pd.Series(ml_scores, name="ml_score")
+                df_factors = df_factors.join(ml_series, how="left")
+                logger.info(f"ML因子注入：{len(ml_scores)}只股票获得ml_score")
+
         # 横截面百分位排名（消除量纲）
         valid_factors = [f for f in active_weights if f in df_factors.columns]
         df_rank = cross_section_rank(df_factors[valid_factors])
 
-        # 带符号IC加权合成综合因子分
-        weights = {f: active_weights[f] for f in valid_factors}
+        # 带符号IC加权合成综合因子分（权重再平衡：防止单类因子主导）
+        weights = self._rebalance_weights({f: active_weights[f] for f in valid_factors})
         total_w = sum(abs(w) for w in weights.values())
         if total_w == 0:
             logger.warning("多因子权重全为0，无法选股")
             return []
 
         df_rank["composite"] = sum(
-            df_rank[f] * w for f, w in weights.items()
+            df_rank[f].fillna(0) * w for f, w in weights.items()
         ) / total_w
+
+        # ── 趋势确认过滤：排除下降趋势中的股票 ──
+        # 纯反转因子会选出"跌多了的股票"，但这些股票经常继续跌。
+        # 要求MA20>MA60（中期上升趋势）+ 价格站稳MA20 + 近5日企稳。
+        confirmed = {sym for sym, t in trend_info.items()
+                     if t["ma20_above_ma60"] and t["above_ma20"] and t["stabilized"]}
+        if len(confirmed) < self._TOP_N * 2:
+            # 候选不足时放宽
+            confirmed = {sym for sym, t in trend_info.items()
+                         if t["ma20_above_ma60"] and t["above_ma20"]}
+        if len(confirmed) < self._TOP_N:
+            confirmed = {sym for sym, t in trend_info.items() if t["above_ma20"]}
+
+        before_filter = len(df_rank)
+        df_rank = df_rank[df_rank.index.isin(confirmed)]
+        filtered_out = before_filter - len(df_rank)
+
+        # ── 动量修正加分：趋势确认股中，已企稳反弹的优先 ──
+        for sym in df_rank.index:
+            t = trend_info.get(sym, {})
+            ret5 = t.get("ret_5d", 0)
+            ret20 = t.get("ret_20d", 0)
+            if ret5 > 0 and ret20 > -0.05:
+                df_rank.loc[sym, "composite"] += 0.08
+            elif ret5 > 0:
+                df_rank.loc[sym, "composite"] += 0.04
+            if ret20 > 0.05:
+                df_rank.loc[sym, "composite"] += 0.03
 
         # 选Top N
         top = df_rank.nlargest(self._TOP_N, "composite")
@@ -167,10 +221,102 @@ class MultiFactorStrategy(BaseStrategy):
 
         logger.info(
             f"MultiFactorStrategy 选出 {len(selected)} 只 "
-            f"（{len(valid_factors)}因子IC加权，综合分"
+            f"（{len(valid_factors)}因子IC加权，趋势过滤淘汰{filtered_out}只，综合分"
             f"{top['composite'].min():.1f}~{top['composite'].max():.1f}）"
         )
         return selected
+
+    def _compute_ml_scores(self, symbols: list[str]) -> dict[str, float]:
+        """计算ML因子分（Ridge因子合成）。
+
+        用最近18个月数据训练，预测当前截面每只股票的ml_score。
+        纯numpy实现，不依赖sklearn。
+        """
+        try:
+            from sequoia_x.analysis.ml_factor import MLFactorEngine
+            import sqlite3
+            import numpy as np
+            import pandas as pd
+
+            engine = MLFactorEngine(self.engine.db_path)
+            result = engine.compute_ml_score()
+            if result.get("valid"):
+                logger.info(f"ML因子IC={result['ic_mean']} ICIR={result['icir']}")
+                return result.get("predictions", {})
+            else:
+                logger.warning(f"ML因子无效(IC={result.get('ic_mean',0)})，跳过注入")
+                return {}
+        except Exception as e:
+            logger.warning(f"ML因子计算失败：{e!r}")
+            return {}
+
+    def _filter_universe(self, symbols: list[str]) -> list[str]:
+        """选股池硬过滤：剔除ST/退市预警股。"""
+        import sqlite3
+        with sqlite3.connect(self.engine.db_path) as conn:
+            st_rows = conn.execute(
+                "SELECT symbol FROM stock_basic "
+                "WHERE name LIKE 'ST%' OR name LIKE '%*ST%' OR name LIKE '%退%'"
+            ).fetchall()
+            st_set = {r[0] for r in st_rows}
+
+        n_before = len(symbols)
+        filtered = [s for s in symbols if s not in st_set]
+        if n_before != len(filtered):
+            logger.info(f"选股池过滤：剔除{n_before - len(filtered)}只ST/退市预警股，剩余{len(filtered)}只")
+        return filtered
+
+    def _rebalance_weights(self, weights: dict[str, float]) -> dict[str, float]:
+        """权重再平衡：单因子上限 + 大类约束。
+
+        解决IC自动权重过度集中问题：
+          - 单因子绝对权重 ≤ 15%（防流动性主导）
+          - 流动性大类总权重 ≤ 25%（防僵尸股入选）
+          - 质量/估值从流动性节余自然获得更大占比
+        """
+        LIQ = {"turnover", "amihud", "volume_ratio", "turn_ratio", "liq_rank", "turn_surge"}
+
+        total_abs = sum(abs(w) for w in weights.values())
+        if total_abs == 0:
+            return weights
+
+        # 单因子上限 15%
+        cap = total_abs * 0.15
+        adjusted = {}
+        for f, w in weights.items():
+            adjusted[f] = cap * (1 if w > 0 else -1) if abs(w) > cap else w
+
+        # 流动性大类 ≤ 25%
+        liq_wt = sum(abs(adjusted.get(f, 0)) for f in LIQ) / total_abs
+        if liq_wt > 0.25:
+            shrink = 0.25 / liq_wt
+            for f in LIQ:
+                if f in adjusted:
+                    adjusted[f] *= shrink
+            logger.info(f"权重再平衡：流动性{liq_wt*100:.0f}%→25%")
+
+        qual_wt = sum(abs(adjusted.get(f, 0)) for f in ("np_margin", "roe", "gp_margin", "rev_growth", "profit_growth")) / total_abs
+        val_wt = sum(abs(adjusted.get(f, 0)) for f in ("pe_ratio", "pb_ratio")) / total_abs
+
+        # 质量估值下限：质量≥15% + 估值≥10%（P0调整：折中值）
+        # 质量因子方向稳定、路径风险极低，是降低止损率的关键
+        QUAL_FLOOR = 0.15
+        VAL_FLOOR = 0.10
+        if qual_wt < QUAL_FLOOR:
+            for f in ("np_margin", "rev_growth", "gp_margin", "roe", "profit_growth"):
+                if f in adjusted and adjusted[f] != 0:
+                    adjusted[f] *= QUAL_FLOOR / max(qual_wt, 0.01)
+                    break
+            logger.info(f"权重再平衡：质量{qual_wt*100:.0f}%→{QUAL_FLOOR*100:.0f}%")
+        if val_wt < VAL_FLOOR:
+            for f in ("pb_ratio", "pe_ratio"):
+                if f in adjusted and adjusted[f] != 0:
+                    adjusted[f] *= VAL_FLOOR / max(val_wt, 0.01)
+                    break
+            logger.info(f"权重再平衡：估值{val_wt*100:.0f}%→{VAL_FLOOR*100:.0f}%")
+
+        logger.info(f"权重分布：流动性{liq_wt*100:.0f}% 质量{qual_wt*100:.0f}% 估值{val_wt*100:.0f}%")
+        return adjusted
 
     def get_factor_weights(self) -> dict[str, float]:
         """返回当前因子权重（供前端展示）。"""
