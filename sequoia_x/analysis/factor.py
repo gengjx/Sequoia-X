@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pandas as pd
 
@@ -23,6 +24,14 @@ from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+# ── 因子显著性过滤门槛（A 股月频工业标准）──
+# alpha 泄漏修复：旧门槛 |IC|>0.015 & ICIR>0.3 过低，放噪声因子进权重稀释强信号。
+# 新门槛三者全过才进权重（宁可少不要错），样本不足(n<MIN_IC_SAMPLES)的因子默认不显著。
+MIN_IC_ABS = 0.03       # IC 绝对值下限
+MIN_ICIR_ABS = 0.5      # ICIR 绝对值下限（信息比率）
+MIN_T_STAT = 2.0        # t 统计量下限（≈95% 置信），样本不足时可下调到 1.65(90%)
+MIN_IC_SAMPLES = 6      # 最少月度 IC 观测数，否则默认不显著
 
 # 因子分类（key=因子名, category=大类, direction=+1正向/-1反向）
 FACTOR_META: dict[str, dict] = {
@@ -843,12 +852,14 @@ def evaluate_factor_ic(
             ic_std = float(np.std(ics))
             icir = ic_mean / ic_std if ic_std > 0 else 0
             win_rate = float((np.array(ics) > 0).mean() * 100)
-            if abs(ic_mean) > 0.025 and abs(icir) > 0.3:  # 提高门槛：剔除弱噪声因子，集中权重给强因子
+            t_stat = _t_stat(ic_mean, ic_std, len(ics))
+            if _is_significant(ic_mean, icir, t_stat, len(ics)):  # 三重显著性过滤，与主表口径一致
                 state_reports.append({
                     "factor_name": f,
                     "category": FACTOR_META.get(f, {}).get("category", ""),
                     "ic_mean": round(ic_mean, 4),
                     "icir": round(icir, 4),
+                    "t_stat": round(t_stat, 3),
                     "win_rate": round(win_rate, 1),
                 })
         total_ic = sum(abs(r["ic_mean"]) for r in state_reports)
@@ -884,6 +895,8 @@ def evaluate_factor_ic(
         ic_std = float(np.std(ics))
         icir = ic_mean / ic_std if ic_std > 0 else 0
         win_rate = float((np.array(ics) > 0).mean() * 100)
+        n_ics = len(ics)
+        t_stat = _t_stat(ic_mean, ic_std, n_ics)
 
         # 分层收益：Top组-Q5组（最后一个月）
         last_batch = pd.DataFrame(records[sorted_months[-1]])
@@ -903,6 +916,8 @@ def evaluate_factor_ic(
             "ic_mean": round(ic_mean, 4),
             "ic_std": round(ic_std, 4),
             "icir": round(icir, 4),
+            "t_stat": round(t_stat, 3),
+            "n_samples": n_ics,
             "win_rate": round(win_rate, 1),
             "assessment": _factor_assessment(ic_mean, icir, win_rate),
             "quantile_spread": q_spread,
@@ -914,13 +929,14 @@ def evaluate_factor_ic(
     # 写回DB：带符号IC权重（正IC→正权重，负IC→负权重）+ ICIR筛选门槛
     #
     # 专业做法：
-    #   1. 只保留 |IC|>0.015 且 |ICIR|>0.3 的因子（剔除噪音）
+    #   1. 只保留统计显著因子（|IC|>0.03 且 |ICIR|>0.5 且 |t|≥2，样本≥6）
     #   2. 权重 = IC_signed / sum(|IC_signed|)，保留IC方向
     #   3. 负IC因子获得负权重，在综合分中做减法（相当于反向指标的正确使用）
     #   4. 综合分 = Σ(因子排名 × signed_weight)，正因子贡献高分，负因子拖累
     try:
         effective = [f for f in factor_reports
-                     if abs(f["ic_mean"]) > 0.015 and abs(f.get("icir", 0)) > 0.3]
+                     if _is_significant(f["ic_mean"], f.get("icir", 0),
+                                        f.get("t_stat", 0), f.get("n_samples", 0))]
 
         # P4: 因子去重——剔除同义因子，只保留每组IC最强的
         # 定义同义因子组（因子值高度相关，来自截面相关性分析）
@@ -953,18 +969,18 @@ def evaluate_factor_ic(
             logger.info(f"因子去重：剔除{len(removed)}个同义因子({', '.join(sorted(removed))})")
 
         total_ic = sum(abs(f["ic_mean"]) for f in effective)
+        # 先清零所有因子的旧权重（无条件执行，防 total_ic==0 时 stale 权重残留）
+        import sqlite3 as _sq3
+        with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
+            _conn.execute("UPDATE factor_weights SET weight=0")
         if total_ic > 0:
-            effective_names = {f["name"] for f in effective}
-            # 先清零所有因子的旧权重（防止未筛选因子残留旧绝对值正值权重）
-            import sqlite3 as _sq3
-            with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
-                _conn.execute("UPDATE factor_weights SET weight=0")
             # 写入新的带符号权重
             weights = [{
                 "factor_name": f["name"],
                 "category": f.get("category", ""),
                 "ic_mean": f["ic_mean"],
                 "icir": f.get("icir", 0),
+                "t_stat": f.get("t_stat", 0),
                 "win_rate": f.get("win_rate", 0),
                 # 带符号权重：正IC正权重，负IC负权重，按|IC|归一化
                 "weight": round(f["ic_mean"] / total_ic, 4),
@@ -973,6 +989,8 @@ def evaluate_factor_ic(
             pos_cnt = sum(1 for w in weights if w["weight"] > 0)
             neg_cnt = sum(1 for w in weights if w["weight"] < 0)
             logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子（{pos_cnt}正+{neg_cnt}负）")
+        else:
+            logger.warning("无因子通过显著性过滤(0.03/0.5/2.0)，权重已全量清零，检查数据/窗口")
     except Exception as e:
         logger.warning(f"因子权重写DB失败（不影响评估结果）：{e!r}")
 
@@ -1004,6 +1022,30 @@ def evaluate_factor_ic(
         "month_states": month_states,
         "crowding": crowding_scores,
     }
+
+
+def _t_stat(ic_mean: float, ic_std: float, n: int) -> float:
+    """月度 Rank IC 的 t 统计量 = ic_mean / (ic_std / sqrt(n))。
+
+    衡量 IC 是否统计显著区别于 0（|t|≥2 ≈ 95% 置信）。样本不足时返回 0
+    （视为不显著），避免小样本噪声被当作有效信号。
+    """
+    if n < MIN_IC_SAMPLES or ic_std <= 0:
+        return 0.0
+    return float(ic_mean / (ic_std / math.sqrt(n)))
+
+
+def _is_significant(ic_mean: float, icir: float, t_stat: float, n: int) -> bool:
+    """三重显著性过滤：IC/ICIR/t-stat 同时达标 且 样本充足。
+
+    alpha 泄漏修复：旧门槛仅 |IC|>0.015 & ICIR>0.3 过低，让一堆 IC≈0.03 的
+    噪声因子获得小权重稀释强信号。新门槛三者全过才进权重。
+    """
+    if n < MIN_IC_SAMPLES:
+        return False
+    return (abs(ic_mean) > MIN_IC_ABS
+            and abs(icir) > MIN_ICIR_ABS
+            and abs(t_stat) >= MIN_T_STAT)
 
 
 def _factor_assessment(ic_mean: float, icir: float, win_rate: float) -> str:
