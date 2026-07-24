@@ -261,3 +261,17 @@ class FinanceSync:
             "failed": len(missing) - (final_count - (len(all_symbols) - len(missing))),
             "elapsed": round(elapsed, 0),
         }
+
+
+def backfill_finance_history(settings=None, n_quarters: int = 20, max_stocks: int | None = None) -> dict:
+    """一次性离线回补财报历史（默认 20 个季度 ≈ 5 年）。
+
+    与每日增量同步（n_quarters=6）不同，本函数拉取更长时间窗口的历史财报，
+    使基本面因子的 IC/t-stat 评估有充足样本。
+
+    用法：
+        python -c "from sequoia_x.data.finance_sync import backfill_finance_history; backfill_finance_history()"
+    或通过 Web 任务触发。复用 baostock 额度保护，超额自动截断分批。
+    """
+    syncer = FinanceSync(settings)
+    return syncer.sync_all(n_quarters=n_quarters, n_workers=3, max_stocks=max_stocks)

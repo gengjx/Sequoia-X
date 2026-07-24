@@ -193,6 +193,19 @@ CREATE TABLE IF NOT EXISTS market_factor_weights (
 );
 """
 
+_CREATE_ML_SCORES_SQL = """
+CREATE TABLE IF NOT EXISTS ml_scores (
+    run_date      TEXT    NOT NULL,
+    symbol        TEXT    NOT NULL,
+    ml_score      REAL,
+    ic_mean       REAL    DEFAULT 0,
+    icir          REAL    DEFAULT 0,
+    t_stat        REAL    DEFAULT 0,
+    model_version TEXT    DEFAULT '',
+    PRIMARY KEY (run_date, symbol)
+);
+"""
+
 _CREATE_LHB_DETAIL_SQL = """
 CREATE TABLE IF NOT EXISTS lhb_detail (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -298,6 +311,7 @@ class DataEngine:
             conn.execute(_CREATE_PAPER_HOLDINGS_SQL)
             conn.execute(_CREATE_PAPER_NAV_SQL)
             conn.execute(_CREATE_MARKET_FACTOR_WEIGHTS_SQL)
+            conn.execute(_CREATE_ML_SCORES_SQL)
             conn.execute(_CREATE_MINUTE_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_sym_dt ON stock_minute(symbol, datetime)")
             # 增量迁移：给已有DB补列（旧数据新列为NULL，不破坏）

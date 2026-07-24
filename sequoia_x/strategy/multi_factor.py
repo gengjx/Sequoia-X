@@ -125,6 +125,8 @@ class MultiFactorStrategy(BaseStrategy):
         fund_flow_map = self._load_fund_flow_map()
         # 预加载龙虎榜（近30天上榜次数+净买入额）
         lhb_map = self._load_lhb_map()
+        # 预加载北向持股历史（用于北向因子）
+        north_map = self._load_north_map()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
@@ -139,6 +141,7 @@ class MultiFactorStrategy(BaseStrategy):
                     finance=finance_map.get(sym),
                     fund_flow=fund_flow_map.get(sym),
                     lhb_data=lhb_map.get(sym),
+                    north_hold=north_map.get(sym),
                 )
                 factors["symbol"] = sym
                 rows.append(factors)
@@ -227,27 +230,32 @@ class MultiFactorStrategy(BaseStrategy):
         return selected
 
     def _compute_ml_scores(self, symbols: list[str]) -> dict[str, float]:
-        """计算ML因子分（Ridge因子合成）。
+        """读取 ml_scores 月度快照（不实时训练）。
 
-        用最近18个月数据训练，预测当前截面每只股票的ml_score。
-        纯numpy实现，不依赖sklearn。
+        ML 引擎在 monthly_sweep 中月度训练一次，写全市场预测快照到 ml_scores 表。
+        决策层只读当日快照，避免每次决策都重训模型。
         """
+        import sqlite3
         try:
-            from sequoia_x.analysis.ml_factor import MLFactorEngine
-            import sqlite3
-            import numpy as np
-            import pandas as pd
-
-            engine = MLFactorEngine(self.engine.db_path)
-            result = engine.compute_ml_score()
-            if result.get("valid"):
-                logger.info(f"ML因子IC={result['ic_mean']} ICIR={result['icir']}")
-                return result.get("predictions", {})
-            else:
-                logger.warning(f"ML因子无效(IC={result.get('ic_mean',0)})，跳过注入")
-                return {}
+            with sqlite3.connect(self.engine.db_path) as conn:
+                # 取最新 run_date 的快照
+                row = conn.execute(
+                    "SELECT MAX(run_date) FROM ml_scores"
+                ).fetchone()
+                if not row or not row[0]:
+                    logger.info("ML因子：无快照（月度训练未运行），跳过注入")
+                    return {}
+                run_date = row[0]
+                rows = conn.execute(
+                    "SELECT symbol, ml_score FROM ml_scores WHERE run_date=?",
+                    (run_date,),
+                ).fetchall()
+            scores = {r[0]: float(r[1]) for r in rows
+                      if r[1] is not None and r[1] == r[1]}
+            logger.info(f"ML因子快照读取：{len(scores)}只（run_date={run_date}）")
+            return scores
         except Exception as e:
-            logger.warning(f"ML因子计算失败：{e!r}")
+            logger.warning(f"ML因子快照读取失败（表可能不存在）：{e!r}")
             return {}
 
     def _filter_universe(self, symbols: list[str]) -> list[str]:
@@ -362,12 +370,14 @@ class MultiFactorStrategy(BaseStrategy):
             with sqlite3.connect(self.engine.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni "
+                    "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
+                    "yoy_ni, asset_turn, inv_turn, nr_turn "
                     "FROM stock_finance WHERE symbol IN ({}) "
                     "AND stat_date = (SELECT MAX(stat_date) FROM stock_finance f2 WHERE f2.symbol = stock_finance.symbol)".format(
                         ",".join("?" * len(symbols))
                     ) if len(symbols) <= 900 else
-                    "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni "
+                    "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
+                    "yoy_ni, asset_turn, inv_turn, nr_turn "
                     "FROM stock_finance WHERE stat_date IN (SELECT MAX(stat_date) FROM stock_finance)",
                     symbols if len(symbols) <= 900 else []
                 ).fetchall()
@@ -388,11 +398,14 @@ class MultiFactorStrategy(BaseStrategy):
             with sqlite3.connect(self.engine.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT symbol, main_net, main_pct FROM fund_flow "
+                    "SELECT symbol, main_net, main_pct, super_net, big_net FROM fund_flow "
                     "WHERE date = (SELECT MAX(date) FROM fund_flow)"
                 ).fetchall()
                 for r in rows:
-                    flow_map[r["symbol"]] = {"main_net": r["main_net"], "main_pct": r["main_pct"]}
+                    flow_map[r["symbol"]] = {
+                        "main_net": r["main_net"], "main_pct": r["main_pct"],
+                        "super_net": r["super_net"], "big_net": r["big_net"],
+                    }
             if flow_map:
                 logger.info(f"资金流向加载：{len(flow_map)}只")
             return flow_map
@@ -418,4 +431,29 @@ class MultiFactorStrategy(BaseStrategy):
             return lhb_map
         except Exception as e:
             logger.warning(f"加载龙虎榜失败：{e!r}")
+            return {}
+
+    def _load_north_map(self) -> dict[str, "pd.DataFrame"]:
+        """加载北向资金持股历史，返回 {symbol: DataFrame(date, hold_pct)}。
+
+        北向数据高度集中于中大市值，小盘股无数据则不返回（compute_factors 中返回 nan）。
+        """
+        try:
+            import sqlite3
+            north_map: dict[str, pd.DataFrame] = {}
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, date, hold_pct FROM north_hold "
+                    "WHERE hold_pct IS NOT NULL ORDER BY symbol, date"
+                ).fetchall()
+            tmp: dict[str, list] = {}
+            for r in rows:
+                tmp.setdefault(r[0], []).append({"date": str(r[1]), "hold_pct": float(r[2])})
+            for sym, recs in tmp.items():
+                north_map[sym] = pd.DataFrame(recs)
+            if north_map:
+                logger.info(f"北向持股加载：{len(north_map)}只")
+            return north_map
+        except Exception as e:
+            logger.warning(f"加载北向持股失败（表可能不存在）：{e!r}")
             return {}

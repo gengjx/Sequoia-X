@@ -326,6 +326,20 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"月度策略质量重评失败（不影响参数扫描结果）：{e!r}")
 
+        # ML 因子合成月度训练（LightGBM/Ridge）→ 写 ml_scores 快照 + factor_weights.ml_score
+        # 与因子IC刷新、oos_decay 同批次，不进每日闭环
+        try:
+            from sequoia_x.analysis.ml_factor import MLFactorEngine
+            ml_engine = MLFactorEngine(self.db_path)
+            ml_result = ml_engine.compute_ml_score()
+            logger.info(
+                f"月度ML训练完成：IC={ml_result.get('ic_mean', 0)} "
+                f"ICIR={ml_result.get('icir', 0)} 有效={ml_result.get('valid', False)} "
+                f"模型={ml_result.get('model_version', '?')}"
+            )
+        except Exception as e:
+            logger.warning(f"月度ML训练失败（不影响其他任务）：{e!r}")
+
     def _daily_report(self) -> str:
         """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
         from sequoia_x.notify.feishu import FeishuNotifier
@@ -443,7 +457,7 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"资金流向同步失败：{e!r}")
 
-        # 历史回填（增量，只补充最近60天）
+        # 历史回填（增量回补~1年，供基本面/资金类因子 IC 评估）
         try:
             import sqlite3
             from sequoia_x.data.fund_flow_history import backfill_fund_flow_history
@@ -451,16 +465,27 @@ class AuctionScheduler:
                 symbols = [r[0] for r in conn.execute(
                     "SELECT DISTINCT symbol FROM ("
                     "SELECT symbol FROM decision_pool UNION "
-                    "SELECT symbol FROM lhb_detail) "
+                    "SELECT symbol FROM lhb_detail UNION "
+                    "SELECT symbol FROM paper_holdings UNION "
+                    "SELECT symbol FROM stock_market_cap "
+                    "WHERE circ_mv IS NOT NULL ORDER BY circ_mv DESC LIMIT 500) "
                     "ORDER BY symbol LIMIT 500"
                 ).fetchall()]
             if symbols:
                 result = backfill_fund_flow_history(
-                    self.db_path, symbols, days=60, n_workers=3
+                    self.db_path, symbols, days=250, n_workers=3
                 )
                 logger.info(f"资金流向历史回填：{result}")
         except Exception as e:
             logger.warning(f"资金流向历史回填失败：{e!r}")
+
+        # 北向资金持股同步（中大市值前 800 只）
+        try:
+            from sequoia_x.data.north_sync import backfill_north_hold
+            result = backfill_north_hold(self.db_path, top_n=800, n_workers=3)
+            logger.info(f"北向持股同步：{result}")
+        except Exception as e:
+            logger.warning(f"北向持股同步失败（不影响其他任务）：{e!r}")
 
     def _auction_verify(self) -> None:
         """竞价T+1命中验证（数据同步后执行）。"""

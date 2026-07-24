@@ -84,9 +84,15 @@ FACTOR_META: dict[str, dict] = {
     "gp_margin":   {"category": "质量", "desc": "毛利率"},
     "rev_growth":  {"category": "质量", "desc": "营收增速"},
     "profit_growth":{"category": "质量", "desc": "利润增速"},
+    # ── 成长(1)（同比增长率，来自stock_finance）──
+    "yoy_ni":      {"category": "成长", "desc": "净利润同比增长率"},
     # ── 估值(2) ──
     "pe_ratio":    {"category": "估值", "desc": "市盈率TTM（低估值溢价）"},
     "pb_ratio":    {"category": "估值", "desc": "市净率（低估值溢价）"},
+    # ── 营运效率(3)（Barra风格周转率，来自stock_finance）──
+    "asset_turn":  {"category": "营运", "desc": "总资产周转率"},
+    "inv_turn":    {"category": "营运", "desc": "存货周转率"},
+    "nr_turn":     {"category": "营运", "desc": "应收账款周转率"},
     # ── 龙虎榜(2) ──
     "lhb_count":   {"category": "龙虎榜", "desc": "近30天上榜次数"},
     "lhb_netbuy":  {"category": "龙虎榜", "desc": "近30天龙虎榜净买入额"},
@@ -96,16 +102,23 @@ FACTOR_META: dict[str, dict] = {
     "flow_trend":       {"category": "资金流", "desc": "5日vs20日资金流趋势"},
     "flow_super_ratio": {"category": "资金流", "desc": "超大单占比（机构资金方向）"},
     "flow_intensity":   {"category": "资金流", "desc": "主力资金净流入强度"},
+    # ── 北向资金(2)（沪深港通持股，来自north_hold表）──
+    "nb_holding_pct":  {"category": "北向", "desc": "北向持股占比（机构持仓水平）"},
+    "nb_inflow":       {"category": "北向", "desc": "近20日北向持股占比变化（增量资金方向）"},
 }
 
 
 def compute_factors(df: pd.DataFrame, finance: dict | None = None,
-                   fund_flow: dict | None = None, lhb_data: dict | None = None, ) -> dict[str, float]:
+                   fund_flow: dict | None = None, lhb_data: dict | None = None,
+                   north_hold: pd.DataFrame | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
     Args:
         df: OHLCV DataFrame（按日期升序），需含 open/high/low/close/volume/turnover
         finance: 财务数据 dict（roe/np_margin等），可选
+        fund_flow: 资金流向 dict，可选
+        lhb_data: 龙虎榜 dict，可选
+        north_hold: 北向资金持股 DataFrame（列含 date/hold_pct，升序），可选
 
     Returns:
         {因子名: 因子值}，取最后一日（最新截面）。无效因子返回nan。
@@ -264,16 +277,44 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         for k in ["lhb_count", "lhb_netbuy"]:
             factors[k] = np.nan
 
-    # ════════ 质量(5) ════════
+    # ════════ 质量(5) + 成长(1) + 营运效率(3) ════════
     if finance:
         factors["roe"] = _safe_float(finance.get("roe"))             # 净资产收益率
         factors["np_margin"] = _safe_float(finance.get("np_margin")) # 净利率
         factors["gp_margin"] = _safe_float(finance.get("gp_margin")) # 毛利率
         factors["rev_growth"] = _safe_float(finance.get("yoy_eps"))  # EPS增速（营收增速代理）
         factors["profit_growth"] = _safe_float(finance.get("yoy_pni"))  # 扣非净利润增速
+        # 成长：净利润同比增长率
+        factors["yoy_ni"] = _safe_float(finance.get("yoy_ni"))
+        # 营运效率（Barra风格周转率）
+        factors["asset_turn"] = _safe_float(finance.get("asset_turn"))
+        factors["inv_turn"] = _safe_float(finance.get("inv_turn"))
+        factors["nr_turn"] = _safe_float(finance.get("nr_turn"))
     else:
-        for k in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"]:
+        for k in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
+                  "yoy_ni", "asset_turn", "inv_turn", "nr_turn"]:
             factors[k] = np.nan
+
+    # ════════ 北向资金(2)（沪深港通持股）════════
+    if north_hold is not None and len(north_hold) > 0:
+        try:
+            nh = north_hold.sort_values("date")
+            last_pct = _safe_float(nh.iloc[-1]["hold_pct"])
+            factors["nb_holding_pct"] = last_pct
+            if len(nh) >= 21:
+                pct_20d_ago = _safe_float(nh.iloc[-21]["hold_pct"])
+                if not np.isnan(last_pct) and not np.isnan(pct_20d_ago):
+                    factors["nb_inflow"] = last_pct - pct_20d_ago
+                else:
+                    factors["nb_inflow"] = np.nan
+            else:
+                factors["nb_inflow"] = np.nan
+        except Exception:
+            factors["nb_holding_pct"] = np.nan
+            factors["nb_inflow"] = np.nan
+    else:
+        factors["nb_holding_pct"] = np.nan
+        factors["nb_inflow"] = np.nan
 
     # 清理nan→None（序列化友好）
     return {k: (None if (v != v) else round(v, 4)) for k, v in factors.items()}
@@ -618,8 +659,16 @@ def evaluate_factor_ic(
 
     # 加载质量因子的月度截面（按财报季度月份匹配）
     # stat_date 格式 YYYY-MM-DD，取 YYYY-MM 作为截面月份
-    quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth"}
+    quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
+                       "yoy_ni", "asset_turn", "inv_turn", "nr_turn"}
     valuation_factors = {"pe_ratio", "pb_ratio"}
+    # 因子名 → stock_finance 字段名映射（IC评估逐月取截面值用）
+    _finance_field_map = {
+        "roe": "roe", "np_margin": "np_margin", "gp_margin": "gp_margin",
+        "rev_growth": "yoy_eps", "profit_growth": "yoy_pni",
+        "yoy_ni": "yoy_ni", "asset_turn": "asset_turn",
+        "inv_turn": "inv_turn", "nr_turn": "nr_turn",
+    }
     has_quality = bool(set(factor_set) & quality_factors)
     has_valuation = bool(set(factor_set) & valuation_factors)
     finance_map: dict[str, dict] = {}  # {symbol: {roe, np_margin, ...}}
@@ -629,7 +678,8 @@ def evaluate_factor_ic(
             with _sq.connect(engine.db_path) as _conn:
                 # 取每只股票最新一季财报
                 _rows = _conn.execute(
-                    """SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni
+                    """SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
+                              yoy_ni, asset_turn, inv_turn, nr_turn
                        FROM stock_finance
                        WHERE (symbol, stat_date) IN (
                            SELECT symbol, MAX(stat_date) FROM stock_finance GROUP BY symbol
@@ -639,6 +689,7 @@ def evaluate_factor_ic(
                     finance_map[r[0]] = {
                         "roe": r[1], "np_margin": r[2], "gp_margin": r[3],
                         "yoy_eps": r[4], "yoy_pni": r[5],
+                        "yoy_ni": r[6], "asset_turn": r[7], "inv_turn": r[8], "nr_turn": r[9],
                     }
             logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
         except Exception as e:
@@ -656,8 +707,8 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：估值加载失败：{e!r}")
 
-    # 加载资金流向（main_net / main_pct）
-    fund_flow_factors = {"main_net", "main_pct"}
+    # 加载资金流向（main_net / main_pct / flow_super_ratio / flow_intensity）
+    fund_flow_factors = {"main_net", "main_pct", "flow_super_ratio", "flow_intensity"}
     has_fund_flow = bool(set(factor_set) & fund_flow_factors)
     fund_flow_map: dict[str, dict] = {}
     if has_fund_flow:
@@ -665,11 +716,14 @@ def evaluate_factor_ic(
         try:
             with _sq2.connect(engine.db_path) as _conn2:
                 _ff_rows = _conn2.execute(
-                    "SELECT symbol, main_net, main_pct FROM fund_flow "
+                    "SELECT symbol, main_net, main_pct, super_net, big_net FROM fund_flow "
                     "WHERE date=(SELECT MAX(date) FROM fund_flow)"
                 ).fetchall()
                 for r in _ff_rows:
-                    fund_flow_map[r[0]] = {"main_net": r[1], "main_pct": r[2]}
+                    fund_flow_map[r[0]] = {
+                        "main_net": r[1], "main_pct": r[2],
+                        "super_net": r[3], "big_net": r[4],
+                    }
             logger.info(f"因子IC评估：加载资金流向 {len(fund_flow_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：资金流向加载失败：{e!r}")
@@ -693,6 +747,23 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：龙虎榜加载失败：{e!r}")
 
+    # 加载北向资金持股历史（按股票→{date: hold_pct}，用于月度截面计算）
+    north_factors = {"nb_holding_pct", "nb_inflow"}
+    north_map: dict[str, dict[str, float]] = {}  # {symbol: {date_str: hold_pct}}
+    if set(factor_set) & north_factors:
+        import sqlite3 as _sq4
+        try:
+            with _sq4.connect(engine.db_path) as _conn4:
+                _nb_rows = _conn4.execute(
+                    "SELECT symbol, date, hold_pct FROM north_hold "
+                    "WHERE hold_pct IS NOT NULL ORDER BY symbol, date"
+                ).fetchall()
+            for r in _nb_rows:
+                north_map.setdefault(r[0], {})[str(r[1])] = float(r[2])
+            logger.info(f"因子IC评估：加载北向持股 {len(north_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：北向持股加载失败（表可能不存在）：{e!r}")
+
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
     records: dict[str, list[dict]] = {}  # {month: [{factor_values..., fwd_return}]}
@@ -709,10 +780,10 @@ def evaluate_factor_ic(
             df = df.reset_index(drop=True)
             # 向量化算完整序列的因子值（一次算完，按月取截面）
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
-            ts_factors = [f for f in factor_set if f not in
-                          ("roe","np_margin","gp_margin","rev_growth","profit_growth",
-                           "pe_ratio","pb_ratio",
-                           "lhb_count","lhb_netbuy","main_net","main_pct")]
+            # 所有 point-in-time 因子（非时序，按月取截面值）需排除出 compute_factor_series
+            _pit_factors = (quality_factors | valuation_factors | fund_flow_factors
+                            | lhb_factors | {"nb_holding_pct", "nb_inflow"})
+            ts_factors = [f for f in factor_set if f not in _pit_factors]
             series = compute_factor_series(df, ts_factors)
             dates = df["date"].astype(str).values
             months = np.array([d[:7] for d in dates])
@@ -741,25 +812,30 @@ def evaluate_factor_ic(
                                 row[k] = float(ff.get("main_net", 0)) if ff.get("main_net") is not None else None
                             elif k == "main_pct":
                                 row[k] = float(ff.get("main_pct", 0)) if ff.get("main_pct") is not None else None
+                            elif k == "flow_super_ratio":
+                                sn = ff.get("super_net")
+                                bn = ff.get("big_net")
+                                if sn is not None and bn is not None:
+                                    tot = abs(float(sn)) + abs(float(bn)) + 1
+                                    row[k] = float(sn) / tot
+                                else:
+                                    row[k] = None
+                            elif k == "flow_intensity":
+                                mn = ff.get("main_net")
+                                if mn is not None:
+                                    row[k] = abs(float(mn))
+                                else:
+                                    row[k] = None
                             else:
                                 row[k] = None
                         else:
                             row[k] = None
                     elif k in quality_factors:
                         fin = finance_map.get(sym)
-                        if fin:
-                            if k == "rev_growth":
-                                row[k] = float(fin.get("yoy_eps", 0)) if fin.get("yoy_eps") is not None else None
-                            elif k == "profit_growth":
-                                row[k] = float(fin.get("yoy_pni", 0)) if fin.get("yoy_pni") is not None else None
-                            elif k == "roe":
-                                row[k] = float(fin.get("roe", 0)) if fin.get("roe") is not None else None
-                            elif k == "np_margin":
-                                row[k] = float(fin.get("np_margin", 0)) if fin.get("np_margin") is not None else None
-                            elif k == "gp_margin":
-                                row[k] = float(fin.get("gp_margin", 0)) if fin.get("gp_margin") is not None else None
-                            else:
-                                row[k] = None
+                        field = _finance_field_map.get(k)
+                        if fin and field:
+                            v = fin.get(field)
+                            row[k] = float(v) if v is not None else None
                         else:
                             row[k] = None
                     elif k in valuation_factors:
@@ -768,6 +844,35 @@ def evaluate_factor_ic(
                             v = float(val[k])
                             if not np.isnan(v) and abs(v) < 10000:
                                 row[k] = v
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in lhb_factors:
+                        _lhb = lhb_map.get(sym)
+                        if _lhb:
+                            if k == "lhb_count":
+                                row[k] = float(_lhb.get("count", 0))
+                            elif k == "lhb_netbuy":
+                                row[k] = float(_lhb.get("net_buy", 0))
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in north_factors:
+                        nb_series = north_map.get(sym)
+                        if nb_series:
+                            asof_dates = [d for d in nb_series if d <= dates[i]]
+                            if asof_dates:
+                                cur_pct = nb_series[asof_dates[-1]]
+                                if k == "nb_holding_pct":
+                                    row[k] = cur_pct
+                                elif k == "nb_inflow":
+                                    idx20 = len(asof_dates) - 21
+                                    old_pct = nb_series[asof_dates[idx20]] if idx20 >= 0 else None
+                                    row[k] = (cur_pct - old_pct) if old_pct is not None else None
+                                else:
+                                    row[k] = None
                             else:
                                 row[k] = None
                         else:
@@ -954,6 +1059,8 @@ def evaluate_factor_ic(
             {"high_dist", "oversold"},
             # 波动率高度相关
             {"atr_pct", "vol_20"},
+            # 营运效率周转率高度相关
+            {"asset_turn", "inv_turn", "nr_turn"},
         ]
         removed = set()
         for group in _SYNONYM_GROUPS:
