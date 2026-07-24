@@ -50,6 +50,21 @@ STRATEGY_QUALITY: dict[str, int] = dict(_DEFAULT_STRATEGY_QUALITY)
 
 # 质量分 → 分层 → 定级加成
 _TIER_BONUS = {"S": 5, "A": 3, "B": 1, "C": 0, "D": -3}
+ 
+# ── 趋势硬过滤阈值（基于本地全市场数据，独立于当日breadth）──
+# breadth（涨跌家数）看"今日浪花"，趋势看"水位"。下跌途中的反弹日
+# breadth偏暖会误判bull满仓买突破。用"个股MA20上方占比"做硬过滤。
+TREND_DOWN_THRESHOLD = 45.0    # MA20上方占比<45% → 下跌趋势，强制降级
+TREND_DEEP_THRESHOLD = 40.0    # <40% → 深度下跌，触发空仓防御
+
+# ── 仓位集中化参数 ──
+# 散弹枪治理：峰值同时持仓24只(均值17)，多为1-2手微仓(¥4-6k)，稀释信号。
+# 集中到3-8个强信号，剔除无效微仓。
+MAX_HOLDINGS = 8              # 同时持仓上限（含现有持仓）
+MIN_LOT_SHARES = 300          # 最小建仓股数（3手），不足则观望
+MIN_POSITION_AMOUNT = 3000    # 最小建仓金额，不足则观望
+# ── 择时平滑参数 ──
+REGIME_CONFIRM_SCORE = 55     # 退出bear的确认门槛（breadth评分）
 
 
 def quality_tier(score: int) -> str:
@@ -214,6 +229,25 @@ class DecisionEngine:
 
         # 市场状态择时层：获取大盘评分，判定牛/震荡/熊
         market_state, market_score, market_label = self._get_market_state(market_fn)
+        # 趋势叠加层：下跌趋势硬过滤，防止反弹日 breadth 误判 bull 满仓
+        trend = self._market_trend_filter()
+        if trend["trend_down"] and market_state != "bear":
+            pct = trend["pct_above_ma20"]
+            market_state = "bear"
+            if trend["deep_down"]:
+                market_score = min(market_score, 29)  # 深度下跌 → 触发空仓防御
+            market_label = f"趋势过滤强制降级(MA20上方{pct:.0f}%)"
+            logger.warning(
+                f"趋势硬过滤：个股MA20上方仅{pct:.0f}%(<{TREND_DOWN_THRESHOLD:.0f}%)，"
+                f"下跌趋势中反弹日breadth不可信，强制降级bear"
+                + ("，深度下跌触发空仓" if trend["deep_down"] else "")
+            )
+        # 择时平滑：保守滞后，防震荡市逐日翻多翻空（7-21牛→7-22熊→7-23牛）
+        h_state, h_score, h_label = self._apply_regime_hysteresis(market_state, market_score, trend)
+        if h_label:
+            market_state, market_score = h_state, h_score
+            market_label = f"{market_label} | {h_label}" if market_label else h_label
+            logger.info(f"择时平滑：{h_label}")
         logger.info(f"市场状态：{market_state}（评分{market_score} {market_label}）")
 
         # 信号日涨停过滤：封死的票买不进，T+1再观察
@@ -314,19 +348,42 @@ class DecisionEngine:
         buy_list = [i for i in items if i.grade in ("A", "B", "C")]
         reject_list = [i for i in items if i.grade == "淘汰"]
 
+        # ── 仓位集中化：截断至 MAX_HOLDINGS 只（按已排序的评级/评分取优）──
+        if len(buy_list) > MAX_HOLDINGS:
+            overflow = buy_list[MAX_HOLDINGS:]
+            for i in overflow:
+                i.grade = "观望"
+                i.action = "观望"
+                i.reason = f"候选{len(buy_list)}只超持仓上限{MAX_HOLDINGS}，按评分截断观望"
+            reject_list = overflow + reject_list
+            buy_list = buy_list[:MAX_HOLDINGS]
+
         # ── Step 4: 资金分配（仓位不超过总资金）──
         # 市场状态仓位缩放：熊市×0.5、震荡×0.8、牛市×1.0
         position_scale = {"bull": 1.0, "neutral": 0.8, "bear": 0.5}.get(market_state, 0.8)
         scaled_capital = capital * position_scale
         self._allocate_capital(buy_list, scaled_capital, max_industry_pct)
 
-        # 仓位 0%（ATR 约束下无法建整手）的降级为观望
-        cannot_buy = [i for i in buy_list if i.shares == 0]
+        # 微仓过滤：无法建整手、或不足最小仓位门槛（3手/¥3000）的降级为观望
+        def _is_too_small(i: DecisionItem) -> bool:
+            if i.shares == 0:
+                return True
+            if i.shares < MIN_LOT_SHARES or i.capital < MIN_POSITION_AMOUNT:
+                return True
+            return False
+
+        cannot_buy = [i for i in buy_list if _is_too_small(i)]
         for i in cannot_buy:
             i.grade = "观望"
             i.action = "观望"
             if not i.reason:
-                i.reason = f"评分{i.score}但当前价位风险预算下无法建整手，建议观望等回调"
+                if i.shares == 0:
+                    i.reason = f"评分{i.score}但当前价位风险预算下无法建整手，建议观望等回调"
+                else:
+                    i.reason = (f"仓位仅{i.shares}股/¥{i.capital:.0f}，不足最小门槛"
+                                f"({MIN_LOT_SHARES}股/¥{MIN_POSITION_AMOUNT})，集中资金到强信号")
+            i.shares = 0
+            i.capital = 0
         buy_list = [i for i in buy_list if i.shares > 0]
         reject_list = cannot_buy + reject_list
 
@@ -687,6 +744,90 @@ class DecisionEngine:
                         "grade_count": {"A": 0, "B": 0, "C": 0}, "buy_count": 0, "reject_count": 0},
             "strategy_count": 0, "pool_size": 0,
         }
+
+    def _market_trend_filter(self) -> dict:
+        """趋势叠加层：用本地全市场数据计算趋势状态。
+
+        与基于当日涨跌家数的 breadth 评分互补——breadth 看的是"今日浪花"，
+        而趋势看的是"水位"。下跌途中的反弹日 breadth 偏暖会被误判为 bull，
+        导致在下跌途中满仓买突破（历史教训：7-10~7-15 系统误判 bull，买入
+        组合平均 -28%）。
+
+        本层用"个股 MA20 上方占比"做硬过滤，该指标在整个 6-7 月下跌期稳定
+        在 18%-37%，可靠区分趋势方向。
+
+        Returns:
+            {pct_above_ma20, n_stocks, trend_down, deep_down}
+        """
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                row = conn.execute("""
+                    WITH ranked AS (
+                        SELECT symbol, date, close,
+                            AVG(close) OVER (PARTITION BY symbol ORDER BY date
+                                             ROWS 19 PRECEDING) AS ma20
+                        FROM stock_daily
+                        WHERE date >= (SELECT DATE(MAX(date), '-40 days')
+                                       FROM stock_daily)
+                    ),
+                    latest AS (SELECT MAX(date) d FROM stock_daily)
+                    SELECT
+                        ROUND(AVG(CASE WHEN r.close > r.ma20 THEN 1.0 ELSE 0 END) * 100, 1),
+                        COUNT(*)
+                    FROM ranked r JOIN latest l ON r.date = l.d
+                    WHERE r.ma20 > 0
+                """).fetchone()
+            pct = row[0] if row and row[0] is not None else 50.0
+            n = row[1] if row else 0
+            return {"pct_above_ma20": pct, "n_stocks": n,
+                    "trend_down": pct < TREND_DOWN_THRESHOLD,
+                   "deep_down": pct < TREND_DEEP_THRESHOLD}
+        except Exception as e:
+            logger.warning(f"趋势过滤计算失败，跳过（按 breadth 原值）：{e!r}")
+            return {"pct_above_ma20": 50.0, "n_stocks": 0,
+                    "trend_down": False, "deep_down": False}
+
+    def _last_committed_state(self) -> str | None:
+        """读取 paper_decision_log 最近一次提交的 market_state（昨日regime真值）。
+
+        无历史记录（首次运行/日志缺失）时返回 None，由调用方跳过滞后逻辑。
+        """
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                row = conn.execute(
+                    "SELECT market_state FROM paper_decision_log "
+                    "ORDER BY run_date DESC, id DESC LIMIT 1"
+                ).fetchone()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    def _apply_regime_hysteresis(
+        self, candidate_state: str, candidate_score: int, trend: dict
+    ) -> tuple[str, int, str]:
+        """择时平滑（保守滞后）：防震荡市逐日翻多翻空导致高换手。
+
+        不对称规则（资本保全优先）：
+          - 进入 bear → 单日即降级（P0 趋势过滤 + breadth 已覆盖，无需额外滞后）
+          - 退出 bear → 需确认（trend 不下跌 且 breadth ≥ REGIME_CONFIRM_SCORE），
+            确认首日先落到 neutral（×0.8 仓位）作缓冲，次日才放行 bull。
+            未确认则保持 bear。
+
+        无历史记录时不施加滞后，回退 P0 行为。
+        """
+        prev = self._last_committed_state()
+        if prev is None or prev != "bear":
+            return candidate_state, candidate_score, ""
+        # 前日为 bear，今日候选非 bear → 需确认
+        if candidate_state != "bear":
+            confirmed = (not trend["trend_down"]) and candidate_score >= REGIME_CONFIRM_SCORE
+            if not confirmed:
+                return "bear", min(candidate_score, 44), "退出bear未确认(趋势仍弱/breadth不足)，保持防御"
+            # 确认但首日落 neutral 缓冲，避免直接满仓
+            return "neutral", candidate_score, "退出bear确认首日→neutral缓冲(次日确认bull)"
+        return candidate_state, candidate_score, ""
 
     @staticmethod
     def _get_market_state(market_fn) -> tuple[str, int, str]:

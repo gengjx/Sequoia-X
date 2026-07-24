@@ -176,6 +176,8 @@ class PositionTracker:
         df = df.sort_values("date")
         close = df["close"].astype(float)
         price = round(float(close.iloc[-1]), 3)
+        # 日内最低价（止损按最坏情形触发，防盘中穿仓后收盘反弹漏检）
+        low = round(float(df["low"].astype(float).iloc[-1]), 3) if "low" in df.columns else price
         # 实时MA估算：把今日实时价替换最后一根K线的收盘
         ma_source = close.copy()
         if realtime_price and realtime_price > 0 and len(close) >= 2:
@@ -203,7 +205,7 @@ class PositionTracker:
         if "pct_chg" in df.columns:
             pct_chg = float(df["pct_chg"].astype(float).iloc[-1]) if pd.notna(df["pct_chg"].astype(float).iloc[-1]) else 0.0
         return {"price": price, "ma10": ma10, "ma20": ma20, "atr": atr, "kline_date": last_date,
-                "turn": turn, "turn_ma20": turn_ma20, "pct_chg": pct_chg}
+                "turn": turn, "turn_ma20": turn_ma20, "pct_chg": pct_chg, "low": low}
 
     @staticmethod
     def _fetch_quote(symbol: str) -> tuple[float | None, float | None]:
@@ -267,10 +269,16 @@ class PositionTracker:
         new_stop = h["stop_loss"]
 
         # ── 规则1：硬止损 ──
-        if h["stop_loss"] > 0 and price <= h["stop_loss"]:
+        # 用日内最低价判定（防盘中穿仓后收盘反弹漏检，如300821止损24.97却持有到21.92）
+        day_low = q.get("low", price)
+        if h["stop_loss"] > 0 and day_low <= h["stop_loss"]:
             sig.action = "止损清仓"
             sig.signal_level = "danger"
-            sig.reasons.append(f"现价{price} ≤ 止损线{h['stop_loss']}，跌破硬止损")
+            # 执行价取止损线（保守：止损单在该价位成交，而非可能反弹的收盘价）
+            sig.price = h["stop_loss"]
+            sig.pnl = round((h["stop_loss"] - entry) * h["shares"], 0)
+            sig.pnl_pct = round((h["stop_loss"] / entry - 1) * 100, 1)
+            sig.reasons.append(f"日内低点{day_low} ≤ 止损线{h['stop_loss']}，触发硬止损@{h['stop_loss']}")
             return sig
 
         # ── 规则2：止盈 ──

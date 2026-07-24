@@ -460,23 +460,37 @@ class PaperReplayEngine:
 
     @staticmethod
     def _detect_market_state_at(symbol_groups: dict, today: str) -> str:
-        """检测某日的市场状态。"""
+        """检测某日的市场状态（动量 + 趋势双层）。"""
         rets = []
+        above_ma20 = 0
+        total_ma = 0
         for sym, g in symbol_groups.items():
             g_cut = g[g["date"] <= today]
             if len(g_cut) < 22 or "close" not in g_cut.columns:
                 continue
+            last = float(g_cut["close"].iloc[-1])
+            ma20 = float(g_cut["close"].iloc[-20:].mean())
+            if ma20 > 0:
+                total_ma += 1
+                if last > ma20:
+                    above_ma20 += 1
             r = g_cut["close"].iloc[-1] / g_cut["close"].iloc[-21] - 1
             if r == r:
                 rets.append(float(r))
         if len(rets) < 50:
             return "neutral"
         median_ret = float(np.median(rets))
+        # 趋势叠加层：MA20上方占比<45%强制bear（防止下跌途中反弹日误判）
+        pct_above = above_ma20 / total_ma * 100 if total_ma else 50.0
         if median_ret > 0.03:
-            return "bull"
+            state = "bull"
         elif median_ret < -0.03:
-            return "bear"
-        return "neutral"
+            state = "bear"
+        else:
+            state = "neutral"
+        if pct_above < 45.0 and state != "bear":
+            state = "neutral" if pct_above >= 40.0 else "bear"
+        return state
 
     @staticmethod
     def _calc_atr_stop(symbol_groups: dict, symbol: str, today: str, entry_price: float,

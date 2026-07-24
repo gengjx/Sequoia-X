@@ -59,6 +59,44 @@ TRAILING_START_PCT = 12.0     # 浮盈>12%启动移动止盈（扫描最优）
 TRAILING_PULLBACK = 8.0       # 移动止盈回撤8%（扫描最优：避免假止损）
 MAX_HOLD_DAYS = 60            # 持仓超60天强制平仓（扫描最优：降低换手）
 
+# ── 交易成本参数（实盘口径）──
+BUY_COMMISSION_RATE = 0.00025   # 买入佣金 0.025%（券商普遍费率，含规费）
+SELL_COMMISSION_RATE = 0.00025  # 卖出佣金 0.025%
+STAMP_DUTY_RATE = 0.0005        # 印花税 0.05%（卖出单边征收）
+SLIPPAGE_RATE = 0.001           # 滑点 0.1%（突破买入成交价偏高 / 卖出偏低）
+
+
+def apply_trading_costs(side: str, price: float, shares: int) -> dict:
+    """计算实盘交易成本，返回成交价与各项费用。
+
+    买方成交价偏高（滑点向不利方向）、卖方成交价偏低，佣金按成交额计，
+    印花税仅卖出征收。该函数供模拟盘与回放引擎共用，保证口径一致。
+
+    Args:
+        side: 'buy' 或 'sell'
+        price: 名义成交价（决策价/收盘价）
+        shares: 成交股数
+
+    Returns:
+        {fill_price, amount, commission, stamp_duty, net_cash}
+        buy: net_cash 为现金流出（正数）；sell: net_cash 为现金净流入（正数）
+    """
+    if side == "buy":
+        fill_price = round(price * (1 + SLIPPAGE_RATE), 3)
+        amount = fill_price * shares
+        commission = amount * BUY_COMMISSION_RATE
+        net_cash = amount + commission  # 现金流出
+        return {"fill_price": fill_price, "amount": amount,
+                "commission": commission, "stamp_duty": 0.0, "net_cash": net_cash}
+    else:
+        fill_price = round(price * (1 - SLIPPAGE_RATE), 3)
+        amount = fill_price * shares
+        commission = amount * SELL_COMMISSION_RATE
+        stamp_duty = amount * STAMP_DUTY_RATE
+        net_cash = amount - commission - stamp_duty  # 现金净流入
+        return {"fill_price": fill_price, "amount": amount,
+                "commission": commission, "stamp_duty": stamp_duty, "net_cash": net_cash}
+
 
 @dataclass
 
@@ -321,7 +359,7 @@ class PaperTradeEngine:
                     continue
 
             # 执行买入
-            self._execute_buy(
+            actual_cash_out = self._execute_buy(
                 symbol=sym, name=item.get("name", ""),
                 price=price, shares=shares, amount=amount,
                 date=today, stop_loss=item.get("stop_loss", 0),
@@ -329,8 +367,8 @@ class PaperTradeEngine:
                 hit_strategies=item.get("hit_strategies", ""),
                 reason=f"决策评分{score} {item.get('action','')}",
             )
-            cash -= amount
-            holding_value += amount
+            cash -= actual_cash_out
+            holding_value += actual_cash_out
             holding_symbols.add(sym)
             bought.append({
                 "symbol": sym, "name": item.get("name", ""),
@@ -347,19 +385,26 @@ class PaperTradeEngine:
 
     def _execute_buy(self, symbol: str, name: str, price: float, shares: int,
                      amount: float, date: str, stop_loss: float, target: float,
-                     grade: str, hit_strategies, reason: str) -> None:
-        """执行买入：扣现金 + 写持仓 + 写交易记录。"""
+                     grade: str, hit_strategies, reason: str) -> float:
+        """执行买入：扣现金（含成本）+ 写持仓 + 写交易记录。
+
+        成本模型：成交价含滑点（买方偏高），另收佣金。entry_price 记实际成交价，
+        使止损/盈亏计算基于真实成本。返回实际现金流出额（含佣金）。
+        """
         # hit_strategies 可能为 list，SQLite 不支持绑定 list，需转为字符串
         if isinstance(hit_strategies, (list, tuple)):
             hit_strategies = ", ".join(str(s) for s in hit_strategies)
         elif hit_strategies is None:
             hit_strategies = ""
+        cost = apply_trading_costs("buy", price, shares)
+        fill_price = cost["fill_price"]
+        net_cash = cost["net_cash"]  # 现金流出（成交额 + 佣金）
         now = datetime.now().isoformat()
         with self._conn() as conn:
-            # 扣现金
+            # 扣现金（成交额 + 佣金）
             conn.execute(
                 "UPDATE paper_account SET cash=cash-?, updated_at=? WHERE id=1",
-                (amount, now),
+                (net_cash, now),
             )
             # 写持仓
             conn.execute(
@@ -367,17 +412,18 @@ class PaperTradeEngine:
                 "(account_id, symbol, name, entry_price, shares, entry_date, "
                 "stop_loss, initial_stop, target, grade, hit_strategies, cost) "
                 "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (symbol, name, price, shares, date,
-                 stop_loss, stop_loss, target, grade, hit_strategies, amount),
+                (symbol, name, fill_price, shares, date,
+                 stop_loss, stop_loss, target, grade, hit_strategies, net_cash),
             )
             # 写交易记录
             conn.execute(
                 "INSERT INTO paper_trades "
                 "(account_id, symbol, name, side, price, shares, amount, date, reason, created_at) "
                 "VALUES (1, ?, ?, 'buy', ?, ?, ?, ?, ?, ?)",
-                (symbol, name, price, shares, amount, date, reason, now),
+                (symbol, name, fill_price, shares, cost["amount"], date, reason, now),
             )
             conn.commit()
+        return net_cash
 
     # ════════════════════════════════════════
     # 自动卖出
@@ -527,20 +573,26 @@ class PaperTradeEngine:
             if sell_shares <= 0:
                 return None
 
-            amount = sell_shares * price
             entry_price = h["entry_price"]
-            pnl = (price - entry_price) * sell_shares
-            pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0
+            # 成本模型：滑点（卖方成交价偏低）+ 佣金 + 印花税
+            cost = apply_trading_costs("sell", price, sell_shares)
+            fill_price = cost["fill_price"]
+            amount = cost["amount"]            # 滑点后成交额
+            net_cash = cost["net_cash"]        # 实际现金净流入（扣佣金+印花税）
+            # 已实现盈亏 = 净流入 - 成本基础（entry_price 已含买入滑点）
+            cost_basis = entry_price * sell_shares
+            pnl = net_cash - cost_basis if cost_basis else 0
+            pnl_pct = (pnl / cost_basis * 100) if cost_basis else 0
             hold_days = (datetime.strptime(date, "%Y-%m-%d") -
                          datetime.strptime(h["entry_date"], "%Y-%m-%d")).days
 
             now = datetime.now().isoformat()
             reason_str = reason + (" | " + "; ".join(reasons[:2]) if reasons else "")
 
-            # 加现金
+            # 加现金（净流入，已扣佣金+印花税）
             conn.execute(
                 "UPDATE paper_account SET cash=cash+?, updated_at=? WHERE id=1",
-                (amount, now),
+                (net_cash, now),
             )
             # 更新/删除持仓
             remaining = h["shares"] - sell_shares
@@ -559,13 +611,13 @@ class PaperTradeEngine:
                 "(account_id, symbol, name, side, price, shares, amount, date, reason, "
                 "pnl, pnl_pct, hold_days, entry_price, created_at) "
                 "VALUES (1, ?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (symbol, h["name"], price, sell_shares, amount, date, reason_str,
+                (symbol, h["name"], fill_price, sell_shares, amount, date, reason_str,
                  round(pnl, 2), round(pnl_pct, 2), hold_days, entry_price, now),
             )
             conn.commit()
 
             logger.info(
-                f"模拟卖出：{symbol} {sell_shares}股@{price:.2f}={amount:.0f}元 "
+                f"模拟卖出：{symbol} {sell_shares}股@{fill_price:.2f}={amount:.0f}元(费{amount-net_cash:.0f}) "
                 f"盈亏{pnl:+.0f}({pnl_pct:+.1f}%) 持{hold_days}天"
             )
             return {
@@ -1042,5 +1094,3 @@ class PaperTradeEngine:
         except Exception as e:
             logger.debug(f"基准数据获取失败: {e}")
             return 0.0, 0.0
-
-

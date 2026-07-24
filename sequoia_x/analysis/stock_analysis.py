@@ -738,6 +738,10 @@ class StockAnalyzer:
         entry_ideal = round(min(ma5, support), 2)
         entry_secondary = round(min(ma10, price * 0.98), 2)
         stop_loss = round(price - 2 * atr, 2)
+        # 止损距离封顶 -10%：超宽止损等于没止损（高波动股 2×ATR 可能达 -18%）
+        stop_floor = round(price * 0.90, 2)
+        if stop_loss < stop_floor:
+            stop_loss = stop_floor
         risk_per_share = price - stop_loss
         target = round(price + 3 * risk_per_share, 2) if risk_per_share > 0 else None
 

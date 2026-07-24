@@ -486,9 +486,9 @@ class AuctionScheduler:
             sell_result = services.paper_auto_sell(pos_result.get("signals", []))
 
             # Step2: 多因子为核心的决策（废弃策略已自动排除）
-            from sequoia_x.web.services import ALL_ACTIVE_KEYS
+            from sequoia_x.strategy.registry import ACTIVE_STRATEGY_KEYS
             decision = services.generate_decision(
-                strategy_keys=ALL_ACTIVE_KEYS, capital=100000, min_score=50,
+                strategy_keys=ACTIVE_STRATEGY_KEYS, capital=100000, min_score=50,
                 exclude_markets=None, exclude_st=True,
                 max_candidates=60, include_auction=False,
             )

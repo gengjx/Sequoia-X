@@ -14,6 +14,7 @@ from sequoia_x.analysis.decision import DecisionEngine
 from sequoia_x.analysis.market import MarketAnalyzer
 from sequoia_x.analysis.stock_analysis import StockAnalyzer
 from sequoia_x.strategy.registry import (
+    ACTIVE_STRATEGY_KEYS,
     RETIRED_STRATEGY_KEYS,
     STRATEGY_REGISTRY,
 )
@@ -163,9 +164,9 @@ class AnalysisMixin:
                 return cached[1]
             if strategy_keys is None:
                 # 默认：多因子为核心（5.3年回测年化+22.6%，唯一穿越牛熊）
-                # 废弃策略不纳入默认决策池
-                strategy_keys = [k for k in STRATEGY_REGISTRY.keys()
-                                 if k not in RETIRED_STRATEGY_KEYS]
+                # 仅保留 core+active 策略（multi_factor/bottom/flag），
+                # demoted(ma_volume/pullback/volume_extreme) 弱于基准，退出默认决策池。
+                strategy_keys = list(ACTIVE_STRATEGY_KEYS)
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
