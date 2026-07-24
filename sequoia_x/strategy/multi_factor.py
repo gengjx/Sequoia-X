@@ -118,6 +118,10 @@ class MultiFactorStrategy(BaseStrategy):
         # P1: 市场状态自适应——根据当前市场状态选择对应权重
         market_state = self._detect_market_state()
         active_weights = self.get_weights_for_state(market_state)
+        # ML 合成因子是市场状态无关的全局信号，三态权重表可能不含，
+        # 从全局权重补充注入（达标时非零、未达标为0则不注入）
+        if self._weights.get("ml_score"):
+            active_weights["ml_score"] = self._weights["ml_score"]
 
         # 预加载财报数据（批量查一次，避免逐只查库）
         finance_map = self._load_finance_map(symbols)

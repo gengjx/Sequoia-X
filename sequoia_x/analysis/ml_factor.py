@@ -323,21 +323,25 @@ class MLFactorEngine:
         """
         if _HAS_LGB and X_train.shape[0] >= 500:
             try:
-                model = lgb.LGBMRegressor(
-                    n_estimators=100,
-                    num_leaves=15,
-                    max_depth=4,
-                    min_child_samples=200,
-                    reg_lambda=1.0,
-                    reg_alpha=0.5,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    random_state=42,
-                    verbose=-1,
-                )
-                model.fit(X_train, y_train)
+                # 原生 API（lgb.train），不依赖 scikit-learn
+                params = {
+                    "objective": "regression",
+                    "metric": "rmse",
+                    "num_leaves": 15,
+                    "max_depth": 4,
+                    "min_data_in_leaf": 200,
+                    "lambda_l2": 1.0,
+                    "lambda_l1": 0.5,
+                    "bagging_fraction": 0.8,
+                    "feature_fraction": 0.8,
+                    "bagging_freq": 1,
+                    "verbose": -1,
+                    "num_threads": 0,
+                }
+                train_set = lgb.Dataset(X_train, label=y_train)
+                model = lgb.train(params, train_set, num_boost_round=100)
                 preds = model.predict(X_test)
-                importance = model.feature_importances_
+                importance = model.feature_importance(importance_type="gain")
                 return preds, importance
             except Exception as e:
                 logger.debug(f"LightGBM 训练失败，回退 Ridge：{e!r}")
