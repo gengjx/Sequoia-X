@@ -142,9 +142,26 @@ class StrategyEvaluator:
                 curve=[round(v, 4) for v in curve],
             ).to_dict())
 
+        # 样本外衰减率：walk-forward 验证每个策略的样本外延续性，
+        # 过拟合策略(decay低)质量分打折。evaluate 为手动/月度触发，额外一次采样可接受。
+        per_strategy_decay: dict[str, float] = {}
+        try:
+            from sequoia_x.analysis.backtest_validation import BacktestValidator
+            wf = BacktestValidator(self).walk_forward(
+                train_months=6, test_months=2, sample_size=min(sample_size, 300),
+                hold_days=hold_days,
+            )
+            per_strategy_decay = wf.detail.get("per_strategy_decay", {})
+            logger.info(f"样本外衰减验证完成：{len(per_strategy_decay)}个策略，"
+                        f"decay中位{wf.detail.get('median_decay', 'N/A')}")
+        except Exception as e:
+            logger.warning(f"walk-forward验证失败（质量分不应用衰减折扣）：{e!r}")
+
         # 计算综合质量分（0-100）并写回DB
         for strat in strategies:
-            strat["quality_score"] = self._quality_score(strat, bench_annual)
+            decay = per_strategy_decay.get(strat["key"], 1.0)
+            strat["oos_decay"] = round(decay, 2)
+            strat["quality_score"] = self._quality_score(strat, bench_annual, oos_decay=decay)
 
         # 按质量分降序（质量分已融合夏普/回撤/alpha，比纯夏普更全面）
         strategies.sort(key=lambda x: x["quality_score"], reverse=True)
@@ -159,6 +176,7 @@ class StrategyEvaluator:
                 "win_rate": s["win_rate"], "pl_ratio": s["profit_loss_ratio"],
                 "annual_return": s["annual_return"],
                 "sample_trades": s["sample_trades"],
+                "oos_decay": s.get("oos_decay", 1.0),
             } for s in strategies]
             self.engine.save_strategy_weights(weights)
             logger.info(f"策略权重已刷新写入DB：{len(weights)}个策略")
@@ -462,7 +480,7 @@ class StrategyEvaluator:
         return float(np.mean(gains) / abs(np.mean(losses)))
 
     @staticmethod
-    def _quality_score(strat: dict, bench_annual: float) -> int:
+    def _quality_score(strat: dict, bench_annual: float, oos_decay: float = 1.0) -> int:
         """综合质量分（0-100），融合收益/风险/alpha/稳定性。
 
         评分维度（各0-100标准化后加权）：
@@ -470,6 +488,7 @@ class StrategyEvaluator:
           - 抗风险 25%：最大回撤归一化（回撤越小越好，0%=100，-70%=0）
           - 超额alpha 20%：年化超额归一化（跑赢基准20%+=100，落后40%=0）
           - 交易质量 15%：盈亏比归一化（>2.0=100，<0.5=0）
+          - 样本外衰减折扣：oos_decay=1.0(完全延续)不打折，0.0(完全失效)保留50%
         最终clamp到0-100整数，对齐决策中枢的S/A/B/C/D分层。
         """
         def _norm(v, hi, lo):
@@ -485,6 +504,9 @@ class StrategyEvaluator:
         s_pl = _norm(strat["profit_loss_ratio"], 2.0, 0.5)
 
         score = (0.40 * s_sharpe + 0.25 * s_dd + 0.20 * s_alpha + 0.15 * s_pl)
+        # 样本外衰减折扣：过拟合策略(decay低)质量分打折，但留50%下限防噪声误杀
+        decay_factor = 0.5 + 0.5 * max(0.0, min(1.0, oos_decay))
+        score *= decay_factor
         return int(round(max(0, min(100, score))))
 
 

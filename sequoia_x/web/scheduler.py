@@ -314,6 +314,18 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"月度参数扫描失败：{e!r}")
 
+        # 策略质量重评 + 样本外衰减刷新（walk-forward）→ 写 strategy_weights.oos_decay
+        # 避免质量分长期停留在手动跑的旧值，使决策加成反映最新样本外延续性
+        try:
+            from sequoia_x.analysis.strategy_eval import StrategyEvaluator
+            from sequoia_x.data.engine import DataEngine
+            eval_engine = DataEngine(self.settings)
+            evaluator = StrategyEvaluator(eval_engine, self.settings)
+            evaluator.evaluate(hold_days=20, sample_size=300)
+            logger.info("月度策略质量重评完成：oos_decay 已刷新写入 strategy_weights")
+        except Exception as e:
+            logger.warning(f"月度策略质量重评失败（不影响参数扫描结果）：{e!r}")
+
     def _daily_report(self) -> str:
         """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
         from sequoia_x.notify.feishu import FeishuNotifier

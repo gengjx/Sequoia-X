@@ -338,6 +338,12 @@ class PaperTradeEngine:
                 skipped.append({"symbol": sym, "reason": "无成交价"})
                 continue
 
+            # 实战成交假设：涨停封板/停牌的票买不进（与决策层 _filter_limit_up 口径一致）
+            tradable, not_reason = self._check_tradable(sym, today)
+            if not tradable:
+                skipped.append({"symbol": sym, "reason": not_reason})
+                continue
+
             # 高价股补救：目标仓位不足1手但1手在单票上限内 → 最低建仓1手
             one_lot_cost = price * 100
             max_per_lot = initial * MAX_POSITION_PCT
@@ -832,6 +838,45 @@ class PaperTradeEngine:
     # ════════════════════════════════════════
     # 辅助方法
     # ════════════════════════════════════════
+
+    def _check_tradable(self, symbol: str, date_str: str | None = None) -> tuple[bool, str]:
+        """检查个股当日是否可买入（停牌/涨停封板买不进）。
+
+        Args:
+            symbol: 股票代码
+            date_str: 日期（空=最新K线日）
+
+        Returns:
+            (tradable, reason) — True=可买入空原因；False=不可买入+原因
+        """
+        try:
+            with self._conn() as conn:
+                if date_str:
+                    row = conn.execute(
+                        "SELECT tradestatus, pct_chg FROM stock_daily "
+                        "WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1",
+                        (symbol, date_str),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT tradestatus, pct_chg FROM stock_daily "
+                        "WHERE symbol=? ORDER BY date DESC LIMIT 1", (symbol,)
+                    ).fetchone()
+            if not row:
+                return False, "当日无K线数据，保守视为不可交易"
+            tradestatus = row["tradestatus"] if "tradestatus" in row.keys() else 1
+            if tradestatus == 0:
+                return False, "今日停牌"
+            pct_chg = row["pct_chg"] if "pct_chg" in row.keys() and row["pct_chg"] is not None else 0
+            # 板块涨停阈值（复用 decision._filter_limit_up 逻辑）
+            threshold = 28.5 if symbol.startswith(("8", "4", "92")) else (
+                19.0 if symbol.startswith(("300", "301", "688", "689")) else 9.5)
+            if pct_chg >= threshold:
+                return False, f"涨停封板({pct_chg:+.1f}%)买不进"
+            return True, ""
+        except Exception as e:
+            logger.debug(f"可交易性检查失败 {symbol}：{e!r}")
+            return True, ""  # 查询失败不阻断买入（保守不假阴性）
 
     def _get_close_price(self, symbol: str, date_str: str | None = None) -> float | None:
         """获取收盘价：优先日K最新价，日K滞后时fallback东财实时价。

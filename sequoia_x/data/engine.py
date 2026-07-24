@@ -311,6 +311,14 @@ class DataEngine:
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        """幂等给已有表补列（旧数据新列取DEFAULT，不破坏现有行）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            cols = {c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                conn.commit()
+
     def save_factor_weights(self, weights: list[dict]) -> None:
         """批量写入因子IC权重（UPSERT）。
 
@@ -388,17 +396,20 @@ class DataEngine:
         """批量写入策略评估权重（UPSERT）。"""
         import time
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        # oos_decay 列迁移（幂等）：样本外衰减率，默认1.0=完全延续
+        self._ensure_column("strategy_weights", "oos_decay", "REAL DEFAULT 1.0")
         sql = ("INSERT OR REPLACE INTO strategy_weights "
                "(strategy_key, quality_score, sharpe, max_dd, alpha, calmar, "
-               "win_rate, pl_ratio, annual_return, sample_trades, updated_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+               "win_rate, pl_ratio, annual_return, sample_trades, oos_decay, updated_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
         with sqlite3.connect(self.db_path) as conn:
             for w in weights:
                 conn.execute(sql, (
                     w["strategy_key"], w["quality_score"],
                     w.get("sharpe", 0), w.get("max_dd", 0), w.get("alpha", 0),
                     w.get("calmar", 0), w.get("win_rate", 0), w.get("pl_ratio", 0),
-                    w.get("annual_return", 0), w.get("sample_trades", 0), now,
+                    w.get("annual_return", 0), w.get("sample_trades", 0),
+                    w.get("oos_decay", 1.0), now,
                 ))
             conn.commit()
 

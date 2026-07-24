@@ -120,6 +120,15 @@ class BacktestValidator:
         positive_test = sum(1 for r in results if r["test_return"] > 0)
         total_valid = len(results)
 
+        # 按 strategy 分组取 median decay（供质量分折扣使用）
+        from statistics import median as _median
+        per_strategy_decay: dict[str, float] = {}
+        strat_decay_groups: dict[str, list[float]] = {}
+        for r in results:
+            strat_decay_groups.setdefault(r["strategy"], []).append(r["decay"])
+        for skey, group in strat_decay_groups.items():
+            per_strategy_decay[skey] = round(float(_median(group)), 2)
+
         # 通过条件：中位衰减率>0.3 且 样本外正收益占比>50%
         passed = median_decay > 0.3 and positive_test / total_valid > 0.5
         score = min(100, max(0, median_decay * 100))
@@ -130,6 +139,7 @@ class BacktestValidator:
                 "median_decay": round(median_decay, 2),
                 "positive_test_ratio": round(positive_test / total_valid, 2),
                 "windows": len(results),
+                "per_strategy_decay": per_strategy_decay,
                 "detail": results[:20],
             },
         )

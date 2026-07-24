@@ -159,6 +159,21 @@ class PaperReplayEngine:
             # 获取当日全市场收盘价
             today_data = all_daily[all_daily["date"] == today]
             today_prices = dict(zip(today_data["symbol"], today_data["close"]))
+            # 涨停/停牌过滤（实盘口径：封板买不进、停牌无成交）
+            today_tradestatus = dict(zip(today_data["symbol"], today_data.get("tradestatus", 1))) \
+                if "tradestatus" in today_data.columns else {}
+            today_pct_chg = dict(zip(today_data["symbol"], today_data.get("pct_chg", 0))) \
+                if "pct_chg" in today_data.columns else {}
+
+            def _is_tradable(sym: str) -> bool:
+                if today_tradestatus.get(sym, 1) == 0:
+                    return False
+                pct = today_pct_chg.get(sym, 0)
+                if pct is None:
+                    return True
+                thr = 28.5 if sym.startswith(("8", "4", "92")) else (
+                    19.0 if sym.startswith(("300", "301", "688", "689")) else 9.5)
+                return pct < thr
 
             # ── 持仓止损/止盈检查 ──
             new_positions = []
@@ -256,6 +271,9 @@ class PaperReplayEngine:
                     for sym in candidates[:slots]:
                         price = today_prices.get(sym)
                         if price is None or price <= 0:
+                            continue
+                        # 涨停封板/停牌的票买不进（与实盘模拟盘口径一致）
+                        if not _is_tradable(sym):
                             continue
                         # 等权分配
                         target_amount = min(
