@@ -87,7 +87,7 @@ class MLFactorEngine:
         data = self._collect_training_data()
         if not data or len(data) < 100:
             logger.warning("ML因子：训练数据不足")
-            return {"ic_mean": 0, "valid": False}
+            return {"ic_mean": 0.0, "valid": False}
 
         results = self._time_series_cv(data)
 
@@ -225,7 +225,7 @@ class MLFactorEngine:
         df = pd.DataFrame(data)
         months = sorted(df["month"].unique())
         if len(months) < 6:
-            return {"ic_mean": 0, "valid": False}
+            return {"ic_mean": 0.0, "valid": False}
 
         ic_list: list[float] = []
         all_predictions: dict[str, float] = {}
@@ -282,7 +282,7 @@ class MLFactorEngine:
                     all_predictions[row["symbol"]] = float(preds[idx])
 
         if not ic_list:
-            return {"ic_mean": 0, "valid": False}
+            return {"ic_mean": 0.0, "valid": False}
 
         ic_arr = np.array(ic_list)
         ic_mean = float(np.mean(ic_arr))
@@ -301,14 +301,16 @@ class MLFactorEngine:
             }
 
         model_version = "lightgbm" if _HAS_LGB else "ridge"
+        # 强制原生 Python 类型（避免 numpy.bool/float 导致 JSON 序列化失败）
+        valid = bool(ic_mean > 0.03 and icir > 0.5 and abs(t_stat) >= 2.0)
 
         return {
-            "ic_mean": round(ic_mean, 4),
-            "icir": round(icir, 3),
-            "win_rate": round(win_rate * 100, 1),
-            "t_stat": round(t_stat, 3),
-            "n_months": len(ic_list),
-            "valid": ic_mean > 0.03 and icir > 0.5 and abs(t_stat) >= 2.0,
+            "ic_mean": float(round(ic_mean, 4)),
+            "icir": float(round(icir, 3)),
+            "win_rate": float(round(win_rate * 100, 1)),
+            "t_stat": float(round(t_stat, 3)),
+            "n_months": int(len(ic_list)),
+            "valid": valid,
             "predictions": all_predictions,
             "feature_importance": feature_importance,
             "model_version": model_version,
