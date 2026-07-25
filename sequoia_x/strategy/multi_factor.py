@@ -133,6 +133,8 @@ class MultiFactorStrategy(BaseStrategy):
         lhb_map = self._load_lhb_map()
         # 预加载北向持股历史（用于北向因子）
         north_map = self._load_north_map()
+        # 预加载融资融券（杠杆资金方向，最新日）
+        margin_map = self._load_margin_map()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
@@ -148,6 +150,7 @@ class MultiFactorStrategy(BaseStrategy):
                     fund_flow=fund_flow_map.get(sym),
                     lhb_data=lhb_map.get(sym),
                     north_hold=north_map.get(sym),
+                    margin=margin_map.get(sym),
                 )
                 factors["symbol"] = sym
                 rows.append(factors)
@@ -285,6 +288,23 @@ class MultiFactorStrategy(BaseStrategy):
         if n_before != len(filtered):
             logger.info(f"选股池过滤：剔除{n_before - len(filtered)}只ST/退市预警股，剩余{len(filtered)}只")
         return filtered
+
+    def _load_margin_map(self) -> dict[str, dict]:
+        """加载最新日融资融券明细。返回 {symbol: {rzye, rzbuy, rqlts, rqye}}。"""
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, rzye, rzbuy, rqlts, rqye FROM margin_detail "
+                    "WHERE date=(SELECT MAX(date) FROM margin_detail)"
+                ).fetchall()
+            result = {}
+            for r in rows:
+                result[r[0]] = {"rzye": r[1], "rzbuy": r[2], "rqlts": r[3], "rqye": r[4]}
+            return result
+        except Exception as e:
+            logger.debug(f"融资融券加载失败: {e}")
+            return {}
 
     def _rebalance_weights(self, weights: dict[str, float]) -> dict[str, float]:
         """权重再平衡：单因子上限 + 大类约束。

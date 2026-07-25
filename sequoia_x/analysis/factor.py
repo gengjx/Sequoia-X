@@ -124,7 +124,8 @@ FACTOR_META: dict[str, dict] = {
 
 def compute_factors(df: pd.DataFrame, finance: dict | None = None,
                    fund_flow: dict | None = None, lhb_data: dict | None = None,
-                   north_hold: pd.DataFrame | None = None, ) -> dict[str, float]:
+                   north_hold: pd.DataFrame | None = None,
+                   margin: dict | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
     Args:
@@ -133,6 +134,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         fund_flow: 资金流向 dict，可选
         lhb_data: 龙虎榜 dict，可选
         north_hold: 北向资金持股 DataFrame（列含 date/hold_pct，升序），可选
+        margin: 融资融券 dict（rzye/rzbuy/rqlts/rqye），可选
 
     Returns:
         {因子名: 因子值}，取最后一日（最新截面）。无效因子返回nan。
@@ -329,6 +331,20 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
     else:
         factors["nb_holding_pct"] = np.nan
         factors["nb_inflow"] = np.nan
+
+    # ══════ 融资融券(3)（杠杆资金方向，北向断供后的替代信号）══════
+    if margin:
+        rzye = _safe_float(margin.get("rzye"))
+        rqye = _safe_float(margin.get("rqye"))
+        factors["margin_balance"] = rzye
+        factors["margin_netbuy"] = _safe_float(margin.get("rzbuy"))
+        if rqye is not None and rzye is not None and rzye > 0:
+            factors["short_ratio"] = rqye / (rzye + rqye)
+        else:
+            factors["short_ratio"] = np.nan
+    else:
+        for k in ["margin_balance", "margin_netbuy", "short_ratio"]:
+            factors[k] = np.nan
 
     # 清理nan→None（序列化友好）
     return {k: (None if (v != v) else round(v, 4)) for k, v in factors.items()}
