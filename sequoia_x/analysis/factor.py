@@ -119,13 +119,21 @@ FACTOR_META: dict[str, dict] = {
     "margin_balance":  {"category": "融资融券", "desc": "融资余额（杠杆看多水平，高=拥挤）"},
     "margin_netbuy":   {"category": "融资融券", "desc": "融资净买入额（当日杠杆资金流入）"},
     "short_ratio":     {"category": "融资融券", "desc": "融券占比（看空比例，高=空头情绪）"},
+    # ── 基金持仓(2)（公募基金重仓，来自fund_hold表）──
+    "fund_holding":    {"category": "基金持仓", "desc": "基金持有家数（机构共识/拥挤，高=拥挤）", "reverse": True},
+    "fund_inflow":     {"category": "基金持仓", "desc": "基金季度增仓比例（高=机构加仓）"},
+    # ── 沪深300 Beta(2)（相对沪深300的系统性暴露）──
+    "beta_300":        {"category": "Beta", "desc": "相对沪深300 Beta（低Beta防御溢价）", "reverse": True},
+    "rel_strength_300":{"category": "Beta", "desc": "相对沪深300超额收益（20日相对强度）"},
 }
 
 
 def compute_factors(df: pd.DataFrame, finance: dict | None = None,
                    fund_flow: dict | None = None, lhb_data: dict | None = None,
                    north_hold: pd.DataFrame | None = None,
-                   margin: dict | None = None, ) -> dict[str, float]:
+                   margin: dict | None = None,
+                   fund_hold: dict | None = None,
+                   index_ret: pd.Series | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
     Args:
@@ -136,7 +144,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         north_hold: 北向资金持股 DataFrame（列含 date/hold_pct，升序），可选
         margin: 融资融券 dict（rzye/rzbuy/rqlts/rqye），可选
 
-    Returns:
+   Returns:
         {因子名: 因子值}，取最后一日（最新截面）。无效因子返回nan。
     """
     if len(df) < 20:
@@ -346,6 +354,47 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         for k in ["margin_balance", "margin_netbuy", "short_ratio"]:
             factors[k] = np.nan
 
+    # ════════ 基金持仓(2)（公募基金重仓，来自fund_hold表）════════
+    if fund_hold:
+        factors["fund_holding"] = _safe_float(fund_hold.get("fund_count"))
+        factors["fund_inflow"] = _safe_float(fund_hold.get("change_pct"))
+    else:
+        for k in ["fund_holding", "fund_inflow"]:
+            factors[k] = np.nan
+
+    # ════════ 沪深300 Beta(2)（相对沪深300系统性暴露）════════
+    if index_ret is not None and len(index_ret) >= 60:
+        try:
+            stock_ret = close.pct_change().dropna()
+            sr = stock_ret.iloc[-60:]
+            mr = pd.Series(index_ret).dropna().iloc[-60:]
+            min_len = min(len(sr), len(mr))
+            if min_len >= 30:
+                sr = sr.iloc[-min_len:].values
+                mr = mr.iloc[-min_len:].values
+                m_var = float(np.var(mr))
+                if m_var > 0:
+                    cov = float(np.cov(sr, mr)[0, 1])
+                    factors["beta_300"] = max(-2.0, min(3.0, cov / m_var))
+                else:
+                    factors["beta_300"] = np.nan
+                # 相对强度：20日个股超额收益
+                if len(stock_ret) >= 21 and len(mr) >= 21:
+                    s20 = float(stock_ret.iloc[-21:].sum())
+                    m20 = float(mr[-21:].sum())
+                    factors["rel_strength_300"] = s20 - m20
+                else:
+                    factors["rel_strength_300"] = np.nan
+            else:
+                factors["beta_300"] = np.nan
+                factors["rel_strength_300"] = np.nan
+        except Exception:
+            factors["beta_300"] = np.nan
+            factors["rel_strength_300"] = np.nan
+    else:
+        factors["beta_300"] = np.nan
+        factors["rel_strength_300"] = np.nan
+
     # 清理nan→None（序列化友好）
     return {k: (None if (v != v) else round(v, 4)) for k, v in factors.items()}
 
@@ -404,7 +453,7 @@ def cross_section_rank(df: pd.DataFrame) -> pd.DataFrame:
     return df.rank(pct=True) * 100
 
 
-def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = None, finance_series: dict[str, pd.Series] | None = None) -> dict[str, pd.Series]:
+def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = None, finance_series: dict[str, pd.Series] | None = None, index_ret: pd.Series | None = None) -> dict[str, pd.Series]:
     """向量化计算完整序列的因子值（性能优化核心）。
 
     一次性算出每个因子在每个交易日的值，下游按月取截面。
@@ -506,6 +555,21 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
     flow_5 = (rets_all * turnover).rolling(5).sum() / turnover.rolling(5).sum().replace(0, np.nan)
     flow_20v = (rets_all * turnover).rolling(20, min_periods=10).sum() / turnover.rolling(20, min_periods=10).sum().replace(0, np.nan)
     series["flow_trend"] = (flow_5 - flow_20v) * 10000
+
+    # 沪深300 Beta（相对沪深300系统性暴露）
+    if index_ret is not None and "date" in df.columns:
+        try:
+            _idx_map = index_ret.to_dict() if hasattr(index_ret, "to_dict") else dict(index_ret)
+            idx_ret_aligned = df["date"].astype(str).map(_idx_map)
+            if idx_ret_aligned.notna().sum() >= 60:
+                _ir = idx_ret_aligned.astype(float)
+                _mvar = _ir.rolling(60, min_periods=30).var()
+                _cov = rets.rolling(60, min_periods=30).cov(_ir)
+                _beta = (_cov / _mvar.replace(0, np.nan)).clip(-2.0, 3.0)
+                series["beta_300"] = _beta
+                series["rel_strength_300"] = rets.rolling(20, min_periods=10).sum() - _ir.rolling(20, min_periods=10).sum()
+        except Exception:
+            pass
 
     # 质量因子（point-in-time，从finance_series注入）
     if finance_series:
@@ -808,6 +872,44 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：融资融券加载失败：{e!r}")
 
+    # 加载基金持仓（公募重仓，来自fund_hold表，按季度截面）
+    fund_hold_factors = {"fund_holding", "fund_inflow"}
+    fund_hold_map: dict[str, list[tuple]] = {}  # {symbol: [(report_date, {fields})], 排序}
+    if set(factor_set) & fund_hold_factors:
+        import sqlite3 as _sq6
+        try:
+            with _sq6.connect(engine.db_path) as _conn6:
+                _fh_rows = _conn6.execute(
+                    "SELECT symbol, report_date, fund_count, change_pct "
+                    "FROM fund_hold ORDER BY symbol, report_date"
+                ).fetchall()
+            for r in _fh_rows:
+                fund_hold_map.setdefault(r[0], []).append((r[1], {
+                    "fund_count": r[2], "change_pct": r[3],
+                }))
+            logger.info(f"因子IC评估：加载基金持仓 {len(fund_hold_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：基金持仓加载失败：{e!r}")
+
+    # 加载沪深300指数收益率序列（用于 beta_300 / rel_strength_300 的IC评估）
+    index_ret_series = None
+    if set(factor_set) & {"beta_300", "rel_strength_300"}:
+        import sqlite3 as _sq7
+        try:
+            with _sq7.connect(engine.db_path) as _conn7:
+                _idx_rows = _conn7.execute(
+                    "SELECT date, close FROM index_daily "
+                    "WHERE symbol='000300' ORDER BY date"
+                ).fetchall()
+            if len(_idx_rows) >= 60:
+                _idx_df = pd.DataFrame(_idx_rows, columns=["date", "close"])
+                _idx_df["date"] = _idx_df["date"].astype(str)
+                _idx_ret = _idx_df["close"].pct_change()
+                index_ret_series = pd.Series(_idx_ret.values, index=_idx_df["date"].values).dropna()
+                logger.info(f"因子IC评估：加载沪深300指数 {len(index_ret_series)} 日")
+        except Exception as e:
+            logger.warning(f"因子IC评估：沪深300指数加载失败：{e!r}")
+
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
     def _pit_asof(seq: list[tuple], asof_date: str) -> dict | None:
@@ -848,9 +950,9 @@ def evaluate_factor_ic(
             # 所有 point-in-time 因子（非时序，按月取截面值）需排除出 compute_factor_series
             margin_factors = {"margin_balance", "margin_netbuy", "short_ratio"}
             _pit_factors = (quality_factors | valuation_factors | fund_flow_factors
-                            | lhb_factors | north_factors | margin_factors)
+                            | lhb_factors | north_factors | margin_factors | fund_hold_factors)
             ts_factors = [f for f in factor_set if f not in _pit_factors]
-            series = compute_factor_series(df, ts_factors)
+            series = compute_factor_series(df, ts_factors, index_ret=index_ret_series)
             dates = df["date"].astype(str).values
             months = np.array([d[:7] for d in dates])
             close = df["close"]
@@ -959,6 +1061,20 @@ def evaluate_factor_ic(
                                     row[k] = float(rqye) / (rzye + rqye)
                                 else:
                                     row[k] = None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in fund_hold_factors:
+                        # as-of 取截面前最新基金持仓（按季度披露，杜绝未来函数）
+                        fh = _pit_asof(fund_hold_map.get(sym, []), dates[i])
+                        if fh:
+                            if k == "fund_holding":
+                                fc = fh.get("fund_count")
+                                row[k] = float(fc) if fc is not None else None
+                            elif k == "fund_inflow":
+                                cp = fh.get("change_pct")
+                                row[k] = float(cp) if cp is not None else None
                             else:
                                 row[k] = None
                         else:

@@ -135,6 +135,10 @@ class MultiFactorStrategy(BaseStrategy):
         north_map = self._load_north_map()
         # 预加载融资融券（杠杆资金方向，最新日）
         margin_map = self._load_margin_map()
+        # 预加载基金持仓（公募重仓，最新季度）
+        fund_hold_map = self._load_fund_hold_map()
+        # 预加载沪深300指数收益率（用于 beta_300 / rel_strength_300）
+        index_ret = self._load_index_ret()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
@@ -151,6 +155,8 @@ class MultiFactorStrategy(BaseStrategy):
                     lhb_data=lhb_map.get(sym),
                     north_hold=north_map.get(sym),
                     margin=margin_map.get(sym),
+                    fund_hold=fund_hold_map.get(sym),
+                    index_ret=index_ret,
                 )
                 factors["symbol"] = sym
                 rows.append(factors)
@@ -306,6 +312,42 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"融资融券加载失败: {e}")
             return {}
 
+    def _load_fund_hold_map(self) -> dict[str, dict]:
+        """加载最新季度基金持仓。返回 {symbol: {fund_count, change_pct}}。"""
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, fund_count, change_pct FROM fund_hold "
+                    "WHERE report_date=(SELECT MAX(report_date) FROM fund_hold)"
+                ).fetchall()
+            result = {}
+            for r in rows:
+                result[r[0]] = {"fund_count": r[1], "change_pct": r[2]}
+            return result
+        except Exception as e:
+            logger.debug(f"基金持仓加载失败: {e}")
+            return {}
+
+    def _load_index_ret(self) -> "pd.Series | None":
+        """加载沪深300指数收益率序列（用于 beta_300 / rel_strength_300）。"""
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT date, close FROM index_daily "
+                    "WHERE symbol='000300' ORDER BY date"
+                ).fetchall()
+            if len(rows) < 60:
+                return None
+            s = pd.DataFrame(rows, columns=["date", "close"])
+            rets = s["close"].pct_change()
+            series = pd.Series(rets.values, index=s["date"].astype(str).values).dropna()
+            return series
+        except Exception as e:
+            logger.debug(f"沪深300指数加载失败: {e}")
+            return None
+
     def _rebalance_weights(self, weights: dict[str, float]) -> dict[str, float]:
         """权重再平衡：单因子上限 + 大类约束。
 
@@ -367,6 +409,10 @@ class MultiFactorStrategy(BaseStrategy):
 
         用全市场近20日等权收益中位数判断：
           >3% bull, <-3% bear, 中间 neutral
+
+        P8: 宏观流动性（M2/社融）作为辅助确认层，对阈值做方向性偏置：
+          M2同比>9%或社融放量→放宽bull门槛（更易确认多头）；
+          M2同比<7%或社融收缩→收紧bear门槛（更易确认空头）。
         """
         import numpy as np
         try:
@@ -382,17 +428,49 @@ class MultiFactorStrategy(BaseStrategy):
             if len(rets) < 50:
                 return "neutral"
             median_ret = float(np.median(rets))
-            if median_ret > 0.03:
+            # 宏观流动性偏置（放宽/收紧状态门槛）
+            macro_bias = self._load_macro_bias()
+            bull_thr = 0.02 if macro_bias == "bull" else 0.03
+            bear_thr = -0.02 if macro_bias == "bear" else -0.03
+            if median_ret > bull_thr:
                 state = "bull"
-            elif median_ret < -0.03:
+            elif median_ret < bear_thr:
                 state = "bear"
             else:
                 state = "neutral"
-            logger.info(f"市场状态检测：{state}（全市场中位20日收益{median_ret*100:+.2f}%）")
+            logger.info(f"市场状态检测：{state}（中位20日收益{median_ret*100:+.2f}%, 宏观偏置={macro_bias}）")
             return state
         except Exception as e:
             logger.warning(f"市场状态检测失败，默认neutral：{e!r}")
             return "neutral"
+
+    def _load_macro_bias(self) -> str | None:
+        """加载宏观流动性偏置（M2/社融），返回 'bull'/'bear'/None。"""
+        try:
+            import sqlite3
+            with sqlite3.connect(self.engine.db_path) as conn:
+                m2_row = conn.execute(
+                    "SELECT m2_yoy FROM macro_money ORDER BY month DESC LIMIT 1"
+                ).fetchone()
+                sf_rows = conn.execute(
+                    "SELECT sf_total FROM macro_sf ORDER BY month DESC LIMIT 2"
+                ).fetchall()
+            bias = None
+            m2_yoy = m2_row[0] if m2_row else None
+            if m2_yoy is not None and m2_yoy > 9.0:
+                bias = "bull"
+            elif m2_yoy is not None and m2_yoy < 7.0:
+                bias = "bear"
+            # 社融环比：最近月 vs 上月，放量→bull、收缩→bear
+            if len(sf_rows) >= 2 and sf_rows[0][0] is not None and sf_rows[1][0] is not None:
+                if sf_rows[0][0] > sf_rows[1][0] * 1.2:
+                    bias = bias or "bull"
+                elif sf_rows[0][0] < sf_rows[1][0] * 0.8:
+                    bias = bias or "bear"
+            return bias
+        except Exception as e:
+            logger.debug(f"宏观偏置加载失败: {e}")
+            return None
 
     def _load_finance_map(self, symbols: list[str]) -> dict[str, dict]:
         """批量加载财报数据，返回 {symbol: {roe, np_margin, ...}}。"""

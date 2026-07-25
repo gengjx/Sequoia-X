@@ -449,8 +449,16 @@ class PortfolioRiskMonitor:
         return np.diff(closes) / closes[:-1]
 
     def _get_market_returns(self, days: int = 250) -> np.ndarray:
-        """沪深300收益率（用全市场等权均值近似）。"""
+        """沪深300真实收益率（从 index_daily 表读取，无则回退全市场等权近似）。"""
         with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT close FROM index_daily WHERE symbol='000300' "
+                "ORDER BY date DESC LIMIT ?", (days + 1,)
+            ).fetchall()
+            if len(rows) >= 2:
+                closes = np.array([r[0] for r in reversed(rows)])
+                return np.diff(closes) / closes[:-1]
+            # 回退：全市场等权均值近似
             rows = conn.execute(
                 "SELECT date, AVG(pct_chg) as avg_ret FROM stock_daily "
                 "WHERE pct_chg IS NOT NULL AND date >= "
