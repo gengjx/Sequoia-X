@@ -32,7 +32,8 @@ class AuctionScheduler:
         (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
         (21, 5, "sync_lhb"),         # 龙虎榜数据同步（紧跟日K之后）
         (21, 6, "sync_fund_flow"),   # 主力资金流向同步
-        (21, 7, "sync_valuation"),  # PE/PB估值同步（东财快照，全市场3秒）
+        (21, 7, "sync_margin"),      # 融资融券增量同步（杠杆资金方向，北向断供替代）
+        (21, 8, "sync_valuation"),  # PE/PB估值同步（东财快照，全市场3秒）
         (21, 10, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
         (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
@@ -223,6 +224,8 @@ class AuctionScheduler:
             self._sync_lhb()
         elif task == "sync_fund_flow":
             self._sync_fund_flow()
+        elif task == "sync_margin":
+            self._sync_margin()
         elif task == "sync_valuation":
             self._sync_valuation()
         elif task == "refresh_factor_ic":
@@ -358,6 +361,7 @@ class AuctionScheduler:
                 "sync_daily": "日K同步",
                 "sync_lhb": "龙虎榜同步",
                 "sync_fund_flow": "资金流向同步",
+                "sync_margin": "融资融券同步",
                 "refresh_factor_ic": "因子IC刷新",
                 "auction_verify": "竞价T+1验证",
                 "paper_trade": "模拟盘闭环",
@@ -382,26 +386,58 @@ class AuctionScheduler:
                     line += f"\n   ⚠️ {r[5][:80]}"
                 lines.append(line)
 
-            # 补充系统状态
+            # ── 数据同步全景状态 ──
             lines.append("")
-            latest_k = ""
-            fin_cov = 0
-            total_stocks = 0
+            lines.append("---")
+            lines.append("**📦 数据同步状态**")
             try:
                 with sqlite3.connect(self.db_path) as conn:
+                    # 日K
                     latest_k = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()[0] or "-"
-                    fin_cov = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_finance").fetchone()[0]
-                    total_stocks = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0]
-            except Exception:
-                pass
-            lines.append(f"---\n日K最新: {latest_k}")
-            lines.append(f"财报覆盖: {fin_cov}/{total_stocks} ({fin_cov/total_stocks*100:.0f}%)")
+                    k_rows = conn.execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0]
+                    lines.append(f"日K: {latest_k} | {k_rows:,}行")
+
+                    # 财报
+                    fin_full = conn.execute(
+                        "SELECT COUNT(*) FROM (SELECT symbol FROM stock_finance "
+                        "GROUP BY symbol HAVING COUNT(DISTINCT stat_date)>=18)").fetchone()[0]
+                    fin_sym = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_finance").fetchone()[0]
+                    total_sym = conn.execute("SELECT COUNT(*) FROM stock_basic").fetchone()[0] or 5000
+                    lines.append(f"财报: ≥5年{fin_full}/{total_sym} ({fin_full/total_sym*100:.0f}%) | {fin_sym}只")
+
+                    # 龙虎榜
+                    lhb_days = conn.execute("SELECT COUNT(DISTINCT date) FROM lhb_detail").fetchone()[0]
+                    lhb_max = conn.execute("SELECT MAX(date) FROM lhb_detail").fetchone()[0] or "-"
+                    lines.append(f"龙虎榜: {lhb_max} | {lhb_days}交易日")
+
+                    # 融资融券
+                    mg_days = conn.execute("SELECT COUNT(DISTINCT date) FROM margin_detail").fetchone()[0]
+                    mg_max = conn.execute("SELECT MAX(date) FROM margin_detail").fetchone()[0] or "-"
+                    mg_sym = conn.execute("SELECT COUNT(DISTINCT symbol) FROM margin_detail").fetchone()[0]
+                    lines.append(f"融资融券: {mg_max} | {mg_days}天/{mg_sym}只")
+
+                    # 资金流
+                    ff_days = conn.execute("SELECT COUNT(DISTINCT date) FROM fund_flow").fetchone()[0]
+                    ff_max = conn.execute("SELECT MAX(date) FROM fund_flow").fetchone()[0] or "-"
+                    ff_sym = conn.execute("SELECT COUNT(DISTINCT symbol) FROM fund_flow").fetchone()[0]
+                    lines.append(f"资金流: {ff_max} | {ff_days}天/{ff_sym}只")
+
+                    # 北向（标注断供）
+                    nb_max = conn.execute("SELECT MAX(date) FROM north_hold").fetchone()[0] or "-"
+                    lines.append(f"北向: {nb_max}（2024-08后断供）")
+            except Exception as e:
+                lines.append(f"数据状态查询失败: {e}")
 
             # 限流器状态
             try:
                 from sequoia_x.core.rate_limiter import _rate_limiter
                 rl = _rate_limiter.baostock_status()
+                em_cb = _rate_limiter._circuit_until.get("eastmoney", 0)
+                em_remain = max(0, int(em_cb - time.time()))
+                em_status = f"熔断(剩{em_remain//60}分)" if em_remain > 0 else "正常"
+                lines.append(f"---")
                 lines.append(f"baostock额度: {rl['used']}/{rl['limit']} ({rl['usage_pct']:.0f}%)")
+                lines.append(f"东财: {em_status}")
             except Exception:
                 pass
 
@@ -436,6 +472,19 @@ class AuctionScheduler:
             logger.info(f"因子IC刷新完成：{len(effective)}/{len(factors)}个有效因子（滚动6个月）")
         except Exception as e:
             logger.warning(f"因子IC刷新失败：{e!r}")
+
+    def _sync_margin(self) -> None:
+        """融资融券增量同步（盘后执行，akshare 沪+深，不受东财push2his熔断影响）。
+
+        同步当日全市场融资融券明细到 margin_detail 表（幂等UPSERT）。
+        """
+        try:
+            from sequoia_x.data.margin_sync import sync_margin_detail
+            today = datetime.now().strftime("%Y%m%d")
+            n = sync_margin_detail(self.db_path, today)
+            logger.info(f"融资融券同步完成：{n} 行")
+        except Exception as e:
+            logger.warning(f"融资融券同步失败：{e!r}")
 
     def _sync_valuation(self) -> None:
         """PE/PB估值同步（东财快照，全市场）。"""
@@ -472,20 +521,16 @@ class AuctionScheduler:
                     "ORDER BY symbol LIMIT 500"
                 ).fetchall()]
             if symbols:
+                # 串行慢速回补（n_workers=1），避免东财神 IP 风控触发熔断
                 result = backfill_fund_flow_history(
-                    self.db_path, symbols, days=250, n_workers=3
+                    self.db_path, symbols, days=250, n_workers=1
                 )
                 logger.info(f"资金流向历史回填：{result}")
         except Exception as e:
             logger.warning(f"资金流向历史回填失败：{e!r}")
 
-        # 北向资金持股同步（中大市值前 800 只）
-        try:
-            from sequoia_x.data.north_sync import backfill_north_hold
-            result = backfill_north_hold(self.db_path, top_n=800, n_workers=3)
-            logger.info(f"北向持股同步：{result}")
-        except Exception as e:
-            logger.warning(f"北向持股同步失败（不影响其他任务）：{e!r}")
+        # 北向资金已断供（2024-08沪深港通新规取消个股明细公开），跳过同步
+        logger.debug("北向持股跳过同步（2024-08后数据源永久断供）")
 
     def _auction_verify(self) -> None:
         """竞价T+1命中验证（数据同步后执行）。"""
