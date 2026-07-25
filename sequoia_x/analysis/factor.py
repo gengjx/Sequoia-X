@@ -681,26 +681,22 @@ def evaluate_factor_ic(
     }
     has_quality = bool(set(factor_set) & quality_factors)
     has_valuation = bool(set(factor_set) & valuation_factors)
-    finance_map: dict[str, dict] = {}  # {symbol: {roe, np_margin, ...}}
+    finance_map: dict[str, list[tuple]] = {}  # {symbol: [(stat_date, {fields})], 排序}
     if has_quality:
         import sqlite3 as _sq
         try:
             with _sq.connect(engine.db_path) as _conn:
-                # 取每只股票最新一季财报
                 _rows = _conn.execute(
-                    """SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
+                    """SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
                               yoy_ni, asset_turn, inv_turn, nr_turn
-                       FROM stock_finance
-                       WHERE (symbol, stat_date) IN (
-                           SELECT symbol, MAX(stat_date) FROM stock_finance GROUP BY symbol
-                       )"""
+                       FROM stock_finance ORDER BY symbol, stat_date"""
                 ).fetchall()
-                for r in _rows:
-                    finance_map[r[0]] = {
-                        "roe": r[1], "np_margin": r[2], "gp_margin": r[3],
-                        "yoy_eps": r[4], "yoy_pni": r[5],
-                        "yoy_ni": r[6], "asset_turn": r[7], "inv_turn": r[8], "nr_turn": r[9],
-                    }
+            for r in _rows:
+                finance_map.setdefault(r[0], []).append((r[1], {
+                    "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
+                    "yoy_eps": r[5], "yoy_pni": r[6],
+                    "yoy_ni": r[7], "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
+                }))
             logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：财报加载失败：{e!r}")
@@ -720,20 +716,20 @@ def evaluate_factor_ic(
     # 加载资金流向（main_net / main_pct / flow_super_ratio / flow_intensity）
     fund_flow_factors = {"main_net", "main_pct", "flow_super_ratio", "flow_intensity"}
     has_fund_flow = bool(set(factor_set) & fund_flow_factors)
-    fund_flow_map: dict[str, dict] = {}
+    fund_flow_map: dict[str, list[tuple]] = {}  # {symbol: [(date, {fields})], 排序}
     if has_fund_flow:
         import sqlite3 as _sq2
         try:
             with _sq2.connect(engine.db_path) as _conn2:
                 _ff_rows = _conn2.execute(
-                    "SELECT symbol, main_net, main_pct, super_net, big_net FROM fund_flow "
-                    "WHERE date=(SELECT MAX(date) FROM fund_flow)"
+                    "SELECT symbol, date, main_net, main_pct, super_net, big_net "
+                    "FROM fund_flow ORDER BY symbol, date"
                 ).fetchall()
-                for r in _ff_rows:
-                    fund_flow_map[r[0]] = {
-                        "main_net": r[1], "main_pct": r[2],
-                        "super_net": r[3], "big_net": r[4],
-                    }
+            for r in _ff_rows:
+                fund_flow_map.setdefault(r[0], []).append((r[1], {
+                    "main_net": r[2], "main_pct": r[3],
+                    "super_net": r[4], "big_net": r[5],
+                }))
             logger.info(f"因子IC评估：加载资金流向 {len(fund_flow_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：资金流向加载失败：{e!r}")
@@ -775,6 +771,27 @@ def evaluate_factor_ic(
 
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
+    def _pit_asof(seq: list[tuple], asof_date: str) -> dict | None:
+        """从已排序的 [(date, fields), ...] 取 ≤ asof_date 的最新一条 fields。"""
+        import bisect
+        if not seq:
+            return None
+        dates_list = [d for d, _ in seq]
+        idx = bisect.bisect_right(dates_list, asof_date) - 1
+        return seq[idx][1] if idx >= 0 else None
+
+    def _pit_recent(seq: list[tuple], asof_date: str, days: int) -> list[tuple]:
+        """取 ≤ asof_date 的最近 days 个自然日内的记录。"""
+        if not seq:
+            return []
+        import datetime as _dtm
+        try:
+            ref = _dtm.datetime.strptime(asof_date, "%Y-%m-%d")
+            ws = (ref - _dtm.timedelta(days=days)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return []
+        return [(d, f) for d, f in seq if ws <= d <= asof_date]
+
     records: dict[str, list[dict]] = {}  # {month: [{factor_values..., fwd_return}]}
     processed = 0
 
@@ -815,7 +832,8 @@ def evaluate_factor_ic(
                 row = {"symbol": sym}
                 for k in factor_set:
                     if k in fund_flow_factors:
-                        ff = fund_flow_map.get(sym)
+                        # as-of 取截面前最新资金流（杜绝未来函数）
+                        ff = _pit_asof(fund_flow_map.get(sym, []), dates[i])
                         if ff:
                             if k == "main_net":
                                 row[k] = float(ff.get("main_net", 0)) if ff.get("main_net") is not None else None
@@ -840,7 +858,8 @@ def evaluate_factor_ic(
                         else:
                             row[k] = None
                     elif k in quality_factors:
-                        fin = finance_map.get(sym)
+                        # as-of 取截面前最新季报（杜绝未来函数：用已披露的财报）
+                        fin = _pit_asof(finance_map.get(sym, []), dates[i])
                         field = _finance_field_map.get(k)
                         if fin and field:
                             v = fin.get(field)
@@ -858,23 +877,12 @@ def evaluate_factor_ic(
                         else:
                             row[k] = None
                     elif k in lhb_factors:
-                        # as-of 取近30天龙虎榜（杜绝未来函数：用截面前30天数据）
-                        _lhb_list = lhb_map.get(sym)
-                        if _lhb_list:
-                            import datetime as _dtmod
-                            try:
-                                _asof = _dtmod.datetime.strptime(dates[i], "%Y-%m-%d")
-                                _ws = (_asof - _dtmod.timedelta(days=30)).strftime("%Y-%m-%d")
-                                _recent = [(d, nb) for d, nb in _lhb_list
-                                           if _ws <= d <= dates[i]]
-                            except (ValueError, TypeError):
-                                _recent = []
-                            if k == "lhb_count":
-                                row[k] = float(len(_recent))
-                            elif k == "lhb_netbuy":
-                                row[k] = float(sum(nb for _, nb in _recent))
-                            else:
-                                row[k] = None
+                        # as-of 取近30天龙虎榜（杜绝未来函数），lhb_map 为 [(date, net_buy)]
+                        _recent = _pit_recent(lhb_map.get(sym, []), dates[i], 30)
+                        if k == "lhb_count":
+                            row[k] = float(len(_recent))
+                        elif k == "lhb_netbuy":
+                            row[k] = float(sum(nb for _, nb in _recent))
                         else:
                             row[k] = None
                     elif k in north_factors:
