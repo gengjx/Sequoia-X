@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--batch", type=int, default=80, help="单批最多处理只数")
     ap.add_argument("--interval", type=float, default=1.5, help="每只间隔秒")
     ap.add_argument("--max-fail", type=int, default=8, help="连续失败N次停止")
+    ap.add_argument("--wait", action="store_true", help="熔断中时等待解除再跑(每5分钟检查)")
     args = ap.parse_args()
 
     target = get_target_symbols()
@@ -79,10 +80,16 @@ def main():
     print(f"目标池 {len(target)}只, 待补 {len(todo)}只 (深度<{MIN_DEPTH}行)", flush=True)
     print(f"参数: batch={args.batch} interval={args.interval}s max_fail={args.max_fail}", flush=True)
 
-    # 熔断预检查
-    if _rate_limiter._is_circuit_breaker("eastmoney"):
-        print("!! 东财仍在熔断冷却中，请稍后再试", flush=True)
-        sys.exit(1)
+    # 熔断预检查：--wait 时轮询等待解除，否则直接退出
+    while _rate_limiter._is_circuit_breaker("eastmoney"):
+        cb = _rate_limiter._circuit_until.get("eastmoney", 0)
+        remain = max(0, int(cb - time.time()))
+        if not args.wait:
+            print(f"!! 东财熔断中(剩{remain//60}分)，加 --wait 可等待解除", flush=True)
+            sys.exit(1)
+        print(f"东财熔断中(剩{remain//60}分{remain%60}秒)，5分钟后重试...", flush=True)
+        time.sleep(300)
+    print("东财熔断已解除，开始回补", flush=True)
 
     t0 = time.time()
     done = 0

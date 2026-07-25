@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sequoia.fundflow</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/.venv/bin/python</string>
+        <string>-u</string>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/backfill_fundflow.py</string>
+        <string>--batch</string>
+        <string>80</string>
+        <string>--interval</string>
+        <string>1.5</string>
+        <string>--max-fail</string>
+        <string>8</string>
+        <string>--wait</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/logs/fundflow_backfill.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/logs/fundflow_backfill.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x</string>
+    </dict>
+</dict>
+</plist>
