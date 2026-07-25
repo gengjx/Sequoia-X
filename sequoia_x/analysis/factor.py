@@ -33,6 +33,16 @@ MIN_ICIR_ABS = 0.5      # ICIR 绝对值下限（信息比率）
 MIN_T_STAT = 2.0        # t 统计量下限（≈95% 置信），样本不足时可下调到 1.65(90%)
 MIN_IC_SAMPLES = 6      # 最少月度 IC 观测数，否则默认不显著
 
+# ── 因子拥挤度衰减（行业集中度 HHI → 软连续权重衰减）──
+# 高拥挤因子选出的票集中在少数行业，反转风险大。用多头组合行业 HHI
+# 衡量拥挤，对拥挤因子权重施加软衰减（保留 30% 下限，与 oos_decay 哲学一致）。
+# 阈值为 84 行业、500 采样（top20%≈100 名）的工程估值，首跑后看日志分布再调。
+CROWDING_TOP_PCT = 0.20       # 多头侧分位数（top 20%）
+CROWDING_LOOKBACK_MONTHS = 3  # 取最近 N 月 HHI 均值降噪
+CROWDING_SAFE = 0.08          # HHI ≤ 此值不衰减（分散健康）
+CROWDING_MAX = 0.30           # HHI ≥ 此值衰减到下限（重度拥挤）
+CROWDING_FLOOR = 0.30         # 衰减下限（保留 30% 分散价值，不归零）
+
 # 因子分类（key=因子名, category=大类, direction=+1正向/-1反向）
 FACTOR_META: dict[str, dict] = {
     # ── 动量(8) ──
@@ -913,6 +923,25 @@ def evaluate_factor_ic(
             ic = float(valid[f].rank().corr(valid["fwd_return"].rank()))
             ic_series[f].append(ic)
 
+    # P6: 因子拥挤度评估（多头组合行业集中度 HHI）—— 在三态/全局权重计算前算，
+    # 以便对拥挤因子施加软衰减乘子。ic_by_factor 从 ic_series 均值推导
+    # （此处 factor_reports 尚未构建），industry_map 已加载。
+    ic_by_factor = {
+        f: float(np.mean([x for x in ic_series[f] if not np.isnan(x)]))
+        for f in factor_set if any(not np.isnan(x) for x in ic_series[f])
+    }
+    crowding_scores = _compute_crowding(
+        records, sorted_months, ic_by_factor, industry_map,
+    )
+    if crowding_scores:
+        vals = sorted(crowding_scores.values())
+        med = vals[len(vals) // 2]
+        logger.info(
+            f"因子拥挤度(HHI)：{len(vals)}个因子 "
+            f"min={vals[0]:.3f} median={med:.3f} max={vals[-1]:.3f} "
+            f"(衰减阈值 SAFE={CROWDING_SAFE}/MAX={CROWDING_MAX})"
+        )
+
     # ════════ P1: 三态市场状态分组IC（bull/neutral/bear 各一套权重）════════
     # 用全市场等权月度收益判定该月市场状态：
     #   月收益 >3% → bull, <-3% → bear, 中间 → neutral
@@ -970,7 +999,10 @@ def evaluate_factor_ic(
         total_ic = sum(abs(r["ic_mean"]) for r in state_reports)
         if total_ic > 0:
             for r in state_reports:
-                r["weight"] = round(r["ic_mean"] / total_ic, 4)
+                # P6: 三态权重同样施加拥挤度软衰减（用同一全局 crowding：
+                # 行业集中度是结构性属性，与市场态无关）
+                r["weight"] = round(
+                    (r["ic_mean"] / total_ic) * _crowding_penalty(crowding_scores.get(r["factor_name"], 0.0)), 4)
             state_weights[state] = state_reports
 
     # 写入三态权重表
@@ -1089,8 +1121,11 @@ def evaluate_factor_ic(
                 "icir": f.get("icir", 0),
                 "t_stat": f.get("t_stat", 0),
                 "win_rate": f.get("win_rate", 0),
-                # 带符号权重：正IC正权重，负IC负权重，按|IC|归一化
-                "weight": round(f["ic_mean"] / total_ic, 4),
+                "crowding": crowding_scores.get(f["name"], 0.0),
+                # P6: 权重 = (IC/|ΣIC|) × 拥挤度软衰减；乘子在归一化分母后施加，
+                # 正确穿透 multi_factor 的 Σ|w| 再归一化（只有相对权重生效）。
+                "weight": round(
+                    (f["ic_mean"] / total_ic) * _crowding_penalty(crowding_scores.get(f["name"], 0.0)), 4),
             } for f in effective]
             engine.save_factor_weights(weights)
             pos_cnt = sum(1 for w in weights if w["weight"] > 0)
@@ -1100,22 +1135,6 @@ def evaluate_factor_ic(
             logger.warning("无因子通过显著性过滤(0.03/0.5/2.0)，权重已全量清零，检查数据/窗口")
     except Exception as e:
         logger.warning(f"因子权重写DB失败（不影响评估结果）：{e!r}")
-
-    # P4: 因子拥挤度评估（多头组合集中度）
-    # 拥挤度 = 因子Top20%组合的行业集中度（HHI指数）
-    # 高拥挤度意味着因子选出的票集中在少数行业，反转风险高
-    crowding_scores = {}
-    if "fwd_return" in str(records.get(sorted_months[-1], [{}])[0]):
-        last_month = sorted_months[-1] if sorted_months else None
-        if last_month:
-            last_batch = pd.DataFrame(records[last_month])
-            for f in factor_set:
-                valid_f = last_batch[[f, "fwd_return"]].dropna()
-                if len(valid_f) >= 50:
-                    top_q = valid_f.nlargest(max(len(valid_f)//5, 10), f)
-                    # 简化拥挤度：Top组合的收益分散度（标准差越小越拥挤）
-                    crowd = float(top_q["fwd_return"].std()) if len(top_q) > 5 else 0
-                    crowding_scores[f] = round(crowd, 4)
 
     return {
         "factors": factor_reports,
@@ -1164,3 +1183,99 @@ def _factor_assessment(ic_mean: float, icir: float, win_rate: float) -> str:
     if abs(ic_mean) >= 0.02:
         return "弱有效，方向" + ("正向" if ic_mean > 0 else "负向")
     return "无效因子"
+
+
+def _industry_hhi(symbols, industry_map: dict) -> float:
+    """计算一组股票的行业集中度（Herfindahl-Hirschman Index）。
+
+    HHI = Σ(industry_share²)，范围 (0,1]：全部同行业=1.0，完全均匀分散≈1/行业数。
+    衡量因子多头组合是否过度集中于少数行业（拥挤度代理，反转风险信号）。
+
+    Args:
+        symbols: 多头组合的股票代码列表
+        industry_map: {symbol: 行业名} 映射
+
+    Returns:
+        HHI 值 (0,1]；无行业数据或空集时返回 0（视为不拥挤，不惩罚）。
+    """
+    if not symbols or not industry_map:
+        return 0.0
+    counts: dict[str, int] = {}
+    n = 0
+    for sym in symbols:
+        ind = industry_map.get(sym)
+        if not ind:
+            continue
+        counts[ind] = counts.get(ind, 0) + 1
+        n += 1
+    if n == 0:
+        return 0.0
+    return sum((c / n) ** 2 for c in counts.values())
+
+
+def _compute_crowding(
+    records: dict, sorted_months: list, ic_by_factor: dict, industry_map: dict,
+) -> dict:
+    """计算各因子的多头组合行业集中度（HHI），取近 N 月均值降噪。
+
+    对每个因子按 IC 符号取多头侧（IC≥0→top、IC<0→bottom，修正旧 nlargest
+    不分方向导致负 IC 因子取错侧的缺陷），用原始（未中性化）因子值——中性化
+    会扭曲真实集中度语义。取最近 CROWDING_LOOKBACK_MONTHS 个月 HHI 均值。
+
+    Args:
+        records: {month: [{symbol, factor..., fwd_return}, ...]}
+        sorted_months: 升序月份列表
+        ic_by_factor: {factor_name: ic_mean}（决定多头侧方向）
+        industry_map: {symbol: 行业名}
+
+    Returns:
+        {factor_name: avg_hhi}，仅含有足够数据的因子。
+    """
+    if not sorted_months or not industry_map:
+        return {}
+    lookback = min(CROWDING_LOOKBACK_MONTHS, len(sorted_months))
+    months = sorted_months[-lookback:]
+    crowding: dict[str, float] = {}
+    for f, ic in ic_by_factor.items():
+        hhis = []
+        for m in months:
+            batch = records.get(m, [])
+            if len(batch) < 50 or f not in batch[0]:
+                continue
+            df = pd.DataFrame(batch)
+            valid = df[[f, "symbol"]].dropna()
+            if len(valid) < 50:
+                continue
+            k = max(len(valid) // int(1 / CROWDING_TOP_PCT), 10)  # top20%
+            # 多头侧：IC≥0 取 top、IC<0 取 bottom（负 IC 因子多头是低值侧）
+            if ic >= 0:
+                long_syms = valid.nlargest(k, f)["symbol"].tolist()
+            else:
+                long_syms = valid.nsmallest(k, f)["symbol"].tolist()
+            hhi = _industry_hhi(long_syms, industry_map)
+            if hhi > 0:
+                hhis.append(hhi)
+        if hhis:
+            crowding[f] = round(sum(hhis) / len(hhis), 4)
+    return crowding
+
+
+def _crowding_penalty(crowding: float) -> float:
+    """拥挤度 → 软连续衰减乘子。
+
+    线性映射：c≤SAFE→1.0（不衰减）、c≥MAX→FLOOR（保留下限）、中间线性递减。
+    重度拥挤也不归零，保留分散价值（与 oos_decay 半保留下限哲学一致）。
+
+    Args:
+        crowding: HHI 拥挤度值（通常 0~1）。
+
+    Returns:
+        衰减乘子 [CROWDING_FLOOR, 1.0]。
+    """
+    if crowding <= CROWDING_SAFE:
+        return 1.0
+    if crowding >= CROWDING_MAX:
+        return CROWDING_FLOOR
+    # 线性：1.0 在 SAFE，CROWDING_FLOOR 在 MAX
+    frac = (crowding - CROWDING_SAFE) / (CROWDING_MAX - CROWDING_SAFE)
+    return round(1.0 - (1.0 - CROWDING_FLOOR) * frac, 4)

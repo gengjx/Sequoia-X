@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS factor_weights (
     icir        REAL DEFAULT 0,
     win_rate    REAL DEFAULT 0,
     weight      REAL NOT NULL,
+    crowding    REAL DEFAULT 0,
     updated_at  TEXT NOT NULL
 );
 """
@@ -322,6 +323,10 @@ class DataEngine:
             ]:
                 if _col not in _existing:
                     conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {_col} {_ddl}")
+            # P6: factor_weights 增 crowding 列（幂等）
+            _fw_cols = {r[1] for r in conn.execute("PRAGMA table_info(factor_weights)")}
+            if "crowding" not in _fw_cols:
+                conn.execute("ALTER TABLE factor_weights ADD COLUMN crowding REAL DEFAULT 0")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -342,8 +347,8 @@ class DataEngine:
         import time
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         sql = ("INSERT OR REPLACE INTO factor_weights "
-               "(factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
-               "VALUES (?,?,?,?,?,?,?)")
+               "(factor_name, category, ic_mean, icir, win_rate, weight, crowding, updated_at) "
+               "VALUES (?,?,?,?,?,?,?,?)")
         conn = sqlite3.connect(self.db_path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout=5000")
@@ -351,21 +356,22 @@ class DataEngine:
                 conn.execute(sql, (
                     w["factor_name"], w.get("category", ""),
                     w["ic_mean"], w.get("icir", 0), w.get("win_rate", 0),
-                    w["weight"], now,
+                    w["weight"], w.get("crowding", 0), now,
                 ))
         finally:
             conn.close()
 
     def load_factor_weights(self) -> dict[str, dict]:
         """读取全部因子权重，返回 {factor_name: {weight, ic_mean, ...}}。"""
-        sql = ("SELECT factor_name, category, ic_mean, icir, win_rate, weight, updated_at "
+        sql = ("SELECT factor_name, category, ic_mean, icir, win_rate, weight, crowding, updated_at "
                "FROM factor_weights")
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(sql).fetchall()
         return {
             r[0]: {
                 "category": r[1], "ic_mean": r[2], "icir": r[3],
-                "win_rate": r[4], "weight": r[5], "updated_at": r[6],
+                "win_rate": r[4], "weight": r[5], "crowding": r[6],
+                "updated_at": r[7],
             }
             for r in rows
         }
