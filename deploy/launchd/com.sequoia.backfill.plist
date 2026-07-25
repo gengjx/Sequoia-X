@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sequoia.backfill</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/.venv/bin/python</string>
+        <string>-u</string>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/backfill_finance.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/logs/backfill_finance.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x/logs/backfill_finance.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/he/Documents/Codex/2026-06-30/sequoia-x</string>
+    </dict>
+</dict>
+</plist>
