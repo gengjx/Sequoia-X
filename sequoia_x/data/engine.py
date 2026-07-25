@@ -194,6 +194,21 @@ CREATE TABLE IF NOT EXISTS market_factor_weights (
 );
 """
 
+_CREATE_MARGIN_DETAIL_SQL = """
+CREATE TABLE IF NOT EXISTS margin_detail (
+    symbol    TEXT    NOT NULL,
+    date      TEXT    NOT NULL,
+    rzye      REAL,           -- 融资余额（看多杠杆水平）
+    rzbuy     REAL,           -- 融资买入额
+    rzrepay   REAL,           -- 融资偿还额
+    rqlts     REAL,           -- 融券余量（看空杠杆水平）
+    rqsell    REAL,           -- 融券卖出量
+    rqrepay   REAL,           -- 融券偿还量
+    rqye      REAL,           -- 融券余额
+    PRIMARY KEY (symbol, date)
+);
+"""
+
 _CREATE_ML_SCORES_SQL = """
 CREATE TABLE IF NOT EXISTS ml_scores (
     run_date      TEXT    NOT NULL,
@@ -313,6 +328,7 @@ class DataEngine:
             conn.execute(_CREATE_PAPER_NAV_SQL)
             conn.execute(_CREATE_MARKET_FACTOR_WEIGHTS_SQL)
             conn.execute(_CREATE_ML_SCORES_SQL)
+            conn.execute(_CREATE_MARGIN_DETAIL_SQL)
             conn.execute(_CREATE_MINUTE_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_sym_dt ON stock_minute(symbol, datetime)")
             # 增量迁移：给已有DB补列（旧数据新列为NULL，不破坏）

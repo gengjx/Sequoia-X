@@ -115,6 +115,10 @@ FACTOR_META: dict[str, dict] = {
     # ── 北向资金(2)（沪深港通持股，来自north_hold表）──
     "nb_holding_pct":  {"category": "北向", "desc": "北向持股占比（机构持仓水平）"},
     "nb_inflow":       {"category": "北向", "desc": "近20日北向持股占比变化（增量资金方向）"},
+    # ── 融资融券(3)（杠杆资金方向，北向断供后的替代信号）──
+    "margin_balance":  {"category": "融资融券", "desc": "融资余额（杠杆看多水平，高=拥挤）"},
+    "margin_netbuy":   {"category": "融资融券", "desc": "融资净买入额（当日杠杆资金流入）"},
+    "short_ratio":     {"category": "融资融券", "desc": "融券占比（看空比例，高=空头情绪）"},
 }
 
 
@@ -769,6 +773,25 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：北向持股加载失败（表可能不存在）：{e!r}")
 
+    # 加载融资融券历史（杠杆资金方向，北向断供后的替代信号）
+    margin_factors = {"margin_balance", "margin_netbuy", "short_ratio"}
+    margin_map: dict[str, list[tuple]] = {}  # {symbol: [(date, {fields})], 排序}
+    if set(factor_set) & margin_factors:
+        import sqlite3 as _sq5
+        try:
+            with _sq5.connect(engine.db_path) as _conn5:
+                _mg_rows = _conn5.execute(
+                    "SELECT symbol, date, rzye, rzbuy, rqlts, rqye "
+                    "FROM margin_detail ORDER BY symbol, date"
+                ).fetchall()
+            for r in _mg_rows:
+                margin_map.setdefault(r[0], []).append((r[1], {
+                    "rzye": r[2], "rzbuy": r[3], "rqlts": r[4], "rqye": r[5],
+                }))
+            logger.info(f"因子IC评估：加载融资融券 {len(margin_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：融资融券加载失败：{e!r}")
+
     # 采集每只股票的 (月份, 因子值, 未来收益)
     # 性能优化：一次性向量化算完整序列因子，再按月取截面，避免逐月重算
     def _pit_asof(seq: list[tuple], asof_date: str) -> dict | None:
@@ -807,8 +830,9 @@ def evaluate_factor_ic(
             # 向量化算完整序列的因子值（一次算完，按月取截面）
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
             # 所有 point-in-time 因子（非时序，按月取截面值）需排除出 compute_factor_series
+            margin_factors = {"margin_balance", "margin_netbuy", "short_ratio"}
             _pit_factors = (quality_factors | valuation_factors | fund_flow_factors
-                            | lhb_factors | {"nb_holding_pct", "nb_inflow"})
+                            | lhb_factors | north_factors | margin_factors)
             ts_factors = [f for f in factor_set if f not in _pit_factors]
             series = compute_factor_series(df, ts_factors)
             dates = df["date"].astype(str).values
@@ -897,6 +921,26 @@ def evaluate_factor_ic(
                                     idx20 = len(asof_dates) - 21
                                     old_pct = nb_series[asof_dates[idx20]] if idx20 >= 0 else None
                                     row[k] = (cur_pct - old_pct) if old_pct is not None else None
+                                else:
+                                    row[k] = None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in margin_factors:
+                        # as-of 取截面前最新融资融券（杜绝未来函数）
+                        mg = _pit_asof(margin_map.get(sym, []), dates[i])
+                        if mg:
+                            rzye = mg.get("rzye")
+                            rqye = mg.get("rqye")
+                            if k == "margin_balance":
+                                row[k] = float(rzye) if rzye is not None else None
+                            elif k == "margin_netbuy":
+                                rzbuy = mg.get("rzbuy")
+                                row[k] = float(rzbuy) if rzbuy is not None else None
+                            elif k == "short_ratio":
+                                if rqye is not None and rzye is not None and rzye > 0:
+                                    row[k] = float(rqye) / (rzye + rqye)
                                 else:
                                     row[k] = None
                             else:
