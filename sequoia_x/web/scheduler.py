@@ -34,7 +34,8 @@ class AuctionScheduler:
         (21, 6, "sync_fund_flow"),   # 主力资金流向同步
         (21, 7, "sync_margin"),      # 融资融券增量同步（杠杆资金方向，北向断供替代）
         (21, 8, "sync_valuation"),  # PE/PB估值同步（东财快照，全市场3秒）
-        (21, 10, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
+        (21, 9, "sync_altdata"),  # 另类数据：沪深300+基金持仓+M2/社融增量
+        (21, 12, "refresh_factor_ic"),  # 因子IC权重刷新（滚动6个月窗口）
         (21, 30, "auction_verify"),  # 同步完成后验证T+1命中
         (21, 40, "paper_trade"),  # 模拟盘：盘后选股→买入→卖出闭环
         (22, 0, "daily_report"),  # 每日任务执行汇总 → 飞书推送
@@ -228,6 +229,8 @@ class AuctionScheduler:
             self._sync_margin()
         elif task == "sync_valuation":
             self._sync_valuation()
+        elif task == "sync_altdata":
+            self._sync_altdata()
         elif task == "refresh_factor_ic":
             self._refresh_factor_ic()
         elif task == "daily_report":
@@ -362,6 +365,7 @@ class AuctionScheduler:
                 "sync_lhb": "龙虎榜同步",
                 "sync_fund_flow": "资金流向同步",
                 "sync_margin": "融资融券同步",
+                "sync_altdata": "另类数据同步",
                 "refresh_factor_ic": "因子IC刷新",
                 "auction_verify": "竞价T+1验证",
                 "paper_trade": "模拟盘闭环",
@@ -425,6 +429,20 @@ class AuctionScheduler:
                     # 北向（标注断供）
                     nb_max = conn.execute("SELECT MAX(date) FROM north_hold").fetchone()[0] or "-"
                     lines.append(f"北向: {nb_max}（2024-08后断供）")
+
+                    # 沪深300指数
+                    idx_max = conn.execute("SELECT MAX(date) FROM index_daily").fetchone()[0] or "-"
+                    lines.append(f"沪深300: {idx_max}")
+
+                    # 基金持仓
+                    fh_qtr = conn.execute("SELECT COUNT(DISTINCT report_date) FROM fund_hold").fetchone()[0]
+                    fh_max = conn.execute("SELECT MAX(report_date) FROM fund_hold").fetchone()[0] or "-"
+                    lines.append(f"基金持仓: {fh_max} | {fh_qtr}季度")
+
+                    # 宏观
+                    m2_max = conn.execute("SELECT MAX(month) FROM macro_money").fetchone()[0] or "-"
+                    sf_max = conn.execute("SELECT MAX(month) FROM macro_sf").fetchone()[0] or "-"
+                    lines.append(f"M2: {m2_max} | 社融: {sf_max}")
             except Exception as e:
                 lines.append(f"数据状态查询失败: {e}")
 
@@ -449,6 +467,35 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"每日汇总失败：{e!r}")
             return f"失败: {e}"
+
+    def _sync_altdata(self) -> None:
+        """另类数据增量同步：沪深300指数(日) + 基金持仓(季) + M2/社融(月)。
+
+        各源全量拉取幂等UPSERT，增量数据自动覆盖。约3-5秒。
+        """
+        from sequoia_x.data.altdata_sync import (
+            sync_index_daily, sync_fund_hold,
+            sync_macro_money_supply, sync_macro_social_finance,
+        )
+        try:
+            # 沪深300（日频，全量拉取约1秒）
+            n = sync_index_daily(self.db_path, "sh000300")
+            logger.info(f"沪深300指数同步: {n}行")
+        except Exception as e:
+            logger.warning(f"沪深300同步失败: {e!r}")
+        try:
+            # M2/社融（月频，全量拉取<1秒）
+            sync_macro_money_supply(self.db_path)
+            sync_macro_social_finance(self.db_path)
+        except Exception as e:
+            logger.warning(f"宏观数据同步失败: {e!r}")
+        try:
+            # 基金持仓（季频，取最近2季度约10秒）
+            from sequoia_x.data.altdata_sync import _recent_report_dates
+            for d in _recent_report_dates(2):
+                sync_fund_hold(self.db_path, d)
+        except Exception as e:
+            logger.warning(f"基金持仓同步失败: {e!r}")
 
     def _refresh_factor_ic(self) -> None:
         """因子IC权重自动刷新（滚动6个月窗口 + 三态权重）。

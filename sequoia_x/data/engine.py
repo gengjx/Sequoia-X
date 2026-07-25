@@ -194,6 +194,58 @@ CREATE TABLE IF NOT EXISTS market_factor_weights (
 );
 """
 
+_CREATE_FUND_HOLD_SQL = """
+CREATE TABLE IF NOT EXISTS fund_hold (
+    symbol        TEXT    NOT NULL,
+    report_date   TEXT    NOT NULL,
+    name          TEXT    DEFAULT '',
+    fund_count    INTEGER DEFAULT 0,    -- 持有基金家数
+    hold_shares   REAL,                  -- 持股总数
+    hold_value    REAL,                  -- 持股市值
+    change_dir    TEXT,                  -- 增仓/减仓
+    change_shares REAL,                  -- 变动股数
+    change_pct    REAL,                  -- 变动比例%
+    PRIMARY KEY (symbol, report_date)
+);
+"""
+
+_CREATE_INDEX_DAILY_SQL = """
+CREATE TABLE IF NOT EXISTS index_daily (
+    symbol  TEXT    NOT NULL,
+    date    TEXT    NOT NULL,
+    open    REAL,
+    high    REAL,
+    low     REAL,
+    close   REAL,
+    volume  REAL,
+    PRIMARY KEY (symbol, date)
+);
+"""
+
+_CREATE_MACRO_MONEY_SQL = """
+CREATE TABLE IF NOT EXISTS macro_money (
+    month   TEXT PRIMARY KEY,
+    m2      REAL,       -- M2货币供应量(亿元)
+    m2_yoy  REAL,       -- M2同比%
+    m1      REAL,       -- M1
+    m1_yoy  REAL,
+    m0      REAL,       -- M0流通现金
+    m0_yoy  REAL
+);
+"""
+
+_CREATE_MACRO_SF_SQL = """
+CREATE TABLE IF NOT EXISTS macro_sf (
+    month           TEXT PRIMARY KEY,
+    sf_total        REAL,   -- 社融增量(亿元)
+    rmb_loan        REAL,   -- 人民币贷款
+    entrust_loan    REAL,   -- 委托贷款
+    trust_loan      REAL,   -- 信托贷款
+    corp_bond       REAL,   -- 企业债券
+    equity_finance  REAL    -- 股票融资
+);
+"""
+
 _CREATE_MARGIN_DETAIL_SQL = """
 CREATE TABLE IF NOT EXISTS margin_detail (
     symbol    TEXT    NOT NULL,
@@ -329,6 +381,10 @@ class DataEngine:
             conn.execute(_CREATE_MARKET_FACTOR_WEIGHTS_SQL)
             conn.execute(_CREATE_ML_SCORES_SQL)
             conn.execute(_CREATE_MARGIN_DETAIL_SQL)
+            conn.execute(_CREATE_FUND_HOLD_SQL)
+            conn.execute(_CREATE_INDEX_DAILY_SQL)
+            conn.execute(_CREATE_MACRO_MONEY_SQL)
+            conn.execute(_CREATE_MACRO_SF_SQL)
             conn.execute(_CREATE_MINUTE_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_minute_sym_dt ON stock_minute(symbol, datetime)")
             # 增量迁移：给已有DB补列（旧数据新列为NULL，不破坏）
