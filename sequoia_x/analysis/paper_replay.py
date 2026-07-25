@@ -552,40 +552,19 @@ class PaperReplayEngine:
     @staticmethod
     def _calc_atr_stop(symbol_groups: dict, symbol: str, today: str, entry_price: float,
                        atr_mult: float = 2.5, min_pct: float = 0.08, max_pct: float = 0.15) -> float:
-        """ATR动态止损：根据股票自身波动率计算止损价。
+        """ATR动态止损：薄封装，委托共享 calc_atr_stop（P5 统一止损口径）。
 
         ATR高的股票（创业板/活跃股）止损宽，ATR低的股票（大盘/慢牛股）止损窄。
-        范围限制：8%~15%（防止假止损）。
-
-        Args:
-            atr_mult: ATR乘数（2.5=2.5倍ATR，适配A股波动）
-            min_pct: 最小止损幅度8%（A股日内波动常3-5%）
-            max_pct: 最大止损幅度15%
+        范围限制：8%~15%（防止假止损）。核心计算见 sequoia_x.analysis.stop_loss。
         """
+        from sequoia_x.analysis.stop_loss import calc_atr_stop
         g = symbol_groups.get(symbol)
         if g is None:
-            return entry_price * (1 - max_pct)
-        g_cut = g[g["date"] <= today]
-        if len(g_cut) < 21:
-            return entry_price * (1 - 0.12)  # 不足20天用默认12%
-
-        high = g_cut["high"].iloc[-20:]
-        low = g_cut["low"].iloc[-20:]
-        close = g_cut["close"].iloc[-20:]
-        prev_close = g_cut["close"].iloc[-21] if len(g_cut) > 20 else close.iloc[0]
-
-        # True Range = max(H-L, |H-PrevC|, |L-PrevC|)
-        tr = pd.concat([
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs()
-        ], axis=1).max(axis=1)
-        atr = float(tr.mean())
-        if atr <= 0:
-            return entry_price * (1 - 0.12)
-
-        stop_pct = min(max(atr * atr_mult / entry_price, min_pct), max_pct)
-        return entry_price * (1 - stop_pct)
+            return entry_price * (1 - max_pct)  # 无该股数据 → 最宽止损（保守）
+        return calc_atr_stop(
+            g, entry_price, atr_mult=atr_mult, min_pct=min_pct, max_pct=max_pct,
+            as_of_date=today,
+        )
 
     @staticmethod
     def _get_market_median_return(symbol_groups: dict, today: str, lookback: int) -> float:

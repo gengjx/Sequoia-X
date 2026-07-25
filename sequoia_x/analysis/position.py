@@ -327,6 +327,18 @@ class PositionTracker:
                 new_stop = lock_stop
                 sig.reasons.append(f"盈利{r_mult}R≥3R，止损上移至{lock_stop}(+2R)")
 
+        # ── 规则5b：ATR 自适应收紧（P5，只收紧不放宽）──
+        # 用当前 14 日 ATR 重算理论止损 entry*(1-clamp(2.5*atr/entry,8%,15%))。
+        # 波动率收敛时上移止损锁利/降险；波动率放大时维持原止损（不让亏损空间
+        # 扩大）。与 R 倍数移动止损叠加取更高值，遵循移动止损单向原则。
+        if atr > 0 and entry > 0:
+            atr_stop = round(entry * (1 - max(0.08, min(0.15, 2.5 * atr / entry))), 2)
+            if atr_stop > new_stop:
+                new_stop = atr_stop
+                sig.reasons.append(
+                    f"ATR自适应收紧：2.5×ATR={2.5 * atr:.2f}，止损上移至{atr_stop}"
+                )
+
         sig.new_stop = round(new_stop, 2)
         if new_stop > h["stop_loss"]:
             sig.action = "移动止损" if sig.action == "持有" else sig.action

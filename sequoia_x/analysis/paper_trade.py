@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
+from sequoia_x.analysis.stop_loss import (
+    DEFAULT_FALLBACK_PCT, calc_atr_stop, resolve_entry_stop,
+)
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 
@@ -364,11 +369,23 @@ class PaperTradeEngine:
                     skipped.append({"symbol": sym, "reason": "现金不足1手"})
                     continue
 
+            # ── P5：入场 ATR 自适应止损统一 ──
+            # decision/stock_analysis 传来的 stop_loss 散乱（-4%~-20% 且无封顶），
+            # 用 2.5×ATR（封顶 8%~15%）统一口径：为空/过宽(>15%)时用 ATR 重算。
+            raw_stop = item.get("stop_loss", 0) or 0.0
+            atr_stop = self._calc_entry_atr_stop(sym, today, price)
+            entry_stop = resolve_entry_stop(raw_stop, price, atr_stop)
+            if entry_stop != raw_stop:
+                logger.info(
+                    f"模拟盘入场止损统一 {sym}：原{raw_stop}→ATR{entry_stop:.2f}"
+                    f"(距{((price - entry_stop) / price * 100):.1f}%)"
+                )
+
             # 执行买入
             actual_cash_out = self._execute_buy(
                 symbol=sym, name=item.get("name", ""),
                 price=price, shares=shares, amount=amount,
-                date=today, stop_loss=item.get("stop_loss", 0),
+                date=today, stop_loss=entry_stop,
                 target=item.get("target", 0), grade=item.get("grade", ""),
                 hit_strategies=item.get("hit_strategies", ""),
                 reason=f"决策评分{score} {item.get('action','')}",
@@ -877,6 +894,28 @@ class PaperTradeEngine:
         except Exception as e:
             logger.debug(f"可交易性检查失败 {symbol}：{e!r}")
             return True, ""  # 查询失败不阻断买入（保守不假阴性）
+
+    def _calc_entry_atr_stop(self, symbol: str, date_str: str, entry_price: float) -> float:
+        """计算入场 ATR 止损价（20日 True Range，2.5×ATR，封顶 8%~15%）。
+
+        从 stock_daily 取该股 ≤ date_str 的最近 25 根 K 线，委托共享 calc_atr_stop，
+        口径与回测 _calc_atr_stop 完全一致。数据不足/异常时回退到 12% 止损，
+        不阻断买入流程。
+        """
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT date, high, low, close FROM stock_daily "
+                    "WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 25",
+                    (symbol, date_str),
+                ).fetchall()
+            if not rows:
+                return round(entry_price * (1 - DEFAULT_FALLBACK_PCT), 3)
+            df = pd.DataFrame([dict(r) for r in rows]).sort_values("date")
+            return round(calc_atr_stop(df, entry_price, as_of_date=date_str), 3)
+        except Exception as e:
+            logger.debug(f"ATR 入场止损计算失败 {symbol}：{e!r}")
+            return round(entry_price * (1 - DEFAULT_FALLBACK_PCT), 3)
 
     def _get_close_price(self, symbol: str, date_str: str | None = None) -> float | None:
         """获取收盘价：优先日K最新价，日K滞后时fallback东财实时价。
