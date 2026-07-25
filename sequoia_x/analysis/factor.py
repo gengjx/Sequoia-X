@@ -747,12 +747,11 @@ def evaluate_factor_ic(
         try:
             with _sq3.connect(engine.db_path) as _conn3:
                 _lhb_rows = _conn3.execute(
-                    "SELECT symbol, COUNT(*) as cnt, SUM(net_buy) as total_net "
-                    "FROM lhb_detail WHERE date >= date('now', '-60 days') "
-                    "GROUP BY symbol"
+                    "SELECT symbol, date, net_buy FROM lhb_detail "
+                    "ORDER BY symbol, date"
                 ).fetchall()
                 for r in _lhb_rows:
-                    lhb_map[r[0]] = {"count": r[1], "net_buy": r[2] or 0}
+                    lhb_map.setdefault(r[0], []).append((r[1], r[2] or 0))
             logger.info(f"因子IC评估：加载龙虎榜 {len(lhb_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：龙虎榜加载失败：{e!r}")
@@ -859,12 +858,21 @@ def evaluate_factor_ic(
                         else:
                             row[k] = None
                     elif k in lhb_factors:
-                        _lhb = lhb_map.get(sym)
-                        if _lhb:
+                        # as-of 取近30天龙虎榜（杜绝未来函数：用截面前30天数据）
+                        _lhb_list = lhb_map.get(sym)
+                        if _lhb_list:
+                            import datetime as _dtmod
+                            try:
+                                _asof = _dtmod.datetime.strptime(dates[i], "%Y-%m-%d")
+                                _ws = (_asof - _dtmod.timedelta(days=30)).strftime("%Y-%m-%d")
+                                _recent = [(d, nb) for d, nb in _lhb_list
+                                           if _ws <= d <= dates[i]]
+                            except (ValueError, TypeError):
+                                _recent = []
                             if k == "lhb_count":
-                                row[k] = float(_lhb.get("count", 0))
+                                row[k] = float(len(_recent))
                             elif k == "lhb_netbuy":
-                                row[k] = float(_lhb.get("net_buy", 0))
+                                row[k] = float(sum(nb for _, nb in _recent))
                             else:
                                 row[k] = None
                         else:
