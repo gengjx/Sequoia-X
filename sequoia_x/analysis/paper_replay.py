@@ -25,11 +25,14 @@ import numpy as np
 import pandas as pd
 
 from sequoia_x.analysis.factor import compute_factors, cross_section_rank
+from sequoia_x.analysis.paper_trade import apply_trading_costs, MAX_HOLD_DAYS
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── 回放参数（对齐 paper_trade.py 实盘模拟盘参数）──
+# ── 回放参数：与实盘单一数据源对齐 ──
+# 成本/止损/仓位参数从实盘组件导入，消除两套定义导致的回测-实盘脱节。
+# paper_trade.MAX_HOLD_DAYS（超时强平天数）作为卖出参数单一源。
 HOLD_DAYS = 20             # 默认持有期（参数扫描最优：20天调仓）
 MAX_POSITION_PCT = 0.15     # 单票最大仓位15%
 MAX_TOTAL_PCT = 0.80        # 总仓位上限80%
@@ -37,7 +40,7 @@ TOP_N = 20                  # 每日选出的候选股票数
 STOP_LOSS_PCT = -12.0       # 止损线-12%（扫描最优：放宽避免假止损）
 TAKE_PROFIT_PCT = 30.0      # 止盈线+30%（扫描最优：让赢家跑更远）
 TRAILING_STOP_PCT = -10.0   # 移动止损（从最高点回落10%，放宽减少假止损）
-RTC = 0.00192               # 往返交易成本0.192%（印花税+佣金+滑点）
+# RTC 已废弃：成本改用 apply_trading_costs（与实盘完全一致，拆分佣金/印花税/滑点）
 SAMPLE_SYMBOLS = 500        # 采样股票数（全市场5183只太慢）
 MAX_HOLDINGS = 8            # 最大同时持仓数
 REBALANCE_INTERVAL = 20     # 每20个交易日重新选股调仓（扫描最优：降低交易频率）
@@ -204,10 +207,10 @@ class PaperReplayEngine:
                     reason = f"超时{days_held}天 pnl={pnl_pct:.1f}%"
 
                 if should_sell:
-                    amount = price * pos.shares
-                    cost = amount * RTC
-                    pnl = (price - pos.entry_price) * pos.shares - cost
-                    cash += amount - cost
+                    tc = apply_trading_costs("sell", price, pos.shares)
+                    pnl = (price - pos.entry_price) * pos.shares - (tc["amount"] - tc["net_cash"])
+                    cash += tc["net_cash"]
+                    amount = tc["amount"]
                     trades.append(ReplayTrade(
                         symbol=pos.symbol, side="sell", date=today,
                         price=price, shares=pos.shares, amount=amount,
@@ -239,7 +242,8 @@ class PaperReplayEngine:
                             if price > 0:
                                 amount = price * pos.shares
                                 pnl = (price - pos.entry_price) * pos.shares
-                                cash += amount * (1 - RTC)
+                                _tc = apply_trading_costs("sell", price, pos.shares)
+                                cash += _tc["net_cash"]
                                 trades.append(ReplayTrade(
                                     symbol=pos.symbol, side="sell", date=today,
                                     price=price, shares=pos.shares, amount=amount,
@@ -249,9 +253,11 @@ class PaperReplayEngine:
                                 ))
                         positions = []
                 else:
-                    # 计算因子截面 → 选股
+                    # 计算因子截面 → 选股（与实盘统一，注入 as-of ML 快照）
+                    ml_asof = self._load_ml_scores_asof(today)
                     candidates = self._select_top(
-                        symbol_groups, today, state_weights, finance_map, cutoff_map, st_set
+                        symbol_groups, today, state_weights, finance_map, cutoff_map, st_set,
+                        ml_scores_asof=ml_asof,
                     )
 
                     # 持仓不重复买
@@ -285,21 +291,22 @@ class PaperReplayEngine:
                         shares = int(target_amount / price / 100) * 100  # 整手
                         if shares <= 0:
                             continue
-                        cost = price * shares * RTC
-                        total_cost = price * shares + cost
+                        tc = apply_trading_costs("buy", price, shares)
+                        total_cost = tc["net_cash"]
                         if total_cost > cash:
                             continue
 
                         cash -= total_cost
+                        _entry = tc["fill_price"]
                         # ATR动态止损：根据股票自身波动率计算（替代固定-12%）
                         stop = self._calc_atr_stop(symbol_groups, sym, today, price)
                         positions.append(ReplayPosition(
-                            symbol=sym, entry_date=today, entry_price=price,
-                            shares=shares, highest_price=price, stop_loss=stop,
+                            symbol=sym, entry_date=today, entry_price=_entry,
+                            shares=shares, highest_price=_entry, stop_loss=stop,
                         ))
                         trades.append(ReplayTrade(
                             symbol=sym, side="buy", date=today,
-                            price=price, shares=shares, amount=price*shares,
+                            price=_entry, shares=shares, amount=tc["amount"],
                             reason=f"多因子选股（{market_state}）",
                         ))
 
@@ -339,7 +346,11 @@ class PaperReplayEngine:
             })
 
         # ── Step 4: 计算绩效 ──
-        metrics = self._calc_metrics(nav_curve, benchmark_curve, trades, initial_capital)
+        ml_ic_series = self._compute_ml_ic_series(nav_curve, trades)
+        metrics = self._calc_metrics(
+            nav_curve, benchmark_curve, trades, initial_capital,
+            ml_ic_series=ml_ic_series,
+        )
 
         return {
             "nav_curve": nav_curve,
@@ -367,12 +378,70 @@ class PaperReplayEngine:
     def _select_top(
         self, symbol_groups: dict, today: str,
         state_weights: dict, finance_map: dict, cutoff_map: dict, st_set: set,
+        ml_scores_asof: dict | None = None,
     ) -> list[str]:
-        """多因子选股：计算截面因子 → 趋势确认过滤 → 三态IC加权 → Top N。
+        """多因子选股（与实盘统一）：复用 MultiFactorStrategy.run()。
 
-        核心改进（vs 纯IC加权选股）：
-          纯反转因子选出"跌多了的股票"→ 77%继续跌触发止损。
-          加入趋势确认过滤：只在趋势企稳的股票中应用因子选股。
+        关键改进：注入截至 today 的截断 K 线到 _shared_daily，
+        使 multi_factor.run() 计算的因子/趋势/市场状态全部基于"当时"数据，
+        杜绝前视。ML 因子通过 ml_scores_asof（as-of 快照）注入。
+
+        Args:
+            ml_scores_asof: {symbol: ml_score}，来自 ≤ today 的 ml_scores 快照。
+                            None 时跳过 ML 因子（回退纯因子加权，与旧行为等价）。
+        """
+        try:
+            from sequoia_x.strategy.multi_factor import MultiFactorStrategy
+            from sequoia_x.data.engine import DataEngine
+            from sequoia_x.core.config import Settings
+        except Exception as e:
+            logger.warning(f"multi_factor 不可用，回退旧选股：{e!r}")
+            return self._select_top_legacy(
+                symbol_groups, today, state_weights, finance_map, cutoff_map, st_set,
+            )
+
+        # 构建截至 today 的截断 K 线池（杜绝前视）
+        shared_daily: dict[str, pd.DataFrame] = {}
+        for sym, g in symbol_groups.items():
+            if sym in st_set:
+                continue
+            g_cut = g[g["date"] <= today]
+            if len(g_cut) < 60:
+                continue
+            co = cutoff_map.get(sym)
+            if co:
+                g_cut = g_cut[g_cut["date"] >= co]
+            if len(g_cut) >= 60:
+                shared_daily[sym] = g_cut.reset_index(drop=True)
+
+        if len(shared_daily) < 30:
+            return []
+
+        try:
+            settings = Settings()
+            engine = DataEngine(settings)
+            engine.db_path = self.db_path  # 复用回测 DB
+            strat = MultiFactorStrategy(engine, settings)
+            # 注入截断数据 → multi_factor 用 as-of 数据算因子
+            strat.set_shared_daily(shared_daily)
+            # 注入 as-of ML 快照（若有）
+            if ml_scores_asof:
+                strat._ml_scores_asof = ml_scores_asof
+            selected = strat.run()
+            return selected[:TOP_N]
+        except Exception as e:
+            logger.warning(f"multi_factor.run 失败，回退旧选股：{e!r}")
+            return self._select_top_legacy(
+                symbol_groups, today, state_weights, finance_map, cutoff_map, st_set,
+            )
+
+    def _select_top_legacy(
+        self, symbol_groups: dict, today: str,
+        state_weights: dict, finance_map: dict, cutoff_map: dict, st_set: set,
+    ) -> list[str]:
+        """旧选股逻辑（fallback）：独立 compute_factors + 趋势确认 + 三态加权。
+
+        当 MultiFactorStrategy 不可用时使用，保证回测不中断。
         """
         market_state = self._detect_market_state_at(symbol_groups, today)
         active_weights = state_weights.get(market_state) or state_weights.get("neutral") or state_weights.get("bear") or state_weights.get("bull") or {}
@@ -381,7 +450,6 @@ class PaperReplayEngine:
             return []
 
         rows = []
-        # ── 趋势确认过滤数据 ──
         trend_info: dict[str, dict] = {}
         for sym, g in symbol_groups.items():
             if sym in st_set:
@@ -394,85 +462,56 @@ class PaperReplayEngine:
                 g_cut = g_cut[g_cut["date"] >= co]
             if len(g_cut) < 60:
                 continue
-
             close = g_cut["close"]
             if len(close) < 60:
                 continue
-
             try:
                 factors = compute_factors(g_cut, finance=finance_map.get(sym))
                 if not factors:
                     continue
                 factors["symbol"] = sym
                 rows.append(factors)
-
-                # 趋势确认指标
                 ma20 = close.iloc[-20:].mean()
                 ma60 = close.iloc[-60:].mean()
                 ret_20d = close.iloc[-1] / close.iloc[-21] - 1 if len(close) >= 21 else 0
                 ret_5d = close.iloc[-1] / close.iloc[-6] - 1 if len(close) >= 6 else 0
-
                 trend_info[sym] = {
-                    "above_ma20": close.iloc[-1] > ma20,
-                    "above_ma60": close.iloc[-1] > ma60,
-                    "ma20_above_ma60": ma20 > ma60,  # 中期上升趋势
-                    "ret_20d": ret_20d,
-                    "ret_5d": ret_5d,
-                    # 相对强度：5日反弹力度（反转因子选出的票需要确认企稳）
-                    "stabilized": ret_5d > -0.03,  # 5日跌幅<3%视为企稳
+                    "above_ma20": close.iloc[-1] > ma20, "above_ma60": close.iloc[-1] > ma60,
+                    "ma20_above_ma60": ma20 > ma60, "ret_20d": ret_20d, "ret_5d": ret_5d,
+                    "stabilized": ret_5d > -0.03,
                 }
             except Exception:
                 continue
-
         if len(rows) < 30:
             return []
-
         df_factors = pd.DataFrame(rows).set_index("symbol")
-
-        # ── 趋势确认过滤：3层渐进式 ──
-        # Layer 1: 价格在MA60之上（中期不破位）
-        confirmed = {sym for sym, t in trend_info.items()
-                     if t["above_ma60"] and t["stabilized"]}
+        confirmed = {sym for sym, t in trend_info.items() if t["above_ma60"] and t["stabilized"]}
         if len(confirmed) < 20:
-            # 候选不足，放宽到MA20之上
-            confirmed = {sym for sym, t in trend_info.items()
-                         if t["above_ma20"] and t["stabilized"]}
+            confirmed = {sym for sym, t in trend_info.items() if t["above_ma20"] and t["stabilized"]}
         if len(confirmed) < 20:
-            # 仍然不足，去掉stabilized条件
             confirmed = {sym for sym, t in trend_info.items() if t["above_ma20"]}
-
         df_factors = df_factors[df_factors.index.isin(confirmed)]
         if len(df_factors) < 15:
             return []
-
         valid_factors = [f for f in active_weights if f in df_factors.columns]
         if not valid_factors:
             return []
-
         df_rank = cross_section_rank(df_factors[valid_factors])
         total_w = sum(abs(active_weights[f]) for f in valid_factors)
         if total_w == 0:
             return []
-
         df_rank["composite"] = sum(
             df_rank[f].fillna(0) * active_weights[f] for f in valid_factors
         ) / total_w
-
-        # ── 动量修正加分：趋势确认股中，短期反弹力度强的优先 ──
-        # 在趋势向上的股票中，反转因子选出回调到位的，加分给已确认反弹的
         for sym in df_rank.index:
             t = trend_info.get(sym, {})
-            ret5 = t.get("ret_5d", 0)
-            ret20 = t.get("ret_20d", 0)
-            # 5日正收益+20日不暴跌 = 确认企稳反弹
+            ret5, ret20 = t.get("ret_5d", 0), t.get("ret_20d", 0)
             if ret5 > 0 and ret20 > -0.05:
                 df_rank.loc[sym, "composite"] += 0.08
             elif ret5 > 0:
                 df_rank.loc[sym, "composite"] += 0.04
-            # 20日强势股额外加分（趋势跟随）
             if ret20 > 0.05:
                 df_rank.loc[sym, "composite"] += 0.03
-
         top = df_rank.nlargest(TOP_N, "composite")
         return top.index.tolist()
 
@@ -560,8 +599,69 @@ class PaperReplayEngine:
                 rets.append(float(r))
         return float(np.median(rets)) if len(rets) >= 30 else 0.0
 
+    def _compute_ml_ic_series(self, nav_curve: list, trades: list) -> list[float]:
+        """计算回测期间 ML 因子的月度前向 IC（样本外验证）。
+
+        对每个有 ML 快照的月份，取该月买入交易的 ml_score 与实际持有收益的
+        Spearman 秩相关。IC>0 说明 ML 预测方向正确。
+        无 ML 快照时返回空列表。
+        """
+        snaps = getattr(self, "_ml_snapshots_cache", None)
+        if not snaps:
+            snaps = self._load_ml_snapshots()
+            self._ml_snapshots_cache = snaps
+        if not snaps:
+            return []
+
+        # 按月汇总买入交易的 ML score vs 收益
+        # buy_trades: {month: [{ml_score, fwd_return}]}
+        buy_by_month: dict[str, list[tuple[float, float]]] = {}
+        snap_dates = sorted(snaps.keys())
+        for t in trades:
+            side = t.side if hasattr(t, "side") else t.get("side")
+            if side != "buy":
+                continue
+            d = t.date if hasattr(t, "date") else t.get("date", "")
+            month = d[:7]
+            sym = t.symbol if hasattr(t, "symbol") else t.get("symbol")
+            # 取 ≤ 买入日的最新快照
+            valid = [sd for sd in snap_dates if sd <= d]
+            if not valid:
+                continue
+            latest_snap = max(valid)
+            ml = snaps.get(latest_snap, {}).get(sym)
+            if ml is None:
+                continue
+            # 找对应卖出交易算收益
+            def _sell_sym(s):
+                _side = s.side if hasattr(s, "side") else s.get("side")
+                _sym = s.symbol if hasattr(s, "symbol") else s.get("symbol")
+                _date = s.date if hasattr(s, "date") else s.get("date", "")
+                return _side == "sell" and _sym == sym and _date > d
+            sell = next((s for s in trades if _sell_sym(s)), None)
+            if sell is None:
+                continue
+            pnl_pct = sell.pnl_pct if hasattr(sell, "pnl_pct") else sell.get("pnl_pct", 0)
+            buy_by_month.setdefault(month, []).append((float(ml), float(pnl_pct)))
+
+        ic_list: list[float] = []
+        for month, pairs in buy_by_month.items():
+            if len(pairs) < 10:
+                continue
+            scores = np.array([p[0] for p in pairs])
+            rets = np.array([p[1] for p in pairs])
+            try:
+                from sequoia_x.analysis.ml_factor import MLFactorEngine
+                ic = MLFactorEngine._rank_corr(scores, rets) if scores.std() > 0 and rets.std() > 0 else 0.0
+            except Exception:
+                ic = 0.0
+            if ic == ic:
+                ic_list.append(ic)
+        return ic_list
+
     def _calc_metrics(
         self, nav_curve: list, benchmark: list, trades: list, initial: float,
+        ml_ic_series: list | None = None,
     ) -> dict:
         if len(nav_curve) < 2:
             return {}
@@ -632,6 +732,13 @@ class PaperReplayEngine:
             "benchmark_total": round((bench_final - 1) * 100, 2),
             "alpha": round(annual - bench_annual, 2),
             "monthly_win_rate": round(month_win, 1),
+            # ML walk-forward IC（样本外验证）：回测期间 ML 快照的月度前向 IC
+            "ml_ic_mean": round(float(np.mean(ml_ic_series)), 4) if ml_ic_series else 0.0,
+            "ml_icir": round(
+                float(np.mean(ml_ic_series) / np.std(ml_ic_series)), 3
+            ) if ml_ic_series and np.std(ml_ic_series) > 0 else 0.0,
+            "ml_ic_months": len(ml_ic_series) if ml_ic_series else 0,
+            "ml_ic_positive": sum(1 for x in ml_ic_series if x > 0) if ml_ic_series else 0,
         }
 
     # ── 数据加载 ──
@@ -690,6 +797,41 @@ class PaperReplayEngine:
             except Exception:
                 pass
         return result
+
+    def _load_ml_snapshots(self) -> dict[str, dict[str, float]]:
+        """加载所有 ml_scores 快照，按 run_date 分组。
+
+        返回 {run_date: {symbol: ml_score}}，供回测按调仓日取 as-of 快照。
+        """
+        snapshots: dict[str, dict[str, float]] = {}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT run_date, symbol, ml_score FROM ml_scores "
+                    "WHERE ml_score IS NOT NULL ORDER BY run_date, symbol"
+                ).fetchall()
+            for run_date, symbol, score in rows:
+                snapshots.setdefault(run_date, {})[symbol] = float(score)
+        except Exception:
+            pass  # 表不存在或为空
+        return snapshots
+
+    def _load_ml_scores_asof(self, today: str) -> dict[str, float] | None:
+        """取 ≤ today 的最新 ML 快照（严禁未来函数）。
+
+        无快照时返回 None（_select_top 回退为纯因子加权）。
+        """
+        if not hasattr(self, "_ml_snapshots_cache"):
+            self._ml_snapshots_cache = self._load_ml_snapshots()
+        snaps = self._ml_snapshots_cache
+        if not snaps:
+            return None
+        # 取 ≤ today 的最新 run_date
+        valid_dates = [d for d in snaps if d <= today]
+        if not valid_dates:
+            return None
+        latest = max(valid_dates)
+        return snaps.get(latest)
 
     @staticmethod
     def _trade_to_dict(t: ReplayTrade) -> dict:
@@ -786,8 +928,10 @@ class PaperReplayEngine:
             daily_market_state[today] = market_state
             daily_median_20d[today] = self._get_market_median_return(symbol_groups, today, 20)
 
+            ml_asof = self._load_ml_scores_asof(today)
             candidates = self._select_top(
-                symbol_groups, today, state_weights, finance_map, cutoff_map, st_set
+                symbol_groups, today, state_weights, finance_map, cutoff_map, st_set,
+                ml_scores_asof=ml_asof,
             )
             if candidates:
                 daily_selections[today] = candidates
@@ -908,10 +1052,9 @@ class PaperReplayEngine:
                     reason = f"超时{pnl_pct:.1f}%"
 
                 if should_sell:
-                    amount = price * pos.shares
-                    cost = amount * RTC
-                    pnl = (price - pos.entry_price) * pos.shares - cost
-                    cash += amount - cost
+                    tc = apply_trading_costs("sell", price, pos.shares)
+                    pnl = (price - pos.entry_price) * pos.shares - (tc["amount"] - tc["net_cash"])
+                    cash += tc["net_cash"]
                     trades_count += 1
                     sell_trades.append({"pnl": pnl, "pnl_pct": pnl_pct, "hold_days": days_held})
                 else:
@@ -948,11 +1091,13 @@ class PaperReplayEngine:
                         shares = int(target / price / 100) * 100
                         if shares <= 0:
                             continue
-                        total_cost = price * shares * (1 + RTC)
+                        tc = apply_trading_costs("buy", price, shares)
+                        total_cost = tc["net_cash"]
                         if total_cost > cash:
                             continue
                         cash -= total_cost
-                        positions.append(Pos(sym, today, day_idx, price, shares, price))
+                        _fp = tc["fill_price"]
+                        positions.append(Pos(sym, today, day_idx, _fp, shares, _fp))
 
             # 净值
             mv = sum(prices.get(p.symbol, p.entry_price) * p.shares for p in positions)

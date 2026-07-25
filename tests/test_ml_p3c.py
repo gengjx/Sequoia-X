@@ -229,6 +229,7 @@ class TestMultiFactorReadSnapshot:
         from sequoia_x.strategy.multi_factor import MultiFactorStrategy
         strategy = MultiFactorStrategy.__new__(MultiFactorStrategy)
         strategy.engine = mock_engine
+        strategy._ml_scores_asof = None
 
         scores = strategy._compute_ml_scores(["600519", "000001"])
         assert scores == {"600519": 0.5, "000001": -0.3}
@@ -247,5 +248,6 @@ class TestMultiFactorReadSnapshot:
         from sequoia_x.strategy.multi_factor import MultiFactorStrategy
         strategy = MultiFactorStrategy.__new__(MultiFactorStrategy)
         strategy.engine = mock_engine
+        strategy._ml_scores_asof = None
         scores = strategy._compute_ml_scores(["600519"])
         assert scores == {}

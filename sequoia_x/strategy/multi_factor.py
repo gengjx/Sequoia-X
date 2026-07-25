@@ -68,6 +68,8 @@ class MultiFactorStrategy(BaseStrategy):
             self._weights = self._load_db_weights()
         # 三态权重（市场状态自适应）
         self._state_weights: dict[str, dict[str, float]] = self._load_state_weights()
+        # 回测注入的 as-of ML 快照（{symbol: score}）；None=读最新 run_date 快照
+        self._ml_scores_asof: dict[str, float] | None = None
 
     def _load_db_weights(self) -> dict[str, float]:
         """从DB加载最新因子IC权重，DB空则用默认值兜底。
@@ -234,11 +236,17 @@ class MultiFactorStrategy(BaseStrategy):
         return selected
 
     def _compute_ml_scores(self, symbols: list[str]) -> dict[str, float]:
-        """读取 ml_scores 月度快照（不实时训练）。
+        """读取 ML 因子月度快照（不实时训练）。
 
-        ML 引擎在 monthly_sweep 中月度训练一次，写全市场预测快照到 ml_scores 表。
-        决策层只读当日快照，避免每次决策都重训模型。
+        优先级：回测注入的 as-of 快照（_ml_scores_asof）> DB 最新 run_date 快照。
+        回测注入确保"严禁未来函数"——回测日 D 的 ML 预测来自 ≤ D 的训练。
         """
+        # 回测 as-of 注入优先（杜绝未来函数）
+        if self._ml_scores_asof is not None:
+            scores = {s: float(v) for s, v in self._ml_scores_asof.items()
+                      if v is not None and v == v}
+            return scores
+
         import sqlite3
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
