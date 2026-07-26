@@ -42,9 +42,25 @@ _DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 }
 
 
+
+
+def _pit_asof(seq: list[tuple], as_of_date: str) -> dict | None:
+    """从已排序的 [(date, {fields}), ...] 取 ≤ as_of_date 的最新一条 fields。
+
+    回测 PIT as-of 查找：杜绝未来函数。复用 evaluate_factor_ic 验证过的模式。
+    """
+    if not seq:
+        return None
+    import bisect
+    dates_list = [d for d, _ in seq]
+    idx = bisect.bisect_right(dates_list, as_of_date) - 1
+    return seq[idx][1] if idx >= 0 else None
+
 @register_strategy("multi_factor")
 class MultiFactorStrategy(BaseStrategy):
     """多因子IC加权选股策略。
+
+    选股逻辑：
 
     选股逻辑：
     1. 全市场计算30因子截面值
@@ -70,6 +86,8 @@ class MultiFactorStrategy(BaseStrategy):
         self._state_weights: dict[str, dict[str, float]] = self._load_state_weights()
         # 回测注入的 as-of ML 快照（{symbol: score}）；None=读最新 run_date 快照
         self._ml_scores_asof: dict[str, float] | None = None
+        # 回测 PIT 快照历史（preload_snapshot_history 一次性加载）；None=实盘走最新值
+        self._snapshot_history: dict | None = None
 
     def _load_db_weights(self) -> dict[str, float]:
         """从DB加载最新因子IC权重，DB空则用默认值兜底。
@@ -110,35 +128,168 @@ class MultiFactorStrategy(BaseStrategy):
         logger.info(f"多因子使用全局权重（{len(self._weights)}个因子）")
         return self._weights
 
-    def run(self) -> list[str]:
-        """执行多因子选股，返回综合因子分Top N的股票代码。"""
+    def preload_snapshot_history(self) -> None:
+        """一次性加载全部快照因子的完整历史（回测 PIT 模式）。
+
+        复用 evaluate_factor_ic 验证过的 {symbol: [(date, {fields})]} 排序结构。
+        加载后 run(as_of_date=...) 走 as-of 截断路径；不调用则 run() 走实盘最新值。
+        """
+        import sqlite3
+        sh: dict[str, dict] = {}
+        db = self.engine.db_path
+        with sqlite3.connect(db) as conn:
+            # 财报（按 stat_date 排序）
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
+                    "yoy_ni, asset_turn, inv_turn, nr_turn FROM stock_finance ORDER BY symbol, stat_date"
+                ).fetchall()
+                sh["finance"] = {}
+                for r in rows:
+                    sh["finance"].setdefault(r[0], []).append((r[1], {
+                        "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
+                        "yoy_eps": r[5], "yoy_pni": r[6], "yoy_ni": r[7],
+                        "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
+                    }))
+            except Exception as e:
+                sh["finance"] = {}
+            # 资金流向
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, date, main_net, main_pct, super_net, big_net "
+                    "FROM fund_flow ORDER BY symbol, date"
+                ).fetchall()
+                sh["fund_flow"] = {}
+                for r in rows:
+                    sh["fund_flow"].setdefault(r[0], []).append((r[1], {
+                        "main_net": r[2], "main_pct": r[3], "super_net": r[4], "big_net": r[5],
+                    }))
+            except Exception:
+                sh["fund_flow"] = {}
+            # 龙虎榜
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, date, net_buy FROM lhb_detail ORDER BY symbol, date"
+                ).fetchall()
+                sh["lhb"] = {}
+                for r in rows:
+                    sh["lhb"].setdefault(r[0], []).append((r[1], float(r[2]) if r[2] else 0.0))
+            except Exception:
+                sh["lhb"] = {}
+            # 北向持股（全序列，按 date 排序）
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, date, hold_pct FROM north_hold "
+                    "WHERE hold_pct IS NOT NULL ORDER BY symbol, date"
+                ).fetchall()
+                sh["north"] = {}
+                tmp: dict[str, list] = {}
+                for r in rows:
+                    tmp.setdefault(r[0], []).append({"date": str(r[1]), "hold_pct": float(r[2])})
+                for sym, recs in tmp.items():
+                    sh["north"][sym] = recs  # list[dict]，as-of 时取 <=today 前缀
+            except Exception:
+                sh["north"] = {}
+            # 融资融券
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, date, rzye, rzbuy, rqlts, rqye "
+                    "FROM margin_detail ORDER BY symbol, date"
+                ).fetchall()
+                sh["margin"] = {}
+                for r in rows:
+                    sh["margin"].setdefault(r[0], []).append((r[1], {
+                        "rzye": r[2], "rzbuy": r[3], "rqlts": r[4], "rqye": r[5],
+                    }))
+            except Exception:
+                sh["margin"] = {}
+            # 基金持仓
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, report_date, fund_count, change_pct "
+                    "FROM fund_hold ORDER BY symbol, report_date"
+                ).fetchall()
+                sh["fund_hold"] = {}
+                for r in rows:
+                    sh["fund_hold"].setdefault(r[0], []).append((r[1], {
+                        "fund_count": r[2], "change_pct": r[3],
+                    }))
+            except Exception:
+                sh["fund_hold"] = {}
+            # 沪深300指数收益率（全序列）
+            try:
+                rows = conn.execute(
+                    "SELECT date, close FROM index_daily WHERE symbol='000300' ORDER BY date"
+                ).fetchall()
+                if len(rows) >= 60:
+                    _df = pd.DataFrame(rows, columns=["date", "close"])
+                    _df["date"] = _df["date"].astype(str)
+                    _ret = _df["close"].pct_change()
+                    sh["index_ret"] = pd.Series(_ret.values, index=_df["date"].values).dropna()
+                else:
+                    sh["index_ret"] = None
+            except Exception:
+                sh["index_ret"] = None
+            # 宏观（M2/社融，按 month 排序）
+            try:
+                sh["macro_m2"] = [(r[0], r[1]) for r in conn.execute(
+                    "SELECT month, m2_yoy FROM macro_money ORDER BY month"
+                ) if r[1] is not None]
+                sh["macro_sf"] = [(r[0], r[1]) for r in conn.execute(
+                    "SELECT month, sf_total FROM macro_sf ORDER BY month"
+                ) if r[1] is not None]
+            except Exception:
+                sh["macro_m2"] = []
+                sh["macro_sf"] = []
+        self._snapshot_history = sh
+        logger.info(
+            f"快照历史预加载完成：财报{len(sh.get('finance',{}))} 资金流{len(sh.get('fund_flow',{}))} "
+            f"龙虎榜{len(sh.get('lhb',{}))} 北向{len(sh.get('north',{}))} 融资融券{len(sh.get('margin',{}))} "
+            f"基金持仓{len(sh.get('fund_hold',{}))}"
+        )
+
+    def run(self, as_of_date: str | None = None) -> list[str]:
+        """执行多因子选股，返回综合因子分Top N的股票代码。
+
+        Args:
+            as_of_date: PIT 截止日期（YYYY-MM-DD）。None=实盘走最新快照；
+                        非 None（回测）时用 preload_snapshot_history 预加载的
+                        历史按 as-of 截断，杜绝未来函数。
+        """
         symbols = list(self._shared_daily.keys()) if self._shared_daily else self.engine.get_local_symbols()
 
         # ── 选股池硬过滤：ST/退市预警 ──
         symbols = self._filter_universe(symbols)
 
         # P1: 市场状态自适应——根据当前市场状态选择对应权重
-        market_state = self._detect_market_state()
+        market_state = self._detect_market_state(as_of_date=as_of_date)
         active_weights = self.get_weights_for_state(market_state)
         # ML 合成因子是市场状态无关的全局信号，三态权重表可能不含，
         # 从全局权重补充注入（达标时非零、未达标为0则不注入）
         if self._weights.get("ml_score"):
             active_weights["ml_score"] = self._weights["ml_score"]
 
-        # 预加载财报数据（批量查一次，避免逐只查库）
-        finance_map = self._load_finance_map(symbols)
-        # 预加载资金流向（最近一天）
-        fund_flow_map = self._load_fund_flow_map()
-        # 预加载龙虎榜（近30天上榜次数+净买入额）
-        lhb_map = self._load_lhb_map()
-        # 预加载北向持股历史（用于北向因子）
-        north_map = self._load_north_map()
-        # 预加载融资融券（杠杆资金方向，最新日）
-        margin_map = self._load_margin_map()
-        # 预加载基金持仓（公募重仓，最新季度）
-        fund_hold_map = self._load_fund_hold_map()
-        # 预加载沪深300指数收益率（用于 beta_300 / rel_strength_300）
-        index_ret = self._load_index_ret()
+        # ── 快照因子加载：回测走 as-of 截断（杜绝未来函数），实盘走最新值 ──
+        if as_of_date and self._snapshot_history:
+            sh = self._snapshot_history
+            finance_map = self._build_asof_finance(symbols, as_of_date)
+            fund_flow_map = self._build_asof_fund_flow(as_of_date)
+            lhb_map = self._build_asof_lhb(as_of_date)
+            north_map = self._build_asof_north(as_of_date)
+            margin_map = self._build_asof_margin(as_of_date)
+            fund_hold_map = self._build_asof_fund_hold(as_of_date)
+            index_ret = sh.get("index_ret")
+            if index_ret is not None:
+                index_ret = index_ret[index_ret.index <= as_of_date]
+        else:
+            # 实盘路径：读最新快照（零改动）
+            finance_map = self._load_finance_map(symbols)
+            fund_flow_map = self._load_fund_flow_map()
+            lhb_map = self._load_lhb_map()
+            north_map = self._load_north_map()
+            margin_map = self._load_margin_map()
+            fund_hold_map = self._load_fund_hold_map()
+            index_ret = self._load_index_ret()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
@@ -348,6 +499,78 @@ class MultiFactorStrategy(BaseStrategy):
             logger.debug(f"沪深300指数加载失败: {e}")
             return None
 
+
+    # ───────────────────────────────────────────────────────────────
+    # PIT as-of 快照构建（回测专用，从 _snapshot_history 截断）
+    # ───────────────────────────────────────────────────────────────
+
+    def _build_asof_finance(self, symbols: list[str], as_of_date: str) -> dict[str, dict]:
+        """从预加载财报历史按 as-of 截断，返回 {symbol: {roe,...}}。"""
+        seq_map = self._snapshot_history.get("finance", {})
+        result: dict[str, dict] = {}
+        for sym in symbols:
+            fields = _pit_asof(seq_map.get(sym, []), as_of_date)
+            if fields:
+                result[sym] = fields
+        return result
+
+    def _build_asof_fund_flow(self, as_of_date: str) -> dict[str, dict]:
+        """资金流向 as-of：取 ≤ today 最新一条。"""
+        seq_map = self._snapshot_history.get("fund_flow", {})
+        result: dict[str, dict] = {}
+        for sym, seq in seq_map.items():
+            fields = _pit_asof(seq, as_of_date)
+            if fields:
+                result[sym] = fields
+        return result
+
+    def _build_asof_lhb(self, as_of_date: str) -> dict[str, dict]:
+        """龙虎榜 as-of：(today-30, today] 窗口的 count + net_buy 之和。"""
+        import datetime as _dt
+        seq_map = self._snapshot_history.get("lhb", {})
+        result: dict[str, dict] = {}
+        try:
+            ref = _dt.datetime.strptime(as_of_date, "%Y-%m-%d")
+            ws = (ref - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            ws = "1900-01-01"
+        for sym, seq in seq_map.items():
+            window = [(d, nb) for d, nb in seq if ws <= d <= as_of_date]
+            if window:
+                result[sym] = {"count": float(len(window)),
+                               "net_buy": float(sum(nb for _, nb in window))}
+        return result
+
+    def _build_asof_north(self, as_of_date: str) -> dict[str, "pd.DataFrame"]:
+        """北向持股 as-of：取 ≤ today 全序列（nb_inflow 需 21 行历史）。"""
+        raw = self._snapshot_history.get("north", {})
+        result: dict[str, pd.DataFrame] = {}
+        for sym, recs in raw.items():
+            filt = [r for r in recs if r["date"] <= as_of_date]
+            if filt:
+                result[sym] = pd.DataFrame(filt)
+        return result
+
+    def _build_asof_margin(self, as_of_date: str) -> dict[str, dict]:
+        """融资融券 as-of：取 ≤ today 最新一条。"""
+        seq_map = self._snapshot_history.get("margin", {})
+        result: dict[str, dict] = {}
+        for sym, seq in seq_map.items():
+            fields = _pit_asof(seq, as_of_date)
+            if fields:
+                result[sym] = fields
+        return result
+
+    def _build_asof_fund_hold(self, as_of_date: str) -> dict[str, dict]:
+        """基金持仓 as-of：取 report_date ≤ today 最新季度。"""
+        seq_map = self._snapshot_history.get("fund_hold", {})
+        result: dict[str, dict] = {}
+        for sym, seq in seq_map.items():
+            fields = _pit_asof(seq, as_of_date)
+            if fields:
+                result[sym] = fields
+        return result
+
     def _rebalance_weights(self, weights: dict[str, float]) -> dict[str, float]:
         """权重再平衡：单因子上限 + 大类约束。
 
@@ -404,7 +627,7 @@ class MultiFactorStrategy(BaseStrategy):
         """返回当前因子权重（供前端展示）。"""
         return dict(self._weights)
 
-    def _detect_market_state(self) -> str:
+    def _detect_market_state(self, as_of_date: str | None = None) -> str:
         """检测当前市场状态（bull/neutral/bear）。
 
         用全市场近20日等权收益中位数判断：
@@ -429,7 +652,7 @@ class MultiFactorStrategy(BaseStrategy):
                 return "neutral"
             median_ret = float(np.median(rets))
             # 宏观流动性偏置（放宽/收紧状态门槛）
-            macro_bias = self._load_macro_bias()
+            macro_bias = self._load_macro_bias(as_of_date=as_of_date)
             bull_thr = 0.02 if macro_bias == "bull" else 0.03
             bear_thr = -0.02 if macro_bias == "bear" else -0.03
             if median_ret > bull_thr:
@@ -444,29 +667,53 @@ class MultiFactorStrategy(BaseStrategy):
             logger.warning(f"市场状态检测失败，默认neutral：{e!r}")
             return "neutral"
 
-    def _load_macro_bias(self) -> str | None:
-        """加载宏观流动性偏置（M2/社融），返回 'bull'/'bear'/None。"""
+    def _load_macro_bias(self, as_of_date: str | None = None) -> str | None:
+        """加载宏观流动性偏置（M2/社融），返回 'bull'/'bear'/None。
+
+        as_of_date 非 None（回测）时从预加载历史按 PIT 取 ≤ as_of_date 最新值。
+        """
+        bias = None
         try:
-            import sqlite3
-            with sqlite3.connect(self.engine.db_path) as conn:
-                m2_row = conn.execute(
-                    "SELECT m2_yoy FROM macro_money ORDER BY month DESC LIMIT 1"
-                ).fetchone()
-                sf_rows = conn.execute(
-                    "SELECT sf_total FROM macro_sf ORDER BY month DESC LIMIT 2"
-                ).fetchall()
-            bias = None
-            m2_yoy = m2_row[0] if m2_row else None
+            if as_of_date and self._snapshot_history:
+                sh = self._snapshot_history
+                m2_seq = sh.get("macro_m2", [])
+                sf_seq = sh.get("macro_sf", [])
+                # M2: 取 month <= as_of_date[:7] 最新
+                m2_month = as_of_date[:7]
+                m2_valid = [(m, v) for m, v in m2_seq if m <= m2_month]
+                m2_yoy = m2_valid[-1][1] if m2_valid else None
+                # 社融：取最近两个月 <= as_of_date
+                sf_month = as_of_date[:7]
+                sf_valid = [(m, v) for m, v in sf_seq if m <= sf_month]
+                sf_rows = sf_valid[-2:] if len(sf_valid) >= 2 else sf_valid
+            else:
+                import sqlite3
+                with sqlite3.connect(self.engine.db_path) as conn:
+                    m2_row = conn.execute(
+                        "SELECT m2_yoy FROM macro_money ORDER BY month DESC LIMIT 1"
+                    ).fetchone()
+                    sf_rows = conn.execute(
+                        "SELECT sf_total FROM macro_sf ORDER BY month DESC LIMIT 2"
+                    ).fetchall()
+                    sf_rows = [(None, r[0]) for r in sf_rows]  # 对齐结构
+                m2_yoy = m2_row[0] if m2_row else None
             if m2_yoy is not None and m2_yoy > 9.0:
                 bias = "bull"
             elif m2_yoy is not None and m2_yoy < 7.0:
                 bias = "bear"
             # 社融环比：最近月 vs 上月，放量→bull、收缩→bear
-            if len(sf_rows) >= 2 and sf_rows[0][0] is not None and sf_rows[1][0] is not None:
-                if sf_rows[0][0] > sf_rows[1][0] * 1.2:
-                    bias = bias or "bull"
-                elif sf_rows[0][0] < sf_rows[1][0] * 0.8:
-                    bias = bias or "bear"
+            # sf_vals = [最新月, 上月]（无论哪个分支，最新在前）
+            if len(sf_rows) >= 2:
+                # as-of 路径是升序（最新在 -1），DB 路径是降序（最新在 0）
+                if as_of_date and self._snapshot_history:
+                    cur_sf, prev_sf = sf_rows[-1][1], sf_rows[-2][1]
+                else:
+                    cur_sf, prev_sf = sf_rows[0][1], sf_rows[1][1]
+                if cur_sf is not None and prev_sf is not None and prev_sf != 0:
+                    if cur_sf > prev_sf * 1.2:
+                        bias = bias or "bull"
+                    elif cur_sf < prev_sf * 0.8:
+                        bias = bias or "bear"
             return bias
         except Exception as e:
             logger.debug(f"宏观偏置加载失败: {e}")

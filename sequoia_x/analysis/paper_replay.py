@@ -75,6 +75,8 @@ class PaperReplayEngine:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        self._replay_strat = None  # 复用的 MultiFactorStrategy 实例（含预加载快照历史）
+        self._index_ret_cache: pd.Series | None = None  # 沪深300日收益率（基准）
 
     def replay(
         self,
@@ -110,6 +112,8 @@ class PaperReplayEngine:
         finance_map = self._load_finance_map()
         state_weights = self._load_state_weights()
         st_set = self._load_st_set()
+        # 真实沪深300基准（替代采样股等权）
+        idx_ret_series = self._load_index_returns()
 
         all_dates = sorted(all_daily["date"].unique())
         if not start_date:
@@ -332,17 +336,14 @@ class PaperReplayEngine:
             if dd < max_dd:
                 max_dd = dd
 
-            # 基准（等权全市场）
-            bench_rets = []
-            for sym, g in symbol_groups.items():
-                gtd = g[g["date"] == today]
-                if len(gtd) > 0:
-                    bench_rets.append(gtd["pct_chg"].values[0] if gtd["pct_chg"].values[0] == gtd["pct_chg"].values[0] else 0)
-            bench_daily = float(np.mean(bench_rets)) if bench_rets else 0
+            # 基准：真实沪深300（不再用采样股等权——后者随 seed 变化使 alpha 无意义）
+            idx_daily = 0.0
+            if idx_ret_series is not None and today in idx_ret_series.index:
+                idx_daily = float(idx_ret_series[today])
             prev_bench = benchmark_curve[-1]["nav"] if benchmark_curve else 1.0
             benchmark_curve.append({
                 "date": today,
-                "nav": round(prev_bench * (1 + bench_daily / 100), 4),
+                "nav": round(prev_bench * (1 + idx_daily), 4),
             })
 
         # ── Step 4: 计算绩效 ──
@@ -374,6 +375,109 @@ class PaperReplayEngine:
                 "rebalance_interval": REBALANCE_INTERVAL,
             },
         }
+
+
+    def run_validation(
+        self,
+        start_date: str = "2022-01-01",
+        end_date: str = "",
+        seeds: tuple = (42, 0, 7),
+        initial_capital: float = 100000.0,
+        progress_callback=None,
+    ) -> dict:
+        """全市场多种子回测编排器（可信化验证）。
+
+        对每个 seed 跑全市场（sample_size=None）回测，聚合年化/夏普/回撤/alpha
+        的 mean ± std。跨 seed 标准差即"采样噪声"，配置间差异需大于此才可信。
+
+        Args:
+            seeds: 随机种子元组（全市场采样下种子影响极小，但保留多 seed 交叉验证）
+            initial_capital: 初始资金
+
+        Returns:
+            {
+                "per_seed": [{seed, metrics}, ...],
+                "summary": {annual_return_mean, annual_return_std, sharpe_mean, ...},
+                "benchmark_annual": float,  # 沪深300年化
+                "config": {...},
+            }
+        """
+        import numpy as np
+        per_seed: list[dict] = []
+        bench_annual = 0.0
+        for i, seed in enumerate(seeds):
+            if progress_callback:
+                progress_callback(i, len(seeds), f"validation seed {seed} ({i+1}/{len(seeds)})")
+            res = self.replay(
+                start_date=start_date, end_date=end_date,
+                initial_capital=initial_capital, sample_size=0,  # 0=不采样=全市场
+                seed=seed, progress_callback=None,
+            )
+            m = res["metrics"]
+            bench_annual = m.get("benchmark_annual", 0)
+            per_seed.append({"seed": seed, "metrics": m})
+
+        # 聚合
+        keys = ("annual_return", "max_drawdown", "sharpe", "calmar", "win_rate",
+                "total_return", "alpha")
+        summary: dict[str, float] = {}
+        for k in keys:
+            vals = [ps["metrics"].get(k, 0) for ps in per_seed]
+            summary[f"{k}_mean"] = round(float(np.mean(vals)), 2)
+            summary[f"{k}_std"] = round(float(np.std(vals)), 2)
+
+        return {
+            "per_seed": per_seed,
+            "summary": summary,
+            "benchmark_annual": round(bench_annual, 2),
+            "config": {
+                "start_date": start_date or per_seed[0]["metrics"].get("final_nav", "auto"),
+                "seeds": list(seeds),
+                "sample_size": "全市场",
+            },
+        }
+
+    def _get_replay_strategy(self):
+        """获取/复用回测用的 MultiFactorStrategy 实例。
+
+        首次调用时创建实例并预加载全部快照历史（PIT），后续调仓复用，
+        消除每次重建 strategy + 重载 DB 的开销。
+        """
+        if self._replay_strat is not None:
+            return self._replay_strat
+        from sequoia_x.strategy.multi_factor import MultiFactorStrategy
+        from sequoia_x.data.engine import DataEngine
+        from sequoia_x.core.config import Settings
+        settings = Settings()
+        engine = DataEngine(settings)
+        engine.db_path = self.db_path
+        strat = MultiFactorStrategy(engine, settings)
+        # 预加载快照历史（回测 PIT as-of 截断用）
+        strat.preload_snapshot_history()
+        self._replay_strat = strat
+        return strat
+
+    def _load_index_returns(self) -> "pd.Series | None":
+        """加载沪深300日收益率序列（作为真实基准）。"""
+        if self._index_ret_cache is not None:
+            return self._index_ret_cache
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT date, close FROM index_daily "
+                    "WHERE symbol='000300' ORDER BY date"
+                ).fetchall()
+            if len(rows) < 2:
+                return None
+            s = pd.DataFrame(rows, columns=["date", "close"])
+            s["date"] = s["date"].astype(str)
+            rets = s["close"].pct_change()
+            series = pd.Series(rets.values, index=s["date"].values).dropna()
+            self._index_ret_cache = series
+            return series
+        except Exception as e:
+            logger.warning(f"沪深300基准加载失败，回退采样股等权：{e!r}")
+            return None
 
     def _select_top(
         self, symbol_groups: dict, today: str,
@@ -418,16 +522,13 @@ class PaperReplayEngine:
             return []
 
         try:
-            settings = Settings()
-            engine = DataEngine(settings)
-            engine.db_path = self.db_path  # 复用回测 DB
-            strat = MultiFactorStrategy(engine, settings)
+            strat = self._get_replay_strategy()
             # 注入截断数据 → multi_factor 用 as-of 数据算因子
             strat.set_shared_daily(shared_daily)
             # 注入 as-of ML 快照（若有）
-            if ml_scores_asof:
-                strat._ml_scores_asof = ml_scores_asof
-            selected = strat.run()
+            strat._ml_scores_asof = ml_scores_asof
+            # PIT 模式：传 as_of_date 使快照因子按当时截断（杜绝未来函数）
+            selected = strat.run(as_of_date=today)
             return selected[:TOP_N]
         except Exception as e:
             logger.warning(f"multi_factor.run 失败，回退旧选股：{e!r}")
