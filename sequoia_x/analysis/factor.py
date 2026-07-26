@@ -132,6 +132,9 @@ FACTOR_META: dict[str, dict] = {
     "beta_300":        {"category": "Beta", "desc": "相对沪深300 Beta（低Beta防御溢价）", "reverse": True},
     "rel_strength_300":{"category": "Beta", "desc": "相对沪深300超额收益（20日相对强度）"},
     "block_discount":  {"category": "大宗交易", "desc": "近30天大宗交易加权折价率（折价=机构接货，正向）"},
+    "holder_change":   {"category": "筹码集中度", "desc": "股东户数环比变化（减少=筹码集中→看涨，负向）"},
+    "holder_count":    {"category": "筹码集中度", "desc": "股东户数（多=分散，负向）"},
+    "holder_avg_value":{"category": "筹码集中度", "desc": "户均持股市值（高=大户持仓，正向）"},
 }
 
 
@@ -141,6 +144,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
                    margin: dict | None = None,
                    fund_hold: dict | None = None,
                    block_data: dict | None = None,
+                   holder_data: dict | None = None,
                    index_ret: pd.Series | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
@@ -315,6 +319,15 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         factors["block_discount"] = float(block_data.get("discount", 0))
     else:
         factors["block_discount"] = np.nan
+
+    # ════════ 股东户数/筹码集中度(3) ════════
+    if holder_data:
+        factors["holder_change"] = _safe_float(holder_data.get("holder_change"))
+        factors["holder_count"] = _safe_float(holder_data.get("holder_num"))
+        factors["holder_avg_value"] = _safe_float(holder_data.get("avg_value"))
+    else:
+        for k in ["holder_change", "holder_count", "holder_avg_value"]:
+            factors[k] = np.nan
 
     # ════════ 质量(5) + 成长(1) + 营运效率(3) ════════
     if finance:
@@ -923,6 +936,25 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：大宗交易加载失败（表可能不存在）：{e!r}")
 
+    # 加载股东户数历史（筹码集中度，季频）
+    holder_factors = {"holder_change", "holder_count", "holder_avg_value"}
+    holder_map: dict[str, list[tuple]] = {}  # {symbol: [(end_date, {fields})], 排序}
+    if set(factor_set) & holder_factors:
+        import sqlite3 as _sq9
+        try:
+            with _sq9.connect(engine.db_path) as _conn9:
+                _hd_rows = _conn9.execute(
+                    "SELECT symbol, end_date, holder_num, holder_change, avg_value "
+                    "FROM holder_count ORDER BY symbol, end_date"
+                ).fetchall()
+            for r in _hd_rows:
+                holder_map.setdefault(r[0], []).append((r[1], {
+                    "holder_num": r[2], "holder_change": r[3], "avg_value": r[4],
+                }))
+            logger.info(f"因子IC评估：加载股东户数 {len(holder_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：股东户数加载失败（表可能不存在）：{e!r}")
+
     # 加载沪深300指数收益率序列（用于 beta_300 / rel_strength_300 的IC评估）
     index_ret_series = None
     if set(factor_set) & {"beta_300", "rel_strength_300"}:
@@ -982,9 +1014,10 @@ def evaluate_factor_ic(
             # 所有 point-in-time 因子（非时序，按月取截面值）需排除出 compute_factor_series
             margin_factors = {"margin_balance", "margin_netbuy", "short_ratio"}
             block_factors = {"block_discount"}
+            holder_factors = {"holder_change", "holder_count", "holder_avg_value"}
             _pit_factors = (quality_factors | valuation_factors | fund_flow_factors
                             | lhb_factors | north_factors | margin_factors | fund_hold_factors
-                            | block_factors)
+                            | block_factors | holder_factors)
             ts_factors = [f for f in factor_set if f not in _pit_factors]
             series = compute_factor_series(df, ts_factors, index_ret=index_ret_series)
             dates = df["date"].astype(str).values
@@ -1075,6 +1108,20 @@ def evaluate_factor_ic(
                                     row[k] = (cur_pct - old_pct) if old_pct is not None else None
                                 else:
                                     row[k] = None
+                            else:
+                                row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in holder_factors:
+                        # as-of 取截面前最新季度股东户数（季频，杜绝未来函数）
+                        hd = _pit_asof(holder_map.get(sym, []), dates[i])
+                        if hd:
+                            if k == "holder_change":
+                                row[k] = float(hd["holder_change"]) if hd["holder_change"] is not None else None
+                            elif k == "holder_count":
+                                row[k] = float(hd["holder_num"]) if hd["holder_num"] is not None else None
+                            elif k == "holder_avg_value":
+                                row[k] = float(hd["avg_value"]) if hd["avg_value"] is not None else None
                             else:
                                 row[k] = None
                         else:

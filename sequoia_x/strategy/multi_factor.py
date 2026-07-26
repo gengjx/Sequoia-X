@@ -233,6 +233,19 @@ class MultiFactorStrategy(BaseStrategy):
                     }))
             except Exception:
                 sh["block"] = {}
+            # 股东户数（季频，筹码集中度）
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, end_date, holder_num, holder_change, avg_value "
+                    "FROM holder_count ORDER BY symbol, end_date"
+                ).fetchall()
+                sh["holder"] = {}
+                for r in rows:
+                    sh["holder"].setdefault(r[0], []).append((r[1], {
+                        "holder_num": r[2], "holder_change": r[3], "avg_value": r[4],
+                    }))
+            except Exception:
+                sh["holder"] = {}
             # 沪深300指数收益率（全序列）
             try:
                 rows = conn.execute(
@@ -307,6 +320,7 @@ class MultiFactorStrategy(BaseStrategy):
             margin_map = self._build_asof_margin(as_of_date)
             fund_hold_map = self._build_asof_fund_hold(as_of_date)
             block_map = self._build_asof_block(as_of_date)
+            holder_map = self._build_asof_holder(as_of_date)
             index_ret = sh.get("index_ret")
             if index_ret is not None:
                 index_ret = index_ret[index_ret.index <= as_of_date]
@@ -319,6 +333,7 @@ class MultiFactorStrategy(BaseStrategy):
             margin_map = self._load_margin_map()
             fund_hold_map = self._load_fund_hold_map()
             block_map = self._load_block_map()
+            holder_map = self._load_holder_map()
             index_ret = self._load_index_ret()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
@@ -338,6 +353,7 @@ class MultiFactorStrategy(BaseStrategy):
                     margin=margin_map.get(sym),
                     fund_hold=fund_hold_map.get(sym),
                     block_data=block_map.get(sym),
+                    holder_data=holder_map.get(sym),
                     index_ret=index_ret,
                 )
                 factors["symbol"] = sym
@@ -586,6 +602,31 @@ class MultiFactorStrategy(BaseStrategy):
         """融资融券 as-of：取 ≤ today 最新一条。"""
         seq_map = self._snapshot_history.get("margin", {})
         result: dict[str, dict] = {}
+        for sym, seq in seq_map.items():
+            fields = _pit_asof(seq, as_of_date)
+            if fields:
+                result[sym] = fields
+        return result
+
+    def _load_holder_map(self) -> dict[str, dict]:
+        """加载最新季度股东户数（实盘）。返回 {symbol: {holder_num, holder_change, avg_value}}。"""
+        import sqlite3
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, holder_num, holder_change, avg_value FROM holder_count "
+                    "WHERE end_date=(SELECT MAX(end_date) FROM holder_count)"
+                ).fetchall()
+            return {r[0]: {"holder_num": r[1], "holder_change": r[2], "avg_value": r[3]}
+                    for r in rows}
+        except Exception as e:
+            logger.debug(f"股东户数加载失败: {e}")
+            return {}
+
+    def _build_asof_holder(self, as_of_date: str) -> dict[str, dict]:
+        """股东户数 as-of：取 ≤ today 最新季度快照（季频 PIT）。"""
+        seq_map = self._snapshot_history.get("holder", {})
+        result = {}
         for sym, seq in seq_map.items():
             fields = _pit_asof(seq, as_of_date)
             if fields:
