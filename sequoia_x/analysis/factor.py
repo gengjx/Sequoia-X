@@ -43,6 +43,12 @@ CROWDING_SAFE = 0.08          # HHI ≤ 此值不衰减（分散健康）
 CROWDING_MAX = 0.30           # HHI ≥ 此值衰减到下限（重度拥挤）
 CROWDING_FLOOR = 0.30         # 衰减下限（保留 30% 分散价值，不归零）
 
+# P10b: ML 因子近期 IC 稳定性门控——抑制衰退期噪声、保留强周期 alpha。
+# 仿 P6 拥挤度衰减的连续软门控，用 ML 近期样本外 IC 均值做稳定性度量。
+ML_IC_FULL = 0.06            # 近期均 IC ≥ 此值 → 满权重（略低于全样本均0.078）
+ML_IC_WEAK = 0.015           # 近期均 IC ≤ 此值 → 降到下限（衰退窗口均IC≈0.002~0.02）
+ML_PENALTY_FLOOR = 0.35      # 重度衰退仍保留 35%（与 P6/P2 半保留下限哲学一致）
+
 # 因子分类（key=因子名, category=大类, direction=+1正向/-1反向）
 FACTOR_META: dict[str, dict] = {
     # ── 动量(8) ──
@@ -1489,3 +1495,60 @@ def _crowding_penalty(crowding: float) -> float:
     # 线性：1.0 在 SAFE，CROWDING_FLOOR 在 MAX
     frac = (crowding - CROWDING_SAFE) / (CROWDING_MAX - CROWDING_SAFE)
     return round(1.0 - (1.0 - CROWDING_FLOOR) * frac, 4)
+
+
+def _ml_stability_penalty(recent_ic_mean: float) -> float:
+    """ML 近期 IC 均值 → 连续软惩罚乘子。
+
+    线性映射：ic≥ML_IC_FULL→1.0（满权重）、ic≤ML_IC_WEAK→ML_PENALTY_FLOOR
+    （保留下限）、中间线性递增。衰退期 ML 注入噪声时自动降权，
+    强周期满权重保留 alpha。结构与 _crowding_penalty 镜像（方向相反）。
+
+    Args:
+        recent_ic_mean: ML 近期 n 月样本外 IC 均值。
+
+    Returns:
+        权重乘子 [ML_PENALTY_FLOOR, 1.0]。
+    """
+    if recent_ic_mean >= ML_IC_FULL:
+        return 1.0
+    if recent_ic_mean <= ML_IC_WEAK:
+        return ML_PENALTY_FLOOR
+    # 线性：ML_PENALTY_FLOOR 在 WEAK，1.0 在 FULL
+    frac = (recent_ic_mean - ML_IC_WEAK) / (ML_IC_FULL - ML_IC_WEAK)
+    return round(ML_PENALTY_FLOOR + (1.0 - ML_PENALTY_FLOOR) * frac, 4)
+
+
+def _recent_ml_ic_mean(db_path: str, as_of_date: str | None = None, n: int = 6) -> float | None:
+    """读 ml_scores 的 run_date 级 IC 均值，取最近 n 个的均值。
+
+    Args:
+        db_path: 数据库路径。
+        as_of_date: PIT 截止日期（回测）。None（实盘）取全部最近 n 个 run_date。
+        n: 取最近 n 个月。可用 run_date < 3 时返回 None（样本不足不惩罚）。
+
+    Returns:
+        近期 IC 均值；无数据或样本不足返回 None（调用方按满权重处理）。
+    """
+    import sqlite3
+    try:
+        with sqlite3.connect(db_path) as conn:
+            if as_of_date:
+                rows = conn.execute(
+                    "SELECT ic_mean FROM ml_scores "
+                    "WHERE run_date <= ? AND ic_mean IS NOT NULL "
+                    "GROUP BY run_date ORDER BY run_date DESC LIMIT ?",
+                    (as_of_date, n),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ic_mean FROM ml_scores "
+                    "WHERE ic_mean IS NOT NULL "
+                    "GROUP BY run_date ORDER BY run_date DESC LIMIT ?",
+                    (n,),
+                ).fetchall()
+    except Exception:
+        return None
+    if len(rows) < 3:
+        return None
+    return round(sum(r[0] for r in rows) / len(rows), 4)

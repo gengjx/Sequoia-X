@@ -11,7 +11,12 @@
 import numpy as np
 import pandas as pd
 
-from sequoia_x.analysis.factor import compute_factors, cross_section_rank
+from sequoia_x.analysis.factor import (
+    compute_factors,
+    cross_section_rank,
+    _ml_stability_penalty,
+    _recent_ml_ic_mean,
+)
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
@@ -266,8 +271,19 @@ class MultiFactorStrategy(BaseStrategy):
         active_weights = self.get_weights_for_state(market_state)
         # ML 合成因子是市场状态无关的全局信号，三态权重表可能不含，
         # 从全局权重补充注入（达标时非零、未达标为0则不注入）
-        if self._weights.get("ml_score"):
-            active_weights["ml_score"] = self._weights["ml_score"]
+        # P10b: 按近期样本外 IC 稳定性施加软惩罚（as-of PIT）——
+        # 强周期满权重保 alpha，衰退期自动降至下限抑制噪声。
+        base_ml = self._weights.get("ml_score")
+        if base_ml:
+            if not hasattr(self, "_ml_ic_cache"):
+                self._ml_ic_cache = {}
+            cache_key = as_of_date or "__live__"
+            recent_ic = self._ml_ic_cache.get(cache_key, "__miss__")
+            if recent_ic == "__miss__":
+                recent_ic = _recent_ml_ic_mean(self.engine.db_path, as_of_date=as_of_date)
+                self._ml_ic_cache[cache_key] = recent_ic
+            penalty = _ml_stability_penalty(recent_ic) if recent_ic is not None else 1.0
+            active_weights["ml_score"] = round(base_ml * penalty, 4)
 
         # ── 快照因子加载：回测走 as-of 截断（杜绝未来函数），实盘走最新值 ──
         if as_of_date and self._snapshot_history:
