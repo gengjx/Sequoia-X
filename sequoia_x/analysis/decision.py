@@ -364,6 +364,13 @@ class DecisionEngine:
         scaled_capital = capital * position_scale
         self._allocate_capital(buy_list, scaled_capital, max_industry_pct)
 
+        # 组合风控单股拦截（P9）：用 PortfolioRiskMonitor 模拟拟买入后的持仓，
+        # 若某只触发 danger 级告警（Beta/HHI/行业），降级为观望（不整仓熔断）
+        try:
+            self._apply_portfolio_risk_filter(buy_list, reject_list, capital)
+        except Exception as e:
+            logger.warning(f"组合风控检查跳过（不影响决策）：{e!r}")
+
         # 微仓过滤：无法建整手、或不足最小仓位门槛（3手/¥3000）的降级为观望
         def _is_too_small(i: DecisionItem) -> bool:
             if i.shares == 0:
@@ -695,6 +702,77 @@ class DecisionEngine:
                 used_capital += item.capital
                 industry_capital[ind] = ind_used + item.capital
             item.position_pct = round(item.capital / capital * 100, 1)
+
+    def _apply_portfolio_risk_filter(self, buy_list: list[DecisionItem],
+                                     reject_list: list[DecisionItem], capital: float) -> None:
+        """组合风控单股拦截：模拟拟买入后的持仓，降级触发 danger 告警的个股。
+
+        与回测 _check_buy_risk 粒度对齐——不做整仓熔断，只把触发 Beta/HHI/
+        行业 danger 告警的个股降级为观望（shares=0），保留其余。
+        """
+        from sequoia_x.analysis.portfolio_risk import PortfolioRiskMonitor
+        monitor = PortfolioRiskMonitor(self.engine.db_path)
+        # 构建模拟持仓（拟买入清单 → PortfolioRiskMonitor.analyze 需要的格式）
+        sim_holdings = []
+        cash = capital
+        for i in buy_list:
+            if i.shares > 0 and i.price > 0:
+                sim_holdings.append({
+                    "symbol": i.symbol, "shares": i.shares,
+                    "entry_price": i.price, "industry": i.industry,
+                })
+                cash -= i.capital
+        if not sim_holdings:
+            return
+        report = monitor.analyze(holdings=sim_holdings, cash=max(cash, 0))
+        if report.risk_score >= 40:
+            return  # 风险可接受
+        # 有 danger 级告警 → 找出触发的个股并降级
+        danger_syms: set[str] = set()
+        for alert in report.alerts:
+            if alert.level != "danger":
+                continue
+            # Beta 告警 → 降级 Beta 最高的持仓
+            if alert.category == "beta":
+                if sim_holdings:
+                    monitor2 = PortfolioRiskMonitor(self.engine.db_path)
+                    worst = max(sim_holdings, key=lambda h: self._get_stock_beta(monitor2, h["symbol"]))
+                    danger_syms.add(worst["symbol"])
+            # 集中度告警 → 降级占比最大的持仓
+            elif alert.category == "concentration":
+                if report.top_industry:
+                    for h in sim_holdings:
+                        if h.get("industry") == report.top_industry:
+                            danger_syms.add(h["symbol"])
+                            break
+        demoted = [i for i in buy_list if i.symbol in danger_syms]
+        for i in demoted:
+            i.grade = "观望"
+            i.action = "观望"
+            i.reason = f"组合风控拦截：风险分{report.risk_score}，触发Beta/集中度danger告警，降级观望"
+            i.shares = 0
+            i.capital = 0
+            buy_list.remove(i)
+            reject_list.insert(0, i)
+        if demoted:
+            logger.info(f"组合风控：降级 {len(demoted)} 只（风险分{report.risk_score}）")
+
+    @staticmethod
+    def _get_stock_beta(monitor, symbol: str) -> float:
+        """获取单股 Beta（用于找最大 Beta 持仓降级）。"""
+        try:
+            rets = monitor._get_stock_returns(symbol)
+            mr = monitor._get_market_returns()
+            min_len = min(len(rets), len(mr))
+            if min_len < 30:
+                return 1.0
+            m_var = float(np.var(mr[-min_len:]))
+            if m_var <= 0:
+                return 1.0
+            cov = float(np.cov(rets[-min_len:], mr[-min_len:])[0, 1])
+            return max(-2.0, min(3.0, cov / m_var))
+        except Exception:
+            return 1.0
 
     # ------------------------------------------------------------------
     # 摘要 & 辅助

@@ -77,6 +77,8 @@ class PaperReplayEngine:
         self.db_path = db_path
         self._replay_strat = None  # 复用的 MultiFactorStrategy 实例（含预加载快照历史）
         self._index_ret_cache: pd.Series | None = None  # 沪深300日收益率（基准）
+        self._beta_cache: dict[str, float] | None = None  # 预计算的个股 beta_300
+        self._industry_cache: dict[str, str] | None = None  # 个股行业
 
     def replay(
         self,
@@ -142,6 +144,9 @@ class PaperReplayEngine:
 
         logger.info(f"回放采样：{len(symbol_groups)}只股票")
 
+        # 预计算组合风控数据（beta/行业，买入循环 O(1) 检查用）
+        self._preload_risk_data(symbol_groups)
+
         # ── Step 2: 预计算每个交易日的截面因子 ──
         # 为了性能，只在天数足够时计算因子
         cutoff_map = self._load_ipo_cutoff()
@@ -192,6 +197,14 @@ class PaperReplayEngine:
 
                 pos.highest_price = max(pos.highest_price, price)
                 pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+                # 持仓期 ATR 收紧（P9 对齐实盘 position.py 规则5b）：
+                # 用当前波动率重算 ATR 止损，只收紧不放宽（单向原则）
+                try:
+                    atr_stop_now = self._calc_atr_stop(symbol_groups, pos.symbol, today, pos.entry_price)
+                    if atr_stop_now > pos.stop_loss:
+                        pos.stop_loss = atr_stop_now
+                except Exception:
+                    pass
                 trailing_stop = pos.highest_price * (1 + TRAILING_STOP_PCT / 100)
                 effective_stop = max(pos.stop_loss, trailing_stop)
 
@@ -294,6 +307,19 @@ class PaperReplayEngine:
                             continue
                         shares = int(target_amount / price / 100) * 100  # 整手
                         if shares <= 0:
+                            continue
+                        # 组合风控单股拦截（P9：Beta/HHI/行业超限则跳过该股）
+                        risk_amt = shares * price
+                        ok, risk_reason = self._check_buy_risk(
+                            sym, risk_amt, positions, today_prices,
+                            self._beta_cache or {}, self._industry_cache or {},
+                        )
+                        if not ok:
+                            trades.append(ReplayTrade(
+                                symbol=sym, side="buy", date=today,
+                                price=price, shares=0, amount=0,
+                                reason=risk_reason,
+                            ))
                             continue
                         tc = apply_trading_costs("buy", price, shares)
                         total_cost = tc["net_cash"]
@@ -478,6 +504,100 @@ class PaperReplayEngine:
         except Exception as e:
             logger.warning(f"沪深300基准加载失败，回退采样股等权：{e!r}")
             return None
+
+
+    def _preload_risk_data(self, symbol_groups: dict) -> None:
+        """预计算组合风控用的个股 beta_300 和行业（回测买入前一次性算完）。"""
+        idx_ret = self._index_ret_cache
+        self._beta_cache = {}
+        if idx_ret is not None:
+            for sym, g in symbol_groups.items():
+                try:
+                    if len(g) >= 60:
+                        stock_ret = g["close"].astype(float).pct_change().dropna().iloc[-60:]
+                        mr = idx_ret.dropna().iloc[-60:]
+                        min_len = min(len(stock_ret), len(mr))
+                        if min_len >= 30:
+                            sr = stock_ret.iloc[-min_len:].values
+                            mr = mr.iloc[-min_len:].values
+                            m_var = float(np.var(mr))
+                            if m_var > 0:
+                                cov = float(np.cov(sr, mr)[0, 1])
+                                self._beta_cache[sym] = max(-2.0, min(3.0, cov / m_var))
+                except Exception:
+                    pass
+        # 行业缓存（用于单行业集中度检查）
+        self._industry_cache = {}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute("SELECT symbol, industry FROM stock_industry").fetchall()
+                self._industry_cache = {r[0]: r[1] for r in rows if r[1]}
+        except Exception:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    rows = conn.execute("SELECT symbol, board FROM stock_board_em").fetchall()
+                    self._industry_cache = {r[0]: r[1] for r in rows if r[1]}
+            except Exception:
+                pass
+        logger.info(f"风控预计算完成：beta {len(self._beta_cache)} 只，行业 {len(self._industry_cache)} 只")
+
+    @staticmethod
+    def _check_buy_risk(
+        sym: str, buy_amount: float,
+        positions: list, today_prices: dict,
+        beta_cache: dict, industry_cache: dict,
+    ) -> tuple[bool, str]:
+        """增量式组合风控单股检查（O(1)）：加这只股后组合 Beta/HHI/行业是否超限。
+
+        Returns:
+            (ok, reason)：ok=True 可买；ok=False 不可买，reason 说明原因。
+        """
+        from sequoia_x.analysis.portfolio_risk import PortfolioRiskMonitor
+        BETA_DANGER = PortfolioRiskMonitor.BETA_DANGER
+        HHI_DANGER = PortfolioRiskMonitor.HHI_DANGER
+        IND_DANGER = PortfolioRiskMonitor.INDUSTRY_DANGER
+
+        # 当前持仓各股权重 + Beta 加权值
+        holdings_value = sum(
+            today_prices.get(p.symbol, p.entry_price) * p.shares
+            for p in positions
+        )
+        total_after = holdings_value + buy_amount
+        if total_after <= 0:
+            return True, ""
+
+        # ── Beta 检查 ──
+        cur_beta_wv = 0.0
+        for p in positions:
+            p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
+            cur_beta_wv += beta_cache.get(p.symbol, 1.0) * p_val
+        stock_beta = beta_cache.get(sym, 1.0)
+        new_beta = (cur_beta_wv + stock_beta * buy_amount) / total_after
+        if new_beta > BETA_DANGER:
+            return False, f"组合风控拦截：Beta={new_beta:.2f}>{BETA_DANGER}"
+
+        # ── HHI 检查（持仓数*10000 尺度）──
+        # 用资金占比做 HHI：w_i = value_i / total
+        weights = {}
+        for p in positions:
+            p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
+            weights[p.symbol] = weights.get(p.symbol, 0) + p_val
+        weights[sym] = weights.get(sym, 0) + buy_amount
+        hhi = sum((v / total_after) ** 2 for v in weights.values()) * 10000
+        if hhi > HHI_DANGER:
+            return False, f"组合风控拦截：HHI={hhi:.0f}>{HHI_DANGER}"
+
+        # ── 单行业集中度检查 ──
+        ind = industry_cache.get(sym, "其他")
+        ind_value = 0.0
+        for p in positions:
+            if industry_cache.get(p.symbol, "其他") == ind:
+                ind_value += today_prices.get(p.symbol, p.entry_price) * p.shares
+        ind_pct = (ind_value + buy_amount) / total_after
+        if ind_pct > IND_DANGER:
+            return False, f"组合风控拦截：{ind}行业占比{ind_pct*100:.0f}%>{IND_DANGER*100:.0f}%"
+
+        return True, ""
 
     def _select_top(
         self, symbol_groups: dict, today: str,
