@@ -131,6 +131,7 @@ FACTOR_META: dict[str, dict] = {
     # ── 沪深300 Beta(2)（相对沪深300的系统性暴露）──
     "beta_300":        {"category": "Beta", "desc": "相对沪深300 Beta（低Beta防御溢价）", "reverse": True},
     "rel_strength_300":{"category": "Beta", "desc": "相对沪深300超额收益（20日相对强度）"},
+    "block_discount":  {"category": "大宗交易", "desc": "近30天大宗交易加权折价率（折价=机构接货，正向）"},
 }
 
 
@@ -139,6 +140,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
                    north_hold: pd.DataFrame | None = None,
                    margin: dict | None = None,
                    fund_hold: dict | None = None,
+                   block_data: dict | None = None,
                    index_ret: pd.Series | None = None, ) -> dict[str, float]:
     """计算单只股票的全部因子值（向量化，基于完整K线序列）。
 
@@ -306,6 +308,13 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
     else:
         for k in ["lhb_count", "lhb_netbuy"]:
             factors[k] = np.nan
+
+    # ════════ 大宗交易(1) ════════
+    if block_data:
+        # block_data: {"discount": 近30天加权折价率, "count": 次数}
+        factors["block_discount"] = float(block_data.get("discount", 0))
+    else:
+        factors["block_discount"] = np.nan
 
     # ════════ 质量(5) + 成长(1) + 营运效率(3) ════════
     if finance:
@@ -897,6 +906,23 @@ def evaluate_factor_ic(
         except Exception as e:
             logger.warning(f"因子IC评估：基金持仓加载失败：{e!r}")
 
+    # 加载大宗交易历史（折溢率=机构接货信号）
+    block_factors = {"block_discount"}
+    block_map: dict[str, list[tuple]] = {}  # {symbol: [(date, discount)], 排序}
+    if set(factor_set) & block_factors:
+        import sqlite3 as _sq8
+        try:
+            with _sq8.connect(engine.db_path) as _conn8:
+                _bt_rows = _conn8.execute(
+                    "SELECT symbol, date, discount, amount FROM block_trade "
+                    "ORDER BY symbol, date"
+                ).fetchall()
+            for r in _bt_rows:
+                block_map.setdefault(r[0], []).append((r[1], r[2] or 0, r[3] or 0))
+            logger.info(f"因子IC评估：加载大宗交易 {len(block_map)} 只股票")
+        except Exception as e:
+            logger.warning(f"因子IC评估：大宗交易加载失败（表可能不存在）：{e!r}")
+
     # 加载沪深300指数收益率序列（用于 beta_300 / rel_strength_300 的IC评估）
     index_ret_series = None
     if set(factor_set) & {"beta_300", "rel_strength_300"}:
@@ -955,8 +981,10 @@ def evaluate_factor_ic(
             # compute_factor_series 只支持量价时序因子，质量因子无时序跳过
             # 所有 point-in-time 因子（非时序，按月取截面值）需排除出 compute_factor_series
             margin_factors = {"margin_balance", "margin_netbuy", "short_ratio"}
+            block_factors = {"block_discount"}
             _pit_factors = (quality_factors | valuation_factors | fund_flow_factors
-                            | lhb_factors | north_factors | margin_factors | fund_hold_factors)
+                            | lhb_factors | north_factors | margin_factors | fund_hold_factors
+                            | block_factors)
             ts_factors = [f for f in factor_set if f not in _pit_factors]
             series = compute_factor_series(df, ts_factors, index_ret=index_ret_series)
             dates = df["date"].astype(str).values
@@ -1049,6 +1077,28 @@ def evaluate_factor_ic(
                                     row[k] = None
                             else:
                                 row[k] = None
+                        else:
+                            row[k] = None
+                    elif k in block_factors:
+                        # as-of 取近30天大宗交易（杜绝未来函数），加权折价率
+                        # block_map 存 3 元组 (date, discount, amount)，内联过滤
+                        import datetime as _bdt
+                        _bt_seq = block_map.get(sym, [])
+                        if _bt_seq:
+                            try:
+                                _ref = _bdt.datetime.strptime(dates[i], "%Y-%m-%d")
+                                _ws = (_ref - _bdt.timedelta(days=30)).strftime("%Y-%m-%d")
+                            except (ValueError, TypeError):
+                                _ws = "1900-01-01"
+                            _bt_recent = [rec for rec in _bt_seq if _ws <= rec[0] <= dates[i]]
+                        else:
+                            _bt_recent = []
+                        if _bt_recent:
+                            total_amt = sum(rec[2] for rec in _bt_recent if rec[2] and rec[2] > 0)
+                            if total_amt > 0:
+                                row[k] = sum(rec[1] * (rec[2] if rec[2] and rec[2] > 0 else 0) for rec in _bt_recent) / total_amt
+                            else:
+                                row[k] = sum(rec[1] for rec in _bt_recent) / len(_bt_recent)
                         else:
                             row[k] = None
                     elif k in margin_factors:

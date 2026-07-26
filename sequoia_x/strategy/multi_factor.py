@@ -221,6 +221,18 @@ class MultiFactorStrategy(BaseStrategy):
                     }))
             except Exception:
                 sh["fund_hold"] = {}
+            # 大宗交易（折溢率，近30天窗口）
+            try:
+                rows = conn.execute(
+                    "SELECT symbol, date, discount, amount FROM block_trade ORDER BY symbol, date"
+                ).fetchall()
+                sh["block"] = {}
+                for r in rows:
+                    sh["block"].setdefault(r[0], []).append((r[1], {
+                        "discount": r[2], "amount": r[3],
+                    }))
+            except Exception:
+                sh["block"] = {}
             # 沪深300指数收益率（全序列）
             try:
                 rows = conn.execute(
@@ -294,6 +306,7 @@ class MultiFactorStrategy(BaseStrategy):
             north_map = self._build_asof_north(as_of_date)
             margin_map = self._build_asof_margin(as_of_date)
             fund_hold_map = self._build_asof_fund_hold(as_of_date)
+            block_map = self._build_asof_block(as_of_date)
             index_ret = sh.get("index_ret")
             if index_ret is not None:
                 index_ret = index_ret[index_ret.index <= as_of_date]
@@ -305,6 +318,7 @@ class MultiFactorStrategy(BaseStrategy):
             north_map = self._load_north_map()
             margin_map = self._load_margin_map()
             fund_hold_map = self._load_fund_hold_map()
+            block_map = self._load_block_map()
             index_ret = self._load_index_ret()
 
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
@@ -323,6 +337,7 @@ class MultiFactorStrategy(BaseStrategy):
                     north_hold=north_map.get(sym),
                     margin=margin_map.get(sym),
                     fund_hold=fund_hold_map.get(sym),
+                    block_data=block_map.get(sym),
                     index_ret=index_ret,
                 )
                 factors["symbol"] = sym
@@ -575,6 +590,50 @@ class MultiFactorStrategy(BaseStrategy):
             fields = _pit_asof(seq, as_of_date)
             if fields:
                 result[sym] = fields
+        return result
+
+    def _load_block_map(self) -> dict[str, dict]:
+        """加载近30天大宗交易（实盘最新日）。返回 {symbol: {discount, count}}。"""
+        import sqlite3
+        try:
+            with sqlite3.connect(self.engine.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, date, discount, amount FROM block_trade "
+                    "WHERE date >= date('now', '-30 days') ORDER BY symbol, date"
+                ).fetchall()
+            result = {}
+            tmp = {}
+            for r in rows:
+                tmp.setdefault(r[0], []).append((r[2] or 0, r[3] or 0))
+            for sym, recs in tmp.items():
+                total_amt = sum(amt for _, amt in recs if amt and amt > 0)
+                if total_amt > 0:
+                    disc = sum(d * (amt if amt and amt > 0 else 0) for d, amt in recs) / total_amt
+                else:
+                    disc = sum(d for d, _ in recs) / len(recs) if recs else 0
+                result[sym] = {"discount": disc, "count": len(recs)}
+            return result
+        except Exception as e:
+            logger.debug(f"大宗交易加载失败: {e}")
+            return {}
+
+    def _build_asof_block(self, as_of_date: str) -> dict[str, dict]:
+        """大宗交易 as-of：取 ≤ today 近30天加权折价率。"""
+        import datetime as _dt
+        seq_map = self._snapshot_history.get("block", {})
+        result = {}
+        cutoff = (_dt.datetime.strptime(as_of_date, "%Y-%m-%d") - _dt.timedelta(days=30)).strftime("%Y-%m-%d")
+        for sym, seq in seq_map.items():
+            recent = [(rec[0], rec[1].get("discount", 0), rec[1].get("amount", 0))
+                      for rec in seq if cutoff <= rec[0] <= as_of_date]
+            if not recent:
+                continue
+            total_amt = sum(amt for _, _, amt in recent if amt and amt > 0)
+            if total_amt > 0:
+                disc = sum(d * (amt if amt and amt > 0 else 0) for _, d, amt in recent) / total_amt
+            else:
+                disc = sum(d for _, d, _ in recent) / len(recent)
+            result[sym] = {"discount": disc, "count": len(recent)}
         return result
 
     def _build_asof_fund_hold(self, as_of_date: str) -> dict[str, dict]:
