@@ -197,14 +197,9 @@ class PaperReplayEngine:
 
                 pos.highest_price = max(pos.highest_price, price)
                 pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-                # 持仓期 ATR 收紧（P9 对齐实盘 position.py 规则5b）：
-                # 用当前波动率重算 ATR 止损，只收紧不放宽（单向原则）
-                try:
-                    atr_stop_now = self._calc_atr_stop(symbol_groups, pos.symbol, today, pos.entry_price)
-                    if atr_stop_now > pos.stop_loss:
-                        pos.stop_loss = atr_stop_now
-                except Exception:
-                    pass
+                # 持仓期止损：入场 ATR 止损 + 固定 trailing stop（与 P8b 基线一致）
+                # 注：ATR 持仓期收紧经全量回测验证轻微降低收益（假止损增加），
+                # 故暂不启用持仓期收紧，仅保留入场 ATR 止损 + portfolio 风控拦截。
                 trailing_stop = pos.highest_price * (1 + TRAILING_STOP_PCT / 100)
                 effective_stop = max(pos.stop_loss, trailing_stop)
 
