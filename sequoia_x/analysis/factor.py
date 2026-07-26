@@ -1300,9 +1300,17 @@ def evaluate_factor_ic(
             logger.info(f"因子去重：剔除{len(removed)}个同义因子({', '.join(sorted(removed))})")
 
         total_ic = sum(abs(f["ic_mean"]) for f in effective)
-        # 先清零所有因子的旧权重（无条件执行，防 total_ic==0 时 stale 权重残留）
+        # 先备份 ML 因子权重（全量清零会抹掉 ml_factor 月度训练写入的 ml_score）
         import sqlite3 as _sq3
+        _ml_backup = None
         with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
+            _ml_row = _conn.execute(
+                "SELECT weight, ic_mean, icir, win_rate, updated_at "
+                "FROM factor_weights WHERE factor_name='ml_score'"
+            ).fetchone()
+            if _ml_row and _ml_row[0] and _ml_row[0] != 0:
+                _ml_backup = _ml_row
+            # 清零所有因子的旧权重（无条件执行，防 total_ic==0 时 stale 权重残留）
             _conn.execute("UPDATE factor_weights SET weight=0")
         if total_ic > 0:
             # 写入新的带符号权重
@@ -1325,6 +1333,16 @@ def evaluate_factor_ic(
             logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子（{pos_cnt}正+{neg_cnt}负）")
         else:
             logger.warning("无因子通过显著性过滤(0.03/0.5/2.0)，权重已全量清零，检查数据/窗口")
+        # 恢复 ML 因子权重（防止全量清零泄漏 ml_factor 月度训练结果）
+        if _ml_backup:
+            with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
+                _conn.execute(
+                    "INSERT OR REPLACE INTO factor_weights "
+                    "(factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
+                    "VALUES ('ml_score','ML因子',?,?,?,?,?)",
+                    (_ml_backup[1], _ml_backup[2], _ml_backup[3], _ml_backup[0], _ml_backup[4]),
+                )
+            logger.info(f"ML因子权重已恢复：weight={_ml_backup[0]:.4f}（不被IC刷新清零）")
     except Exception as e:
         logger.warning(f"因子权重写DB失败（不影响评估结果）：{e!r}")
 

@@ -105,8 +105,113 @@ class MLFactorEngine:
 
     # ───────────────────────── 数据采集 ─────────────────────────
 
-    def _collect_training_data(self) -> list[dict]:
+
+    def generate_walkforward_snapshots(self, start_month: str = "2022-09",
+                                        end_month: str | None = None,
+                                        progress_callback=None) -> dict:
+        """生成 Walk-forward ML 快照（回测验证用，一次性离线任务）。
+
+        按月循环：每月用 ≤ 该月的 PIT 数据训练一次，写 ml_scores 快照
+        （run_date=该月最后一个交易日）。覆盖回测区间内的全部月份后，
+        回测的 _load_ml_scores_asof 能按 as-of 读取历史快照。
+
+        Args:
+            start_month: 起始月份（YYYY-MM），需满足 TRAIN_MONTHS+2 的历史。
+            end_month: 结束月份（None=最新月）。
+
+        Returns:
+            {months_generated, total_snapshots, avg_ic}
+        """
+        import time as _time
+        # 取所有可用月份
+        with sqlite3.connect(self.db_path) as conn:
+            dates = pd.read_sql(
+                "SELECT DISTINCT date FROM stock_daily ORDER BY date", conn
+            )["date"].tolist()
+        monthly_dates: dict[str, str] = {}
+        for d in dates:
+            month = d[:7]
+            monthly_dates[month] = d
+        months_all = sorted(monthly_dates.keys())
+
+        # 过滤到 [start_month, end_month]
+        end = end_month or months_all[-1]
+        target_months = [m for m in months_all if start_month <= m <= end]
+
+        if len(target_months) < 1:
+            logger.warning(f"Walk-forward：无目标月份（{start_month}~{end}）")
+            return {"months_generated": 0}
+
+        logger.info(f"Walk-forward：生成 {len(target_months)} 个月份的 ML 快照（{target_months[0]}~{target_months[-1]}）")
+
+        generated = 0
+        ic_list = []
+        total = len(target_months)
+        for i, month in enumerate(target_months):
+            if progress_callback:
+                progress_callback(i, total, f"walk-forward {month} ({i+1}/{total})")
+
+            # PIT 训练：只用 ≤ month 的数据
+            data = self._collect_training_data(as_of_month=month)
+            if not data or len(data) < 100:
+                logger.debug(f"Walk-forward {month}：数据不足，跳过")
+                continue
+
+            results = self._time_series_cv(data)
+            if not results.get("predictions"):
+                continue
+
+            # 写快照，run_date 用该月最后一个交易日
+            run_date = monthly_dates[month]
+            self._save_ml_scores_to_date(results, run_date)
+            generated += 1
+            ic_list.append(results.get("ic_mean", 0))
+            logger.info(
+                f"Walk-forward {month}：IC={results.get('ic_mean', 0):.4f} "
+                f"ICIR={results.get('icir', 0):.3f}（{i+1}/{total}）"
+            )
+
+        avg_ic = sum(ic_list) / len(ic_list) if ic_list else 0
+        logger.info(f"Walk-forward 完成：{generated}/{total} 月，平均IC={avg_ic:.4f}")
+        return {
+            "months_generated": generated,
+            "total_snapshots": generated,
+            "avg_ic": round(avg_ic, 4),
+        }
+
+    def _save_ml_scores_to_date(self, results: dict, run_date: str) -> None:
+        """写 ml_scores 快照到指定 run_date（walk-forward 用，复用 _save_ml_scores 逻辑）。"""
+        predictions = results.get("predictions", {})
+        if not predictions:
+            return
+        ic_mean = results.get("ic_mean", 0)
+        icir = results.get("icir", 0)
+        t_stat = results.get("t_stat", 0)
+        model_version = results.get("model_version", "ridge")
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM ml_scores WHERE run_date=?", (run_date,))
+                rows = [
+                    (run_date, sym, float(score), ic_mean, icir, t_stat, model_version)
+                    for sym, score in predictions.items()
+                    if score == score
+                ]
+                conn.executemany(
+                    "INSERT OR REPLACE INTO ml_scores "
+                    "(run_date, symbol, ml_score, ic_mean, icir, t_stat, model_version) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    rows,
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Walk-forward 快照写入失败（{run_date}）：{e!r}")
+
+    def _collect_training_data(self, as_of_month: str | None = None) -> list[dict]:
         """收集每月因子截面 + 前向收益标签。
+
+        Args:
+            as_of_month: PIT 截止月份（YYYY-MM）。None=取最新月（实盘/单次训练）；
+                         非 None（walk-forward）时训练数据月份 ≤ as_of_month。
 
         返回: [{month, features: {factor: value}, fwd_return: float}, ...]
         """
@@ -122,14 +227,18 @@ class MLFactorEngine:
         monthly_dates = dict(sorted(monthly_dates.items()))
 
         months = list(monthly_dates.keys())
+        # Walk-forward PIT：as_of_month 非 None 时只用 ≤ as_of_month 的月份
+        if as_of_month is not None:
+            months = [m for m in months if m <= as_of_month]
         if len(months) < self.TRAIN_MONTHS + 2:
             conn.close()
             return []
 
+        sample_date = monthly_dates[months[-1]]
         sample_syms = [r[0] for r in conn.execute(
             "SELECT DISTINCT symbol FROM stock_daily "
             "WHERE date=? AND volume > 1000000 ORDER BY symbol LIMIT 800",
-            (monthly_dates[months[-1]],),
+            (sample_date,),
         ).fetchall()]
 
         logger.info(f"ML因子：加载{len(sample_syms)}只股票数据...")
