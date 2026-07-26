@@ -138,16 +138,20 @@ class TestBuyRiskCheck:
         assert ok, f"不同行业应通过：{reason}"
 
     def test_hhi_block_when_highly_concentrated(self):
-        """持仓已高度集中（单票占比极高）→ 加仓触发 HHI 超限。"""
-        # 单票占 90000，总仓位才 100000 → HHI 极高
+        """持仓已高度集中（3+只但单票占比极高）→ 加仓触发 HHI 超限。"""
+        # 3 只持仓，但其中一只占绝大部分
         positions = [
             ReplayPosition(symbol="000001", entry_date="2025-01-01", entry_price=90,
-                           shares=1000, highest_price=90, stop_loss=80),
+                           shares=1000, highest_price=90, stop_loss=80),  # 90000
+            ReplayPosition(symbol="000002", entry_date="2025-01-01", entry_price=10,
+                           shares=100, highest_price=10, stop_loss=9),    # 1000
+            ReplayPosition(symbol="000003", entry_date="2025-01-01", entry_price=10,
+                           shares=100, highest_price=10, stop_loss=9),    # 1000
         ]
-        today_prices = {"000001": 90.0}
-        # 再加 10000 → 仍高度集中
+        today_prices = {"000001": 90.0, "000002": 10.0, "000003": 10.0}
+        # 加 000004 10000 → 总 102000，但 000001 占 88% → HHI 仍极高
         ok, reason = PaperReplayEngine._check_buy_risk(
-            "000002", 10000, positions, today_prices, {}, {})
+            "000004", 10000, positions, today_prices, {}, {})
         assert not ok
         assert "HHI" in reason
 

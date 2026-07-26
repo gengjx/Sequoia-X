@@ -566,26 +566,28 @@ class PaperReplayEngine:
         if total_after <= 0:
             return True, ""
 
-        # ── Beta 检查 ──
-        cur_beta_wv = 0.0
-        for p in positions:
-            p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
-            cur_beta_wv += beta_cache.get(p.symbol, 1.0) * p_val
-        stock_beta = beta_cache.get(sym, 1.0)
-        new_beta = (cur_beta_wv + stock_beta * buy_amount) / total_after
-        if new_beta > BETA_DANGER:
-            return False, f"组合风控拦截：Beta={new_beta:.2f}>{BETA_DANGER}"
+        # ── Beta 检查（仅在持仓数 ≥ 3 时启用，建仓期允许个股 Beta 波动）──
+        combined_count = len({p.symbol for p in positions}) + (0 if any(p.symbol == sym for p in positions) else 1)
+        if combined_count >= 3:
+            cur_beta_wv = 0.0
+            for p in positions:
+                p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
+                cur_beta_wv += beta_cache.get(p.symbol, 1.0) * p_val
+            stock_beta = beta_cache.get(sym, 1.0)
+            new_beta = (cur_beta_wv + stock_beta * buy_amount) / total_after
+            if new_beta > BETA_DANGER:
+                return False, f"组合风控拦截：Beta={new_beta:.2f}>{BETA_DANGER}"
 
-        # ── HHI 检查（持仓数*10000 尺度）──
-        # 用资金占比做 HHI：w_i = value_i / total
-        weights = {}
-        for p in positions:
-            p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
-            weights[p.symbol] = weights.get(p.symbol, 0) + p_val
-        weights[sym] = weights.get(sym, 0) + buy_amount
-        hhi = sum((v / total_after) ** 2 for v in weights.values()) * 10000
-        if hhi > HHI_DANGER:
-            return False, f"组合风控拦截：HHI={hhi:.0f}>{HHI_DANGER}"
+        # ── HHI 检查（复用 combined_count ≥ 3 判定）──
+        if combined_count >= 3:
+            weights = {}
+            for p in positions:
+                p_val = today_prices.get(p.symbol, p.entry_price) * p.shares
+                weights[p.symbol] = weights.get(p.symbol, 0) + p_val
+            weights[sym] = weights.get(sym, 0) + buy_amount
+            hhi = sum((v / total_after) ** 2 for v in weights.values()) * 10000
+            if hhi > HHI_DANGER:
+                return False, f"组合风控拦截：HHI={hhi:.0f}>{HHI_DANGER}"
 
         # ── 单行业集中度检查 ──
         ind = industry_cache.get(sym, "其他")
