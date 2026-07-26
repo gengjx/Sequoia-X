@@ -6,7 +6,7 @@
   - 多个任务各自独立调用，没有全局协调
 
 限流策略：
-  1. 日额度：baostock 每日上限 40000 次（留 20% 安全余量）
+  1. 日额度：baostock 每日上限 48000 次（官方5万，留4%余量给增量任务）
   2. 频率限制：东财每秒最多 3 次请求（避免触发风控）
   3. 失败退避：连续失败时指数退避，超过阈值自动熔断
   4. 状态持久化：额度计数写入文件，重启不重置
@@ -26,7 +26,7 @@ from sequoia_x.core.logger import get_logger
 logger = get_logger(__name__)
 
 # ── 限额配置 ──
-BAOSTOCK_DAILY_LIMIT = 40_000      # baostock 日限额（官方5万，留20%余量）
+BAOSTOCK_DAILY_LIMIT = 48_000      # baostock 日限额（官方5万，留4%余量给增量任务）
 EASTMONEY_MIN_INTERVAL = 0.4       # 东财请求最小间隔秒（2.5次/秒）
 MAX_CONSECUTIVE_FAILURES = 10      # 连续失败熔断阈值
 CIRCUIT_BREAKER_COOLDOWN = 3600    # 熔断冷却时间（秒）
