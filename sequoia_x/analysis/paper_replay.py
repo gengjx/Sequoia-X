@@ -589,15 +589,16 @@ class PaperReplayEngine:
             if hhi > HHI_DANGER:
                 return False, f"组合风控拦截：HHI={hhi:.0f}>{HHI_DANGER}"
 
-        # ── 单行业集中度检查 ──
-        ind = industry_cache.get(sym, "其他")
-        ind_value = 0.0
-        for p in positions:
-            if industry_cache.get(p.symbol, "其他") == ind:
-                ind_value += today_prices.get(p.symbol, p.entry_price) * p.shares
-        ind_pct = (ind_value + buy_amount) / total_after
-        if ind_pct > IND_DANGER:
-            return False, f"组合风控拦截：{ind}行业占比{ind_pct*100:.0f}%>{IND_DANGER*100:.0f}%"
+        # ── 单行业集中度检查（仅在持仓数 ≥ 3 时启用）──
+        if combined_count >= 3:
+            ind = industry_cache.get(sym, "其他")
+            ind_value = 0.0
+            for p in positions:
+                if industry_cache.get(p.symbol, "其他") == ind:
+                    ind_value += today_prices.get(p.symbol, p.entry_price) * p.shares
+            ind_pct = (ind_value + buy_amount) / total_after
+            if ind_pct > IND_DANGER:
+                return False, f"组合风控拦截：{ind}行业占比{ind_pct*100:.0f}%>{IND_DANGER*100:.0f}%"
 
         return True, ""
 
