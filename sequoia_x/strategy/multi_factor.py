@@ -147,7 +147,8 @@ class MultiFactorStrategy(BaseStrategy):
             try:
                 rows = conn.execute(
                     "SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
-                    "yoy_ni, asset_turn, inv_turn, nr_turn FROM stock_finance ORDER BY symbol, stat_date"
+                    "yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np "
+                    "FROM stock_finance ORDER BY symbol, stat_date"
                 ).fetchall()
                 sh["finance"] = {}
                 for r in rows:
@@ -155,6 +156,7 @@ class MultiFactorStrategy(BaseStrategy):
                         "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
                         "yoy_eps": r[5], "yoy_pni": r[6], "yoy_ni": r[7],
                         "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
+                        "cfo_to_or": r[11], "cfo_to_np": r[12],
                     }))
             except Exception as e:
                 sh["finance"] = {}
@@ -844,13 +846,13 @@ class MultiFactorStrategy(BaseStrategy):
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
                     "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
-                    "yoy_ni, asset_turn, inv_turn, nr_turn "
+                    "yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np "
                     "FROM stock_finance WHERE symbol IN ({}) "
                     "AND stat_date = (SELECT MAX(stat_date) FROM stock_finance f2 WHERE f2.symbol = stock_finance.symbol)".format(
                         ",".join("?" * len(symbols))
                     ) if len(symbols) <= 900 else
                     "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
-                    "yoy_ni, asset_turn, inv_turn, nr_turn "
+                    "yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np "
                     "FROM stock_finance WHERE stat_date IN (SELECT MAX(stat_date) FROM stock_finance)",
                     symbols if len(symbols) <= 900 else []
                 ).fetchall()

@@ -59,6 +59,7 @@ def _fetch_batch(args: tuple) -> list[dict]:
         "symbol", "stat_date", "report_date", "roe", "np_margin", "gp_margin",
         "net_profit", "eps_ttm", "revenue", "yoy_equity", "yoy_asset", "yoy_ni",
         "yoy_eps", "yoy_pni", "nr_turn", "inv_turn", "asset_turn",
+        "cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio",
     ]
 
     for symbol in symbols:
@@ -97,6 +98,14 @@ def _fetch_batch(args: tuple) -> list[dict]:
                     rec["nr_turn"] = _sf(o[3])
                     rec["inv_turn"] = _sf(o[5])
                     rec["asset_turn"] = _sf(o[8])
+
+                rc = bs.query_cash_flow_data(code=bs_code, year=year, quarter=quarter)
+                while rc.next():
+                    c = rc.get_row_data()
+                    rec["tangible_ratio"] = _sf(c[5])
+                    rec["cfo_to_or"] = _sf(c[7])
+                    rec["cfo_to_np"] = _sf(c[8])
+                    rec["cfo_to_gr"] = _sf(c[9])
 
                 results.append(rec)
             except Exception:
@@ -147,8 +156,17 @@ class FinanceSync:
                 "roe REAL, np_margin REAL, gp_margin REAL, net_profit REAL, eps_ttm REAL, revenue REAL,"
                 "yoy_equity REAL, yoy_asset REAL, yoy_ni REAL, yoy_eps REAL, yoy_pni REAL,"
                 "nr_turn REAL, inv_turn REAL, asset_turn REAL,"
+                "cfo_to_or REAL, cfo_to_np REAL, cfo_to_gr REAL, tangible_ratio REAL,"
                 "PRIMARY KEY (symbol, stat_date))"
             )
+            # 幂等迁移：现有表补现金流比率列（P15 盈利质量因子）
+            for col in ("cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE stock_finance ADD COLUMN {col} REAL"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
             conn.commit()
 
         # 获取全市场代码
@@ -164,9 +182,9 @@ class FinanceSync:
         missing = [s for s in all_symbols if s not in have]
 
         # ── baostock 额度预算保护 ──
-        # 每只股票 = n_quarters 季度 × 3 类财报(profit/growth/operation) = 18 次查询
+        # 每只股票 = n_quarters 季度 × 4 类财报(profit/growth/operation/cashflow)
         from sequoia_x.core.rate_limiter import _rate_limiter
-        calls_per_stock = n_quarters * 3
+        calls_per_stock = n_quarters * 4
         rl_status = _rate_limiter.baostock_status()
         budget_stocks = rl_status["remaining"] // calls_per_stock if calls_per_stock > 0 else 0
         if budget_stocks == 0:
@@ -275,3 +293,137 @@ def backfill_finance_history(settings=None, n_quarters: int = 20, max_stocks: in
     """
     syncer = FinanceSync(settings)
     return syncer.sync_all(n_quarters=n_quarters, n_workers=3, max_stocks=max_stocks)
+
+
+def _stat_date_to_yq(stat_date: str | None) -> tuple[int, int] | None:
+    """YYYY-MM-DD -> (year, quarter)。"""
+    if not stat_date or len(stat_date) < 7:
+        return None
+    try:
+        y = int(stat_date[:4])
+        m = int(stat_date[5:7])
+        return (y, (m - 1) // 3 + 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def _fetch_cashflow_batch(args: tuple) -> int:
+    """worker：仅拉现金流比率，逐行 UPDATE。"""
+    import baostock as bs
+
+    (rows,) = args
+    bs.login()
+    updates: list[tuple] = []
+    for symbol, stat_date in rows:
+        yq = _stat_date_to_yq(stat_date)
+        if not yq:
+            continue
+        year, quarter = yq
+        bs_code = _to_baostock_code(symbol)
+        try:
+            rc = bs.query_cash_flow_data(code=bs_code, year=year, quarter=quarter)
+            while rc.next():
+                c = rc.get_row_data()
+                updates.append((
+                    _sf(c[5]),  # tangible_ratio
+                    _sf(c[7]),  # cfo_to_or
+                    _sf(c[8]),  # cfo_to_np
+                    _sf(c[9]),  # cfo_to_gr
+                    symbol, stat_date,
+                ))
+                break  # 单季度单行
+        except Exception:
+            continue
+    bs.logout()
+
+    if updates:
+        db_path = Settings().db_path
+        with sqlite3.connect(db_path) as conn:
+            conn.executemany(
+                "UPDATE stock_finance SET tangible_ratio=?, cfo_to_or=?, "
+                "cfo_to_np=?, cfo_to_gr=? WHERE symbol=? AND stat_date=?",
+                updates,
+            )
+            conn.commit()
+    return len(updates)
+
+
+def backfill_cash_flow(settings=None, batch_size: int = 200,
+                       max_rows: int | None = None, n_workers: int = 3) -> dict:
+    """增量回补现金流比率（仅 cfo_to_or IS NULL 的行）。
+
+    P15 专用：已有 profit/growth/operation 但缺现金流的行，专项补
+    query_cash_flow_data（每行 1 次调用），比全量重拉省 75% 额度。
+
+    用法：
+        python -c "from sequoia_x.data.finance_sync import backfill_cash_flow; backfill_cash_flow()"
+    """
+    syncer = FinanceSync(settings)
+    t0 = time.time()
+
+    with sqlite3.connect(syncer.db_path) as conn:
+        null_rows = conn.execute(
+            "SELECT symbol, stat_date FROM stock_finance "
+            "WHERE cfo_to_or IS NULL ORDER BY symbol, stat_date"
+        ).fetchall()
+
+    total_null = len(null_rows)
+    if total_null == 0:
+        logger.info("现金流回补：无缺失行，跳过")
+        return {"total": 0, "fetched": 0, "elapsed": 0}
+
+    # baostock 额度保护（每行 1 次调用）
+    from sequoia_x.core.rate_limiter import _rate_limiter
+    rl_status = _rate_limiter.baostock_status()
+    budget = rl_status["remaining"]
+    if budget == 0:
+        logger.error(
+            f"baostock 额度已耗尽({rl_status['used']}/{rl_status['limit']})，"
+            f"现金流回补取消，明天 00:00 重置后继续"
+        )
+        return {"total": total_null, "fetched": 0, "rate_limited": True, "elapsed": 0}
+
+    todo = null_rows[:max_rows] if max_rows else null_rows
+    if len(todo) > budget:
+        logger.warning(
+            f"额度保护：需回补 {len(todo)} 行，超出 baostock 剩余 {budget}，截断"
+        )
+        todo = todo[:budget]
+
+    logger.info(
+        f"现金流回补：缺失 {total_null} 行，本次回补 {len(todo)} 行，{n_workers} 进程并行"
+    )
+
+    chunks = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
+    chunk_args = [(c,) for c in chunks]
+    total_fetched = 0
+    with Pool(n_workers) as pool:
+        for i, cnt in enumerate(pool.imap_unordered(_fetch_cashflow_batch, chunk_args)):
+            total_fetched += cnt
+            done = min((i + 1) * batch_size, len(todo))
+            elapsed = time.time() - t0
+            speed = done / elapsed if elapsed > 0 else 0
+            eta = (len(todo) - done) / speed if speed > 0 else 0
+            logger.info(
+                f"现金流回补进度：{done}/{len(todo)} 行 "
+                f"({speed:.0f} 行/秒，ETA {eta:.0f}s)"
+            )
+
+    _rate_limiter.baostock_consume(len(todo))
+    elapsed = time.time() - t0
+
+    with sqlite3.connect(syncer.db_path) as conn:
+        remaining_null = conn.execute(
+            "SELECT COUNT(*) FROM stock_finance WHERE cfo_to_or IS NULL"
+        ).fetchone()[0]
+
+    logger.info(
+        f"现金流回补完成：本次 {total_fetched}/{len(todo)} 行，"
+        f"剩余缺失 {remaining_null} 行，耗时 {elapsed:.0f}s"
+    )
+    return {
+        "total": total_null,
+        "fetched": total_fetched,
+        "remaining": remaining_null,
+        "elapsed": round(elapsed, 0),
+    }

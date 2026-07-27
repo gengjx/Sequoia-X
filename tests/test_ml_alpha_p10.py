@@ -35,6 +35,7 @@ def _make_ml_db(tmp_path: Path, months: int = 25) -> str:
             "CREATE TABLE IF NOT EXISTS stock_finance "
             "(symbol TEXT, stat_date TEXT, roe REAL, np_margin REAL, gp_margin REAL, "
             "yoy_eps REAL, yoy_pni REAL, yoy_ni REAL, asset_turn REAL, inv_turn REAL, nr_turn REAL, "
+            "cfo_to_or REAL, cfo_to_np REAL, cfo_to_gr REAL, tangible_ratio REAL, "
             "PRIMARY KEY (symbol, stat_date))"
         )
         conn.execute("CREATE TABLE IF NOT EXISTS fund_flow (symbol TEXT, date TEXT, main_net REAL, main_pct REAL, super_net REAL, big_net REAL)")

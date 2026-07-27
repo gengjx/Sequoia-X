@@ -965,7 +965,8 @@ class PaperReplayEngine:
         result = {}
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni "
+                "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
+                "cfo_to_or, cfo_to_np "
                 "FROM stock_finance ORDER BY stat_date DESC"
             ).fetchall()
             seen = set()
@@ -974,7 +975,8 @@ class PaperReplayEngine:
                     continue
                 seen.add(r[0])
                 result[r[0]] = {"roe": r[1], "np_margin": r[2], "gp_margin": r[3],
-                                "rev_growth": r[4], "profit_growth": r[5]}
+                                "rev_growth": r[4], "profit_growth": r[5],
+                                "cfo_to_or": r[6], "cfo_to_np": r[7]}
         return result
 
     def _load_state_weights(self) -> dict[str, dict[str, float]]:

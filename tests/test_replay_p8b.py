@@ -40,10 +40,11 @@ def _make_pit_db(tmp_path: Path) -> str:
             "CREATE TABLE IF NOT EXISTS stock_finance "
             "(symbol TEXT, stat_date TEXT, roe REAL, np_margin REAL, gp_margin REAL, "
             "yoy_eps REAL, yoy_pni REAL, yoy_ni REAL, asset_turn REAL, inv_turn REAL, nr_turn REAL, "
+            "cfo_to_or REAL, cfo_to_np REAL, cfo_to_gr REAL, tangible_ratio REAL, "
             "PRIMARY KEY (symbol, stat_date))"
         )
-        conn.execute("INSERT INTO stock_finance VALUES ('000001','2021-12-31',8.0,0,0,0,0,0,0,0,0)")
-        conn.execute("INSERT INTO stock_finance VALUES ('000001','2026-01-31',30.0,0,0,0,0,0,0,0,0)")
+        conn.execute("INSERT INTO stock_finance VALUES ('000001','2021-12-31',8.0,0,0,0,0,0,0,0,0,0,0,0,0)")
+        conn.execute("INSERT INTO stock_finance VALUES ('000001','2026-01-31',30.0,0,0,0,0,0,0,0,0,0,0,0,0)")
 
         # 沪深300指数（构造已知收益率序列）
         for i in range(80):

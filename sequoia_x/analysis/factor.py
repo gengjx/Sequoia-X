@@ -100,6 +100,8 @@ FACTOR_META: dict[str, dict] = {
     "gp_margin":   {"category": "质量", "desc": "毛利率"},
     "rev_growth":  {"category": "质量", "desc": "营收增速"},
     "profit_growth":{"category": "质量", "desc": "利润增速"},
+    "cfo_yield":   {"category": "盈利质量", "desc": "经营现金流/营收（现金收益率，高=盈利扎实）"},
+    "earnings_quality": {"category": "盈利质量", "desc": "经营现金流/净利润（盈余质量，高=真实盈利）"},
     # ── 成长(1)（同比增长率，来自stock_finance）──
     "yoy_ni":      {"category": "成长", "desc": "净利润同比增长率"},
     # ── 估值(2) ──
@@ -342,9 +344,13 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         factors["asset_turn"] = _safe_float(finance.get("asset_turn"))
         factors["inv_turn"] = _safe_float(finance.get("inv_turn"))
         factors["nr_turn"] = _safe_float(finance.get("nr_turn"))
+        # 盈利质量（现金流比率，P15）
+        factors["cfo_yield"] = _safe_float(finance.get("cfo_to_or"))      # 经营现金流/营收
+        factors["earnings_quality"] = _safe_float(finance.get("cfo_to_np"))  # 经营现金流/净利润
     else:
         for k in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
-                  "yoy_ni", "asset_turn", "inv_turn", "nr_turn"]:
+                  "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
+                  "cfo_yield", "earnings_quality"]:
             factors[k] = np.nan
 
     # ════════ 北向资金(2)（沪深港通持股）════════
@@ -782,7 +788,8 @@ def evaluate_factor_ic(
     # 加载质量因子的月度截面（按财报季度月份匹配）
     # stat_date 格式 YYYY-MM-DD，取 YYYY-MM 作为截面月份
     quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
-                       "yoy_ni", "asset_turn", "inv_turn", "nr_turn"}
+                       "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
+                       "cfo_yield", "earnings_quality"}
     valuation_factors = {"pe_ratio", "pb_ratio"}
     # 因子名 → stock_finance 字段名映射（IC评估逐月取截面值用）
     _finance_field_map = {
@@ -790,6 +797,7 @@ def evaluate_factor_ic(
         "rev_growth": "yoy_eps", "profit_growth": "yoy_pni",
         "yoy_ni": "yoy_ni", "asset_turn": "asset_turn",
         "inv_turn": "inv_turn", "nr_turn": "nr_turn",
+        "cfo_yield": "cfo_to_or", "earnings_quality": "cfo_to_np",
     }
     has_quality = bool(set(factor_set) & quality_factors)
     has_valuation = bool(set(factor_set) & valuation_factors)
@@ -800,7 +808,7 @@ def evaluate_factor_ic(
             with _sq.connect(engine.db_path) as _conn:
                 _rows = _conn.execute(
                     """SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
-                              yoy_ni, asset_turn, inv_turn, nr_turn
+                              yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np
                        FROM stock_finance ORDER BY symbol, stat_date"""
                 ).fetchall()
             for r in _rows:
@@ -808,6 +816,7 @@ def evaluate_factor_ic(
                     "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
                     "yoy_eps": r[5], "yoy_pni": r[6],
                     "yoy_ni": r[7], "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
+                    "cfo_to_or": r[11], "cfo_to_np": r[12],
                 }))
             logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
         except Exception as e:
