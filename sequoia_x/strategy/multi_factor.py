@@ -651,7 +651,11 @@ class MultiFactorStrategy(BaseStrategy):
             with sqlite3.connect(self.engine.db_path) as conn:
                 rows = conn.execute(
                     "SELECT symbol, holder_num, holder_change, avg_value FROM holder_count "
-                    "WHERE end_date=(SELECT MAX(end_date) FROM holder_count)"
+                    "WHERE end_date=(SELECT MAX(end_date) FROM ("
+                    "SELECT end_date, COUNT(DISTINCT symbol) as cnt "
+                    "FROM holder_count WHERE end_date LIKE '%-03-31' "
+                    "OR end_date LIKE '%-06-30' OR end_date LIKE '%-09-30' "
+                    "OR end_date LIKE '%-12-31' GROUP BY end_date HAVING cnt > 100))"
                 ).fetchall()
             return {r[0]: {"holder_num": r[1], "holder_change": r[2], "avg_value": r[3]}
                     for r in rows}

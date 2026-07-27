@@ -961,7 +961,7 @@ def evaluate_factor_ic(
             with _sq9.connect(engine.db_path) as _conn9:
                 _hd_rows = _conn9.execute(
                     "SELECT symbol, end_date, holder_num, holder_change, avg_value "
-                    "FROM holder_count ORDER BY symbol, end_date"
+                    "FROM holder_count WHERE end_date LIKE '%-03-31' OR end_date LIKE '%-06-30' OR end_date LIKE '%-09-30' OR end_date LIKE '%-12-31' ORDER BY symbol, end_date"
                 ).fetchall()
             for r in _hd_rows:
                 holder_map.setdefault(r[0], []).append((r[1], {
