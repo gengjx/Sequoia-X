@@ -540,7 +540,7 @@ class PositionTracker:
             if price > 0:
                 realtime_map[sym] = price
 
-        signals = self.scan_all(realtime_map=realtime_map)
+        signals = self.scan_all(apply_stop_move=True, realtime_map=realtime_map)
 
         # 推送新信号（节流：同票同action 30分钟内不重复）
         if notifier:

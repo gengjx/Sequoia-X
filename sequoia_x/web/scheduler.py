@@ -690,8 +690,36 @@ class AuctionScheduler:
             services = WebServices(settings, data_engine)
             notifier = FeishuNotifier(settings)
 
-            # Step1: 持仓扫描 → 自动卖出
-            pos_result = services.scan_positions(apply_stop_move=False)
+            # Step1: 持仓扫描 → 自动卖出（启用止损写回：ATR收紧次日生效）
+            pos_result = services.scan_positions(apply_stop_move=True)
+
+            # Step1.5: 止损收敛兜底 — 过宽止损(>12%)按 ATR(2.5×, 封顶8-15%)重算写回
+            try:
+                from sequoia_x.analysis.stop_loss import calc_atr_stop
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    wide_rows = conn.execute(
+                        "SELECT id, symbol, entry_price, stop_loss FROM paper_holdings "
+                        "WHERE shares > 0 AND entry_price > 0 AND stop_loss > 0 "
+                        "AND (entry_price - stop_loss) / entry_price > 0.12"
+                    ).fetchall()
+                converged = 0
+                for row in wide_rows:
+                    df = data_engine.get_ohlcv(row["symbol"])
+                    atr_stop = calc_atr_stop(df, row["entry_price"])
+                    if atr_stop > row["stop_loss"]:
+                        with sqlite3.connect(self.db_path) as conn:
+                            conn.execute(
+                                "UPDATE paper_holdings SET stop_loss=? WHERE id=?",
+                                (round(atr_stop, 2), row["id"]),
+                            )
+                            conn.commit()
+                        converged += 1
+                if converged:
+                    logger.info(f"止损收敛兜底：{converged} 只过宽持仓按 ATR 收紧至 ≤15%")
+            except Exception as e:
+                logger.warning(f"止损收敛兜底失败：{e!r}")
+
             sell_result = services.paper_auto_sell(pos_result.get("signals", []))
 
             # Step2: 多因子为核心的决策（废弃策略已自动排除）
