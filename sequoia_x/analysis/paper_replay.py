@@ -308,6 +308,8 @@ class PaperReplayEngine:
                         ok, risk_reason = self._check_buy_risk(
                             sym, risk_amt, positions, today_prices,
                             self._beta_cache or {}, self._industry_cache or {},
+                            today=today,
+                            unlock_avoidance=getattr(self, "_unlock_avoidance", None),
                         )
                         if not ok:
                             trades.append(ReplayTrade(
@@ -535,12 +537,22 @@ class PaperReplayEngine:
             except Exception:
                 pass
         logger.info(f"风控预计算完成：beta {len(self._beta_cache)} 只，行业 {len(self._industry_cache)} 只")
+        # 解禁回避过滤器（P14：预加载全部历史大额解禁，回测PIT用）
+        try:
+            from sequoia_x.analysis.portfolio_risk import UnlockAvoidance
+            self._unlock_avoidance = UnlockAvoidance(self.db_path)
+            logger.info(f"解禁回避预加载：{len(self._unlock_avoidance._events)} 只大额解禁股")
+        except Exception as e:
+            self._unlock_avoidance = None
+            logger.debug(f"解禁回避加载失败（表可能不存在）：{e!r}")
 
     @staticmethod
     def _check_buy_risk(
         sym: str, buy_amount: float,
         positions: list, today_prices: dict,
         beta_cache: dict, industry_cache: dict,
+        today: str = "",
+        unlock_avoidance=None,
     ) -> tuple[bool, str]:
         """增量式组合风控单股检查（O(1)）：加这只股后组合 Beta/HHI/行业是否超限。
 
@@ -594,6 +606,10 @@ class PaperReplayEngine:
             ind_pct = (ind_value + buy_amount) / total_after
             if ind_pct > IND_DANGER:
                 return False, f"组合风控拦截：{ind}行业占比{ind_pct*100:.0f}%>{IND_DANGER*100:.0f}%"
+
+        # 解禁回避（P14）：未来30天有大额解禁(>20%)则跳过
+        if unlock_avoidance and today and unlock_avoidance.should_avoid(sym, today):
+            return False, "解禁回避：未来30天大额解禁"
 
         return True, ""
 

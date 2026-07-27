@@ -469,3 +469,69 @@ class PortfolioRiskMonitor:
             return np.array([])
         rets = np.array([r[1] / 100 for r in reversed(rows)])
         return rets
+
+
+class UnlockAvoidance:
+    """解禁回避风控过滤器。
+
+    检查个股未来 N 天内是否有大额解禁（占流通市值 > threshold），
+    有则拦截买入（回避供给冲击风险）。
+
+    解禁日期是公司公告的未来事件（非预测），as_of 日已知，无前视问题。
+    """
+
+    LOOKFORWARD_DAYS = 30
+    RATIO_THRESHOLD = 0.20  # 解禁占比 > 20% 才拦截（p90量级）
+
+    def __init__(self, db_path: str, lookforward_days: int | None = None,
+                 ratio_threshold: float | None = None) -> None:
+        self.db_path = db_path
+        self.lookforward_days = lookforward_days or self.LOOKFORWARD_DAYS
+        self.ratio_threshold = ratio_threshold if ratio_threshold is not None else self.RATIO_THRESHOLD
+        # 预加载全部大额解禁事件（symbol -> [(release_date, ratio)]，按日期排序）
+        self._events: dict[str, list[tuple[str, float]]] = self._load_events()
+
+    def _load_events(self) -> dict[str, list[tuple[str, float]]]:
+        """加载全部大额解禁事件（ratio > threshold），按 release_date 排序。"""
+        import sqlite3 as _sq
+        events: dict[str, list[tuple[str, float]]] = {}
+        try:
+            with _sq.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT symbol, release_date, unlock_ratio FROM restricted_release "
+                    "WHERE unlock_ratio > ? ORDER BY symbol, release_date",
+                    (self.ratio_threshold,),
+                ).fetchall()
+            for r in rows:
+                events.setdefault(r[0], []).append((r[1], r[2]))
+        except Exception:
+            pass
+        return events
+
+    def should_avoid(self, symbol: str, as_of_date: str) -> bool:
+        """检查该股在 [as_of_date, as_of_date + lookforward_days] 内是否有大额解禁。
+
+        PIT 正确：只查 release_date >= as_of_date（解禁前的供给冲击预期），
+        不查已过去的解禁（冲击已释放）。
+
+        Args:
+            symbol: 股票代码
+            as_of_date: PIT 截止日期 YYYY-MM-DD
+
+        Returns:
+            True=应回避（有大额解禁），False=可买
+        """
+        import datetime as _dt
+        evs = self._events.get(symbol)
+        if not evs:
+            return False
+        try:
+            ref = _dt.datetime.strptime(as_of_date, "%Y-%m-%d")
+            deadline = (ref + _dt.timedelta(days=self.lookforward_days)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return False
+        # 查 release_date ∈ [as_of_date, deadline]
+        for release_date, _ratio in evs:
+            if as_of_date <= release_date <= deadline:
+                return True
+        return False

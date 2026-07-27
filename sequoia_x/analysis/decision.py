@@ -371,6 +371,26 @@ class DecisionEngine:
         except Exception as e:
             logger.warning(f"组合风控检查跳过（不影响决策）：{e!r}")
 
+        # 解禁回避（P14）：未来30天有大额解禁(>20%)的个股降级为观望
+        try:
+            from sequoia_x.analysis.portfolio_risk import UnlockAvoidance
+            import datetime as _udt
+            _ua = UnlockAvoidance(self.engine.db_path)
+            _today = _udt.datetime.now().strftime("%Y-%m-%d")
+            _unlock_demoted = [i for i in buy_list if _ua.should_avoid(i.symbol, _today)]
+            for i in _unlock_demoted:
+                i.grade = "观望"
+                i.action = "观望"
+                i.reason = "解禁回避：未来30天大额解禁（占流通市值>20%），回避供给冲击"
+                i.shares = 0
+                i.capital = 0
+                buy_list.remove(i)
+                reject_list.insert(0, i)
+            if _unlock_demoted:
+                logger.info(f"解禁回避：降级 {len(_unlock_demoted)} 只（未来30天大额解禁）")
+        except Exception as e:
+            logger.warning(f"解禁回避检查跳过（不影响决策）：{e!r}")
+
         # 微仓过滤：无法建整手、或不足最小仓位门槛（3手/¥3000）的降级为观望
         def _is_too_small(i: DecisionItem) -> bool:
             if i.shares == 0:
