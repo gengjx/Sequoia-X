@@ -27,6 +27,7 @@ class AuctionScheduler:
 
     # 定时任务表：(hour, minute, task_name)
     SCHEDULE = [
+        (0, 15, "backfill_offline"),  # 凌晨baostock额度恢复后离线回补（现金流+缺失财报）
         (9, 25, "auction_scan"),
         (9, 30, "intraday_scan_start"),  # 启动盘中持仓监控
         (21, 0, "sync_daily"),       # 避开baostock盘后高峰(18-21点拥堵)
@@ -237,6 +238,8 @@ class AuctionScheduler:
             self._daily_report()
         elif task == "monthly_sweep":
             self._monthly_sweep()
+        elif task == "backfill_offline":
+            self._backfill_offline()
 
     def _run_task_with_result(self, task: str) -> str:
         """执行任务并返回结果摘要（供日志记录）。"""
@@ -268,6 +271,32 @@ class AuctionScheduler:
             logger.info(f"定时数据同步完成：写入 {n} 只")
         except Exception as e:
             logger.warning(f"定时数据同步失败：{e!r}")
+
+    def _backfill_offline(self) -> None:
+        """凌晨离线回补：baostock 额度恢复后自动跑（00:15 触发）。
+
+        优先级1：现金流比率回补（P15，每行1次调用，最高性价比）
+        优先级2：缺失财报股票补全（剩余额度）
+        每个工作日凌晨跑一批，连续几天补完。
+        补完后自动跳过（无 NULL 行 / 无缺失股），零开销。
+        """
+        try:
+            from sequoia_x.data.finance_sync import backfill_cash_flow
+            result = backfill_cash_flow(settings=self.settings)
+            logger.info(f"现金流回补完成：{result}")
+            if result.get("rate_limited"):
+                return  # 额度耗尽，不跑步骤2（省额度给高优先级）
+        except Exception as e:
+            logger.warning(f"现金流回补失败：{e!r}")
+            return
+
+        try:
+            from sequoia_x.data.finance_sync import FinanceSync
+            syncer = FinanceSync(self.settings)
+            result = syncer.sync_all(n_quarters=20, max_stocks=300)
+            logger.info(f"财报缺失股补全完成：{result}")
+        except Exception as e:
+            logger.warning(f"财报缺失股补全失败：{e!r}")
 
     def _sync_lhb(self) -> None:
         """龙虎榜数据自动同步（日K同步后执行）。"""
@@ -361,6 +390,7 @@ class AuctionScheduler:
             name_map = {
                 "auction_scan": "竞价扫描",
                 "intraday_scan_start": "盘中持仓监控",
+                "backfill_offline": "离线数据回补",
                 "sync_daily": "日K同步",
                 "sync_lhb": "龙虎榜同步",
                 "sync_fund_flow": "资金流向同步",
