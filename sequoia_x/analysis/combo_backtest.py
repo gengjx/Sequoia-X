@@ -604,3 +604,46 @@ class ComboBacktester:
                     **ic,
                 })
         return out
+
+    def compute_strategy_marginal(
+        self, hold_days: int = 20, sample_size: int = 500, seed: int = 42,
+    ) -> dict[str, dict]:
+        """计算每个策略的增量 alpha（年化贡献 pp）。
+
+        增量 alpha = 该策略触发样本的净收益均值 - 全策略池均值，
+        转年化 = ×（252/hold_days）。
+
+        与 _strategy_panel_ic 的区别：后者只看 Spearman 秩相关方向，
+        本方法给出实际收益贡献（pp），可直接用于"该策略值不值得保留"决策。
+
+        Returns:
+            {strategy_key: {marginal_alpha_pp, sample_count, strategy_avg, pool_avg}}
+        """
+        collected = self._collect_returns([hold_days], sample_size, seed)
+        strategy_returns = collected["returns"]
+
+        all_nets: list[float] = []
+        for skey in SIGNAL_FUNCS:
+            all_nets.extend(strategy_returns.get(skey, {}).get(hold_days, ([], []))[0])
+
+        pool_avg = float(np.mean(all_nets)) if all_nets else 0.0
+        annualize = 252.0 / hold_days
+
+        result: dict[str, dict] = {}
+        for skey in SIGNAL_FUNCS:
+            nets = strategy_returns.get(skey, {}).get(hold_days, ([], []))[0]
+            if len(nets) < 10:
+                continue
+            strat_avg = float(np.mean(nets))
+            marginal = (strat_avg - pool_avg) * annualize * 100  # 转年化 pp
+            result[skey] = {
+                "marginal_alpha_pp": round(marginal, 2),
+                "sample_count": len(nets),
+                "strategy_avg_pct": round(strat_avg * 100, 3),
+                "pool_avg_pct": round(pool_avg * 100, 3),
+            }
+        logger.info(
+            f"策略增量贡献计算完成：{len(result)}个策略，"
+            f"池均值{pool_avg*100:.3f}%/{hold_days}天"
+        )
+        return result

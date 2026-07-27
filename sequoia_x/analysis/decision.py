@@ -165,6 +165,7 @@ class DecisionEngine:
     def __init__(self, engine: DataEngine, settings: Settings) -> None:
         self.engine = engine
         self.settings = settings
+        self._strategy_marginal: dict[str, float] = {}
         self._load_weights()
 
     def _load_weights(self) -> None:
@@ -178,8 +179,12 @@ class DecisionEngine:
             if db_weights:
                 for key, w in db_weights.items():
                     STRATEGY_QUALITY[key] = w["quality_score"]
+                    ma = w.get("marginal_alpha", 0)
+                    if ma:
+                        self._strategy_marginal[key] = float(ma)
                 logger.info(
                     f"策略权重已从DB加载（{len(db_weights)}个策略，"
+                    f"边际alpha {len(self._strategy_marginal)}个，"
                     f"最近更新：{next(iter(db_weights.values())).get('updated_at', '?')}）"
                 )
         except Exception as e:
@@ -553,6 +558,23 @@ class DecisionEngine:
 
         q_str = f"（质量加成{q_bonus:+d}，有效{es}）" if q_bonus else ""
 
+        # 弱信号标注：仅由负 marginal_alpha 策略触发（multi_factor 未命中）
+        weak_label = ""
+        if self._strategy_marginal:
+            from sequoia_x.strategy.registry import STRATEGY_META as _SM
+            _cn_map = {meta.get("name_cn", k): k for k, meta in _SM.items()}
+            _hit_keys = [_cn_map.get(s, s) for s in item.hit_strategies]
+            _has_positive = any(
+                self._strategy_marginal.get(k, 0) > 0 for k in _hit_keys
+            )
+            if not _has_positive and _hit_keys:
+                _weakest = min(_hit_keys, key=lambda k: self._strategy_marginal.get(k, 0))
+                _ma = self._strategy_marginal.get(_weakest, 0)
+                _weak_cn = next(
+                    (s for s, k in _cn_map.items() if k == _weakest), _weakest
+                )
+                weak_label = f"⚠️ 弱信号主导：{_weak_cn}边际alpha={_ma:+.1f}pp"
+
         # 3+共振：过热风险，降级处理
         if r >= 3:
             item.grade = "淘汰"
@@ -563,22 +585,32 @@ class DecisionEngine:
         if r == 1 and es >= t_hi:
             item.grade = "A"
             item.reason = f"单策略+有效评分{es}{q_str}，重点参与"
+            if weak_label:
+                item.reason += f" {weak_label}"
             item.position_pct = self.GRADE_POSITION["A"][0]
         elif r == 2 and es >= t_hi:
             item.grade = "B"
             item.reason = f"{r}策略共振+有效评分{es}{q_str}，趋势确认"
+            if weak_label:
+                item.reason += f" {weak_label}"
             item.position_pct = self.GRADE_POSITION["B"][0]
         elif es >= t_hi:
             item.grade = "B"
             item.reason = f"有效评分{es}{q_str}达标，可逢低建仓"
+            if weak_label:
+                item.reason += f" {weak_label}"
             item.position_pct = self.GRADE_POSITION["B"][0]
         elif es >= t_low:
             item.grade = "C"
             item.reason = f"有效评分{es}{q_str}中性，小仓试探"
+            if weak_label:
+                item.reason += f" {weak_label}"
             item.position_pct = self.GRADE_POSITION["C"][0]
         else:
             item.grade = "淘汰"
             item.reject_reason = f"有效评分{es}<{t_low}（{market_state}市场门槛）{q_str}"
+            if weak_label:
+                item.reason = weak_label
             return
         item.action = {"A": "重点买入", "B": "逢低建仓", "C": "小仓试探/观望"}.get(item.grade, "")
 
@@ -649,9 +681,15 @@ class DecisionEngine:
                 return float((vals <= m).sum() / len(vals) * 100)
 
             scored = {}
+            _SCALE = 10.0
+            _has_marginal = bool(self._strategy_marginal)
             for sym, strats in pool.items():
-                # 策略质量bonus：(质量分-40)/3，高质量正加权，低质量负加权
-                q_bonus = sum((STRATEGY_QUALITY.get(st, 40) - 40) / 3 for st in strats)
+                if _has_marginal:
+                    q_bonus = sum(
+                        self._strategy_marginal.get(st, 0) / _SCALE for st in strats
+                    )
+                else:
+                    q_bonus = sum((STRATEGY_QUALITY.get(st, 40) - 40) / 3 for st in strats)
                 scored[sym] = _pctile(all_mom.get(sym, 0)) + q_bonus
             ranked = sorted(pool.keys(), key=lambda x: -scored.get(x, -999))[:n]
             return {k: pool[k] for k in ranked}

@@ -414,6 +414,55 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"月度归因失败（不影响其他任务）：{e!r}")
 
+        # 策略增量贡献计算（月度）→ 写 strategy_weights.marginal_alpha + 飞书通知
+        try:
+            from sequoia_x.analysis.combo_backtest import ComboBacktester
+            from sequoia_x.data.engine import DataEngine
+            cb_engine = DataEngine(self.settings)
+            cb = ComboBacktester(cb_engine, self.settings)
+            marginal = cb.compute_strategy_marginal(hold_days=20, sample_size=500)
+            if marginal:
+                # 写入 DB（在现有 strategy_weights 行上更新 marginal_alpha 列）
+                import sqlite3 as _sql3
+                import time as _time_mod
+                now_str = _time_mod.strftime("%Y-%m-%d %H:%M:%S")
+                with _sql3.connect(self.db_path) as conn:
+                    for skey, info in marginal.items():
+                        conn.execute(
+                            "UPDATE strategy_weights SET marginal_alpha=?, updated_at=? "
+                            "WHERE strategy_key=?",
+                            (info["marginal_alpha_pp"], now_str, skey),
+                        )
+                        if conn.total_changes == 0:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO strategy_weights "
+                                "(strategy_key, quality_score, marginal_alpha, updated_at) "
+                                "VALUES (?, 0, ?, ?)",
+                                (skey, info["marginal_alpha_pp"], now_str),
+                            )
+                    conn.commit()
+
+                # 飞书通知（按 marginal_alpha 降序前5）
+                _labels = {
+                    "multi_factor": "多因子", "bottom": "底部放量", "flag": "高位旗形",
+                    "ma_volume": "均线放量", "pullback": "缩量回踩", "volume_extreme": "地量见底",
+                    "turtle": "海龟突破", "shakeout": "涨停洗盘", "limit_down": "上升趋势跌停",
+                    "dragon": "板块龙头", "rps": "RPS强势", "lhb_follow": "龙虎榜跟买",
+                    "sector_rotation": "板块轮动",
+                }
+                top5 = sorted(marginal.items(), key=lambda x: -x[1]["marginal_alpha_pp"])[:5]
+                parts = [
+                    f"{_labels.get(k, k)}({v['marginal_alpha_pp']:+.1f}pp)"
+                    for k, v in top5
+                ]
+                from sequoia_x.notify.feishu import FeishuNotifier as _FN2
+                _FN2(self.settings).send(
+                    "📈 策略增量贡献\n" + " ".join(parts)
+                )
+                logger.info(f"月度策略增量贡献完成：{len(marginal)}个策略")
+        except Exception as e:
+            logger.warning(f"月度策略增量贡献失败（不影响其他任务）：{e!r}")
+
     def _daily_report(self) -> str:
         """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
         from sequoia_x.notify.feishu import FeishuNotifier

@@ -491,10 +491,11 @@ class DataEngine:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         # oos_decay 列迁移（幂等）：样本外衰减率，默认1.0=完全延续
         self._ensure_column("strategy_weights", "oos_decay", "REAL DEFAULT 1.0")
+        self._ensure_column("strategy_weights", "marginal_alpha", "REAL DEFAULT 0")
         sql = ("INSERT OR REPLACE INTO strategy_weights "
                "(strategy_key, quality_score, sharpe, max_dd, alpha, calmar, "
-               "win_rate, pl_ratio, annual_return, sample_trades, oos_decay, updated_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+               "win_rate, pl_ratio, annual_return, sample_trades, oos_decay, marginal_alpha, updated_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
         with sqlite3.connect(self.db_path) as conn:
             for w in weights:
                 conn.execute(sql, (
@@ -502,14 +503,15 @@ class DataEngine:
                     w.get("sharpe", 0), w.get("max_dd", 0), w.get("alpha", 0),
                     w.get("calmar", 0), w.get("win_rate", 0), w.get("pl_ratio", 0),
                     w.get("annual_return", 0), w.get("sample_trades", 0),
-                    w.get("oos_decay", 1.0), now,
+                    w.get("oos_decay", 1.0), w.get("marginal_alpha", 0), now,
                 ))
             conn.commit()
 
     def load_strategy_weights(self) -> dict[str, dict]:
         """读取全部策略权重，返回 {strategy_key: {quality_score, ...}}。"""
+        self._ensure_column("strategy_weights", "marginal_alpha", "REAL DEFAULT 0")
         sql = ("SELECT strategy_key, quality_score, sharpe, max_dd, alpha, "
-               "calmar, win_rate, pl_ratio, annual_return, sample_trades, updated_at "
+               "calmar, win_rate, pl_ratio, annual_return, sample_trades, marginal_alpha, updated_at "
                "FROM strategy_weights")
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(sql).fetchall()
@@ -517,7 +519,8 @@ class DataEngine:
             r[0]: {
                 "quality_score": r[1], "sharpe": r[2], "max_dd": r[3], "alpha": r[4],
                 "calmar": r[5], "win_rate": r[6], "pl_ratio": r[7],
-                "annual_return": r[8], "sample_trades": r[9], "updated_at": r[10],
+                "annual_return": r[8], "sample_trades": r[9], "marginal_alpha": r[10],
+                "updated_at": r[11],
             }
             for r in rows
         }
