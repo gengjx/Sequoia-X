@@ -134,7 +134,8 @@ class FinanceSync:
         self.db_path = self.settings.db_path
 
     def sync_all(self, n_quarters: int = 6, n_workers: int = 3,
-                 batch_size: int = 50, max_stocks: int | None = None) -> dict:
+                 batch_size: int = 50, max_stocks: int | None = None,
+                 deep_sync: bool = False) -> dict:
         """全量采集财报。
 
         Args:
@@ -142,6 +143,9 @@ class FinanceSync:
             n_workers: 并行进程数
             batch_size: 每个 worker 分多少只股票
             max_stocks: 最多采几只（None=全部）
+            deep_sync: 增量补深模式——除完全缺失外，也采集
+                季度数 < n_quarters 的股票（INSERT OR REPLACE 自动补缺，
+                不删除已有数据）
 
         Returns:
             {total, fetched, skipped, failed, elapsed}
@@ -179,7 +183,20 @@ class FinanceSync:
                 "SELECT DISTINCT symbol FROM stock_finance"
             ).fetchall()}
 
-        missing = [s for s in all_symbols if s not in have]
+        if deep_sync:
+            # 增量补深：完全缺失 + 季度数不足的股票都纳入采集
+            # INSERT OR REPLACE 天然补缺，绝不删除已有数据
+            with sqlite3.connect(self.db_path) as conn:
+                thin = {r[0] for r in conn.execute(
+                    "SELECT symbol FROM stock_finance GROUP BY symbol "
+                    "HAVING COUNT(*) < ?",
+                    (n_quarters,),
+                ).fetchall()}
+            missing = sorted(
+                (s for s in all_symbols if s not in have or s in thin)
+            )
+        else:
+            missing = [s for s in all_symbols if s not in have]
 
         # ── baostock 额度预算保护 ──
         # 每只股票 = n_quarters 季度 × 4 类财报(profit/growth/operation/cashflow)
