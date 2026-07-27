@@ -882,12 +882,19 @@ class MultiFactorStrategy(BaseStrategy):
                     "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
                     "yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np "
                     "FROM stock_finance WHERE symbol IN ({}) "
-                    "AND stat_date = (SELECT MAX(stat_date) FROM stock_finance f2 WHERE f2.symbol = stock_finance.symbol)".format(
+                    "AND stat_date = (SELECT MAX(stat_date) FROM stock_finance f2 "
+                    "WHERE f2.symbol = stock_finance.symbol "
+                    "AND (f2.stat_date LIKE '%%-03-31' OR f2.stat_date LIKE '%%-06-30' "
+                    "OR f2.stat_date LIKE '%%-09-30' OR f2.stat_date LIKE '%%-12-31'))".format(
                         ",".join("?" * len(symbols))
                     ) if len(symbols) <= 900 else
                     "SELECT symbol, roe, np_margin, gp_margin, yoy_eps, yoy_pni, "
                     "yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np "
-                    "FROM stock_finance WHERE stat_date IN (SELECT MAX(stat_date) FROM stock_finance)",
+                    "FROM stock_finance WHERE stat_date IN (SELECT MAX(stat_date) "
+                    "FROM (SELECT stat_date, COUNT(DISTINCT symbol) as cnt "
+                    "FROM stock_finance WHERE stat_date LIKE '%%-03-31' "
+                    "OR stat_date LIKE '%%-06-30' OR stat_date LIKE '%%-09-30' "
+                    "OR stat_date LIKE '%%-12-31' GROUP BY stat_date HAVING cnt > 100))",
                     symbols if len(symbols) <= 900 else []
                 ).fetchall()
                 for r in rows:

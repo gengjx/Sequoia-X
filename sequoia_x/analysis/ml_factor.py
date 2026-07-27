@@ -551,7 +551,11 @@ class MLFactorEngine:
     def _load_finance_map(self, conn) -> dict:
         rows = conn.execute(
             "SELECT * FROM stock_finance "
-            "WHERE stat_date = (SELECT MAX(stat_date) FROM stock_finance)"
+            "WHERE stat_date = (SELECT MAX(stat_date) FROM ("
+            "SELECT stat_date, COUNT(DISTINCT symbol) as cnt "
+            "FROM stock_finance WHERE stat_date LIKE '%-03-31' "
+            "OR stat_date LIKE '%-06-30' OR stat_date LIKE '%-09-30' "
+            "OR stat_date LIKE '%-12-31' GROUP BY stat_date HAVING cnt > 100))"
         ).fetchall()
         cols = [d[0] for d in conn.execute(
             "SELECT * FROM stock_finance LIMIT 1"

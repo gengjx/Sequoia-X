@@ -816,7 +816,7 @@ def evaluate_factor_ic(
                 _rows = _conn.execute(
                     """SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
                               yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np
-                       FROM stock_finance ORDER BY symbol, stat_date"""
+                       FROM stock_finance WHERE stat_date LIKE '%-03-31' OR stat_date LIKE '%-06-30' OR stat_date LIKE '%-09-30' OR stat_date LIKE '%-12-31' ORDER BY symbol, stat_date"""
                 ).fetchall()
             for r in _rows:
                 finance_map.setdefault(r[0], []).append((r[1], {

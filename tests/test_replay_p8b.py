@@ -44,7 +44,7 @@ def _make_pit_db(tmp_path: Path) -> str:
             "PRIMARY KEY (symbol, stat_date))"
         )
         conn.execute("INSERT INTO stock_finance VALUES ('000001','2021-12-31',8.0,0,0,0,0,0,0,0,0,0,0,0,0)")
-        conn.execute("INSERT INTO stock_finance VALUES ('000001','2026-01-31',30.0,0,0,0,0,0,0,0,0,0,0,0,0)")
+        conn.execute("INSERT INTO stock_finance VALUES ('000001','2025-12-31',30.0,0,0,0,0,0,0,0,0,0,0,0,0)")
 
         # 沪深300指数（构造已知收益率序列）
         for i in range(80):
