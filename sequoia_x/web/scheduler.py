@@ -823,7 +823,7 @@ class AuctionScheduler:
                 if _wl_parts:
                     summary += f"\n⚠️ 因子健康度：{' '.join(_wl_parts)} [{len(_wl_parts)}源降级]"
             try:
-                notifier.send_text(summary)
+                notifier.send_text("模拟盘日报", summary)
             except Exception as e:
                 logger.warning(f"飞书日报推送失败：{e!r}")
 
