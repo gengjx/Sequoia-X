@@ -47,6 +47,25 @@ def _sf(v) -> float | None:
         return None
 
 
+# ── akshare 东财财报摘要 → stock_finance 字段映射 ──
+# 键=(选项,指标)，值=(目标列名, 除数)。除数 100=百分数转小数，1=原值。
+_AK_MAP: dict[tuple[str, str], tuple[str, float]] = {
+    ("盈利能力", "净资产收益率(ROE)"): ("roe", 100.0),
+    ("盈利能力", "销售净利率"): ("np_margin", 100.0),
+    ("盈利能力", "毛利率"): ("gp_margin", 100.0),
+    ("常用指标", "归母净利润"): ("net_profit", 1.0),
+    ("每股指标", "基本每股收益"): ("eps_ttm", 1.0),
+    ("常用指标", "营业总收入"): ("revenue", 1.0),
+    ("成长能力", "归属母公司净利润增长率"): ("yoy_ni", 100.0),
+    ("成长能力", "营业总收入增长率"): ("yoy_eps", 100.0),
+    ("营运能力", "总资产周转率"): ("asset_turn", 1.0),
+    ("营运能力", "存货周转率"): ("inv_turn", 1.0),
+    ("营运能力", "应收账款周转率"): ("nr_turn", 1.0),
+    ("收益质量", "经营性现金净流量/营业总收入"): ("cfo_to_or", 1.0),
+    ("收益质量", "经营活动净现金/归属母公司的净利润"): ("cfo_to_np", 1.0),
+}
+
+
 # 多进程 worker
 def _fetch_batch(args: tuple) -> list[dict]:
     """worker：独立 login，批量采集一批股票的财报。"""
@@ -294,6 +313,140 @@ class FinanceSync:
             "coverage": final_count,
             "coverage_pct": round(final_count / len(all_symbols) * 100, 1),
             "failed": len(missing) - (final_count - (len(all_symbols) - len(missing))),
+            "elapsed": round(elapsed, 0),
+        }
+
+    # ── akshare 路径（不依赖 baostock 额度，天然增量补缺）──
+    def collect_one_akshare(self, symbol: str, n_quarters: int = 20) -> int:
+        """用 akshare 东财财报摘要采集单只股票，INSERT OR REPLACE 写入。
+
+        不依赖 baostock 额度；天然增量补缺（不删除已有数据）。
+        返回写入的季度数。
+        """
+        import re
+
+        import akshare as ak
+
+        try:
+            df = ak.stock_financial_abstract(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"akshare 财报采集失败 {symbol}: {e!r}")
+            return 0
+        if df is None or df.empty or "指标" not in df.columns:
+            return 0
+
+        period_cols = [
+            c for c in df.columns
+            if c not in ("选项", "指标") and re.match(r"^\d{8}$", str(c))
+        ]
+        if not period_cols:
+            return 0
+        period_cols = sorted(period_cols, reverse=True)[:n_quarters]
+
+        # 构建 (选项,指标) → 行，去重保留首个（常见指标与分类指标重复）
+        lookup: dict[tuple[str, str], object] = {}
+        for _, row in df.iterrows():
+            key = (str(row.get("选项", "")), str(row.get("指标", "")))
+            if key not in lookup:
+                lookup[key] = row
+
+        records: list[dict] = []
+        for col in period_cols:
+            stat_date = f"{col[:4]}-{col[4:6]}-{col[6:]}"
+            rec: dict = {"symbol": symbol, "stat_date": stat_date, "report_date": stat_date}
+            for (cat, ind), (field, divisor) in _AK_MAP.items():
+                row = lookup.get((cat, ind))
+                if row is None:
+                    continue
+                fval = _sf(row.get(col))
+                if fval is not None:
+                    rec[field] = fval / divisor
+            if "yoy_ni" in rec:
+                rec["yoy_pni"] = rec["yoy_ni"]
+            if "cfo_to_or" in rec:
+                rec["cfo_to_gr"] = rec["cfo_to_or"]
+            if len(rec) > 3:
+                records.append(rec)
+
+        if not records:
+            return 0
+
+        cols = [
+            "symbol", "stat_date", "report_date", "roe", "np_margin", "gp_margin",
+            "net_profit", "eps_ttm", "revenue", "yoy_equity", "yoy_asset", "yoy_ni",
+            "yoy_eps", "yoy_pni", "nr_turn", "inv_turn", "asset_turn",
+            "cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio",
+        ]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                f"INSERT OR REPLACE INTO stock_finance ({','.join(cols)}) "
+                f"VALUES ({','.join('?' * len(cols))})",
+                [tuple(rec.get(c) for c in cols) for rec in records],
+            )
+            conn.commit()
+        return len(records)
+
+    def sync_all_akshare(self, n_quarters: int = 20,
+                         max_stocks: int | None = None,
+                         delay: float = 0.3) -> dict:
+        """用 akshare 全量/增量采集财报（不依赖 baostock 额度）。
+
+        增量逻辑：跳过已有 ≥ n_quarters 季度数据的股票（深度已够）。
+        幂等：INSERT OR REPLACE，绝不删除已有数据。
+        """
+        t0 = time.time()
+
+        with sqlite3.connect(self.db_path) as conn:
+            all_symbols = [r[0] for r in conn.execute(
+                "SELECT symbol FROM stock_basic ORDER BY symbol"
+            ).fetchall()]
+            full = {r[0] for r in conn.execute(
+                "SELECT symbol FROM stock_finance GROUP BY symbol "
+                "HAVING COUNT(*) >= ?",
+                (n_quarters,),
+            ).fetchall()}
+
+        todo = [s for s in all_symbols if s not in full]
+        if max_stocks:
+            todo = todo[:max_stocks]
+
+        logger.info(
+            f"akshare 财报采集：全市场 {len(all_symbols)} 只，"
+            f"深度已够 {len(full)} 只，待采 {len(todo)} 只"
+        )
+
+        done = 0
+        written = 0
+        for sym in todo:
+            written += self.collect_one_akshare(sym, n_quarters=n_quarters)
+            done += 1
+            time.sleep(delay)
+            if done % 50 == 0:
+                elapsed = time.time() - t0
+                speed = done / elapsed if elapsed > 0 else 0
+                eta = (len(todo) - done) / speed if speed > 0 else 0
+                logger.info(
+                    f"akshare 财报进度：{done}/{len(todo)} 只，"
+                    f"写入 {written} 季，ETA {eta:.0f}s"
+                )
+
+        elapsed = time.time() - t0
+        with sqlite3.connect(self.db_path) as conn:
+            final_count = conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM stock_finance"
+            ).fetchone()[0]
+
+        logger.info(
+            f"akshare 财报采集完成：本次 {done} 只，写入 {written} 季，"
+            f"覆盖率 {final_count}/{len(all_symbols)} "
+            f"({final_count / len(all_symbols) * 100:.1f}%)，耗时 {elapsed:.0f}s"
+        )
+        return {
+            "total": len(all_symbols),
+            "fetched": done,
+            "written": written,
+            "coverage": final_count,
+            "coverage_pct": round(final_count / len(all_symbols) * 100, 1),
             "elapsed": round(elapsed, 0),
         }
 

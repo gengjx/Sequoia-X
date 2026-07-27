@@ -280,24 +280,42 @@ class AuctionScheduler:
         优先级2：缺失财报股票补全（剩余额度）
         每个工作日凌晨跑一批，连续几天补完。
         补完后自动跳过（无 NULL 行 / 无缺失股），零开销。
+        baostock 黑名单/额度耗尽时自动切换 akshare 兜底（免费、含现金流比率）。
         """
+        baostock_ok = True
         try:
             from sequoia_x.data.finance_sync import backfill_cash_flow
             result = backfill_cash_flow(settings=self.settings)
             logger.info(f"现金流回补完成：{result}")
             if result.get("rate_limited"):
-                return  # 额度耗尽，不跑步骤2（省额度给高优先级）
+                baostock_ok = False  # 额度耗尽
+            elif result.get("fetched", 0) == 0 and result.get("remaining", 0) > 0:
+                baostock_ok = False  # 有待补但采到0 → baostock 异常/黑名单
         except Exception as e:
             logger.warning(f"现金流回补失败：{e!r}")
-            return
+            baostock_ok = False
 
-        try:
-            from sequoia_x.data.finance_sync import FinanceSync
-            syncer = FinanceSync(self.settings)
-            result = syncer.sync_all(n_quarters=20, max_stocks=300)
-            logger.info(f"财报缺失股补全完成：{result}")
-        except Exception as e:
-            logger.warning(f"财报缺失股补全失败：{e!r}")
+        if baostock_ok:
+            try:
+                from sequoia_x.data.finance_sync import FinanceSync
+                syncer = FinanceSync(self.settings)
+                result = syncer.sync_all(n_quarters=20, max_stocks=300)
+                logger.info(f"财报缺失股补全完成：{result}")
+                if result.get("rate_limited"):
+                    baostock_ok = False
+            except Exception as e:
+                logger.warning(f"财报缺失股补全失败：{e!r}")
+                baostock_ok = False
+
+        if not baostock_ok:
+            # baostock 额度耗尽/黑名单 → akshare 兜底（免费、含现金流比率）
+            try:
+                from sequoia_x.data.finance_sync import FinanceSync
+                syncer = FinanceSync(self.settings)
+                result = syncer.sync_all_akshare(n_quarters=20, max_stocks=300)
+                logger.info(f"akshare 财报兜底完成：{result}")
+            except Exception as e:
+                logger.warning(f"akshare 财报兜底失败：{e!r}")
 
     def _sync_lhb(self) -> None:
         """龙虎榜数据自动同步（日K同步后执行）。"""
