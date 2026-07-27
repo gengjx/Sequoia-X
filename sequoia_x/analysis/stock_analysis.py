@@ -57,7 +57,7 @@ def _baostock_release() -> None:
         if _BAOSTOCK_SESSION["count"] <= 0:
             try:
                 bs.logout()
-            except Exception:
+            except Exception as e:
                 pass
             _BAOSTOCK_SESSION["alive"] = False
             _BAOSTOCK_SESSION["count"] = 0
@@ -186,7 +186,8 @@ class StockAnalyzer:
             latest = latest / 100.0 if latest else None
             prev = prev / 100.0 if prev else None
             return (latest, prev)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"行情获取失败: {e!r}")
             return (None, None)
 
     def _load_ohlcv(self, symbol: str) -> pd.DataFrame:
@@ -926,7 +927,8 @@ class StockAnalyzer:
                     "fid": "f12", "fs": fs, "fields": fields,
                 }, headers=headers, timeout=6)
                 return (r.json().get("data") or {}).get("diff") or []
-            except Exception:
+            except Exception as e:
+                logger.debug(f"批量快照拉取失败: {e!r}")
                 return []
 
         try:
@@ -1165,7 +1167,8 @@ class StockAnalyzer:
                     rec["inv_turn"] = self._sf(o[5])
                     rec["asset_turn"] = self._sf(o[8])
                 fetched.append(rec)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"个股财报拉取失败: {e!r}")
                 continue
         if fetched:
             with sqlite3.connect(self.db_path) as conn:

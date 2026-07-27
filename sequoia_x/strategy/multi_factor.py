@@ -18,6 +18,7 @@ from sequoia_x.analysis.factor import (
     _recent_ml_ic_mean,
 )
 from sequoia_x.core.config import Settings
+from sequoia_x.core.health import FactorHealth
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.base import BaseStrategy
@@ -93,6 +94,7 @@ class MultiFactorStrategy(BaseStrategy):
         self._ml_scores_asof: dict[str, float] | None = None
         # 回测 PIT 快照历史（preload_snapshot_history 一次性加载）；None=实盘走最新值
         self._snapshot_history: dict | None = None
+        self.last_health: FactorHealth | None = None
 
     def _load_db_weights(self) -> dict[str, float]:
         """从DB加载最新因子IC权重，DB空则用默认值兜底。
@@ -116,7 +118,8 @@ class MultiFactorStrategy(BaseStrategy):
         """从DB加载三态市场状态因子权重（bull/neutral/bear各一套）。"""
         try:
             return self.engine.load_market_factor_weights()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"加载三态权重失败: {e!r}")
             return {}
 
     def get_weights_for_state(self, market_state: str) -> dict[str, float]:
@@ -159,6 +162,7 @@ class MultiFactorStrategy(BaseStrategy):
                         "cfo_to_or": r[11], "cfo_to_np": r[12],
                     }))
             except Exception as e:
+                logger.warning(f"快照加载失败 finance: {e!r}")
                 sh["finance"] = {}
             # 资金流向
             try:
@@ -171,7 +175,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["fund_flow"].setdefault(r[0], []).append((r[1], {
                         "main_net": r[2], "main_pct": r[3], "super_net": r[4], "big_net": r[5],
                     }))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 fund_flow: {e!r}")
                 sh["fund_flow"] = {}
             # 龙虎榜
             try:
@@ -181,7 +186,8 @@ class MultiFactorStrategy(BaseStrategy):
                 sh["lhb"] = {}
                 for r in rows:
                     sh["lhb"].setdefault(r[0], []).append((r[1], float(r[2]) if r[2] else 0.0))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 lhb: {e!r}")
                 sh["lhb"] = {}
             # 北向持股（全序列，按 date 排序）
             try:
@@ -195,7 +201,8 @@ class MultiFactorStrategy(BaseStrategy):
                     tmp.setdefault(r[0], []).append({"date": str(r[1]), "hold_pct": float(r[2])})
                 for sym, recs in tmp.items():
                     sh["north"][sym] = recs  # list[dict]，as-of 时取 <=today 前缀
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 north: {e!r}")
                 sh["north"] = {}
             # 融资融券
             try:
@@ -208,7 +215,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["margin"].setdefault(r[0], []).append((r[1], {
                         "rzye": r[2], "rzbuy": r[3], "rqlts": r[4], "rqye": r[5],
                     }))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 margin: {e!r}")
                 sh["margin"] = {}
             # 基金持仓
             try:
@@ -221,7 +229,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["fund_hold"].setdefault(r[0], []).append((r[1], {
                         "fund_count": r[2], "change_pct": r[3],
                     }))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 fund_hold: {e!r}")
                 sh["fund_hold"] = {}
             # 大宗交易（折溢率，近30天窗口）
             try:
@@ -233,7 +242,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["block"].setdefault(r[0], []).append((r[1], {
                         "discount": r[2], "amount": r[3],
                     }))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 block: {e!r}")
                 sh["block"] = {}
             # 股东户数（季频，筹码集中度）
             try:
@@ -246,7 +256,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["holder"].setdefault(r[0], []).append((r[1], {
                         "holder_num": r[2], "holder_change": r[3], "avg_value": r[4],
                     }))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 holder: {e!r}")
                 sh["holder"] = {}
             # 沪深300指数收益率（全序列）
             try:
@@ -260,7 +271,8 @@ class MultiFactorStrategy(BaseStrategy):
                     sh["index_ret"] = pd.Series(_ret.values, index=_df["date"].values).dropna()
                 else:
                     sh["index_ret"] = None
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 index_ret: {e!r}")
                 sh["index_ret"] = None
             # 宏观（M2/社融，按 month 排序）
             try:
@@ -270,7 +282,8 @@ class MultiFactorStrategy(BaseStrategy):
                 sh["macro_sf"] = [(r[0], r[1]) for r in conn.execute(
                     "SELECT month, sf_total FROM macro_sf ORDER BY month"
                 ) if r[1] is not None]
-            except Exception:
+            except Exception as e:
+                logger.warning(f"快照加载失败 macro: {e!r}")
                 sh["macro_m2"] = []
                 sh["macro_sf"] = []
         self._snapshot_history = sh
@@ -338,6 +351,19 @@ class MultiFactorStrategy(BaseStrategy):
             holder_map = self._load_holder_map()
             index_ret = self._load_index_ret()
 
+        # ── 因子健康度：记录数据源加载量（覆盖关键路径静默失败）──
+        _health = FactorHealth()
+        _n = len(symbols) if symbols else 1
+        _health.record_source("finance", len(finance_map), _n)
+        _health.record_source("fund_flow", len(fund_flow_map), _n)
+        _health.record_source("lhb", len(lhb_map), _n)
+        _health.record_source("north", len(north_map), _n)
+        _health.record_source("margin", len(margin_map), _n)
+        _health.record_source("fund_hold", len(fund_hold_map), _n)
+        _health.record_source("block", len(block_map), _n)
+        _health.record_source("holder", len(holder_map), _n)
+        _health.record_source("index", 1 if index_ret is not None else 0, 1)
+
         # 采集全市场因子截面（含质量因子+资金因子）+ 趋势确认数据
         rows = []
         trend_info: dict[str, dict] = {}
@@ -374,13 +400,21 @@ class MultiFactorStrategy(BaseStrategy):
                     "ret_20d": float(ret_20d) if ret_20d == ret_20d else 0,
                     "stabilized": float(ret_5d) > -0.03 if ret_5d == ret_5d else False,
                 }
-            except Exception:
+            except Exception as e:
+                logger.warning(f"因子计算失败 {sym}: {e!r}")
                 continue
         if not rows:
             logger.info("MultiFactorStrategy 无可用股票")
             return []
 
         df_factors = pd.DataFrame(rows).set_index("symbol")
+
+        # ── 因子健康度：计算有效覆盖率（nan 检测）──
+        _health.record_coverage_from_df(df_factors, list(active_weights.keys()))
+        self.last_health = _health
+        _wl = _health.warning_line()
+        if _wl:
+            logger.warning(_wl)
 
         # ── 注入ML因子分（如果权重中包含ml_score）──
         if "ml_score" in active_weights:

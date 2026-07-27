@@ -521,21 +521,22 @@ class PaperReplayEngine:
                             if m_var > 0:
                                 cov = float(np.cov(sr, mr)[0, 1])
                                 self._beta_cache[sym] = max(-2.0, min(3.0, cov / m_var))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"beta缓存预计算失败: {e!r}")
         # 行业缓存（用于单行业集中度检查）
         self._industry_cache = {}
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute("SELECT symbol, industry FROM stock_industry").fetchall()
                 self._industry_cache = {r[0]: r[1] for r in rows if r[1]}
-        except Exception:
+        except Exception as e:
+            logger.debug(f"stock_industry加载失败，尝试board: {e!r}")
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     rows = conn.execute("SELECT symbol, board FROM stock_board_em").fetchall()
                     self._industry_cache = {r[0]: r[1] for r in rows if r[1]}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"行业缓存加载失败: {e!r}")
         logger.info(f"风控预计算完成：beta {len(self._beta_cache)} 只，行业 {len(self._industry_cache)} 只")
         # 解禁回避过滤器（P14：预加载全部历史大额解禁，回测PIT用）
         try:
@@ -715,7 +716,8 @@ class PaperReplayEngine:
                     "ma20_above_ma60": ma20 > ma60, "ret_20d": ret_20d, "ret_5d": ret_5d,
                     "stabilized": ret_5d > -0.03,
                 }
-            except Exception:
+            except Exception as e:
+                logger.warning(f"回测选股因子计算失败: {e!r}")
                 continue
         if len(rows) < 30:
             return []
@@ -867,7 +869,8 @@ class PaperReplayEngine:
             try:
                 from sequoia_x.analysis.ml_factor import MLFactorEngine
                 ic = MLFactorEngine._rank_corr(scores, rets) if scores.std() > 0 and rets.std() > 0 else 0.0
-            except Exception:
+            except Exception as e:
+                logger.debug(f"ML IC计算失败: {e!r}")
                 ic = 0.0
             if ic == ic:
                 ic_list.append(ic)
@@ -989,8 +992,8 @@ class PaperReplayEngine:
             for state, fname, wt in rows:
                 if wt and wt != 0:
                     result.setdefault(state, {})[fname] = wt
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"三态权重加载失败: {e!r}")
         return result
 
     def _load_st_set(self) -> set:
@@ -1010,8 +1013,8 @@ class PaperReplayEngine:
                     if ipo:
                         # 上市后60个交易日才纳入
                         result[sym] = ipo
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"ipo_date加载失败: {e!r}")
         return result
 
     def _load_ml_snapshots(self) -> dict[str, dict[str, float]]:
@@ -1028,8 +1031,8 @@ class PaperReplayEngine:
                 ).fetchall()
             for run_date, symbol, score in rows:
                 snapshots.setdefault(run_date, {})[symbol] = float(score)
-        except Exception:
-            pass  # 表不存在或为空
+        except Exception as e:
+            logger.debug(f"ML快照加载失败: {e!r}")
         return snapshots
 
     def _load_ml_scores_asof(self, today: str) -> dict[str, float] | None:

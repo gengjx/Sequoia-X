@@ -173,6 +173,7 @@ class AnalysisMixin:
             # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
             # 每策略独立读K线+结果缓存；共享DF实测在3M行下groupby慢+内存复制开销，无净收益
             strategy_results: dict[str, list[str]] = {}
+            strategy_health: dict[str, object] = {}
 
             def _run_strategy(key: str) -> tuple[str, list[str]]:
                 # 缓存命中：同一data_date内策略结果不变（K线数据没变，选股结果一致）
@@ -185,11 +186,13 @@ class AnalysisMixin:
                 try:
                     strat = cls(engine=self.engine, settings=self.settings)
                     results = strat.run()
+                    if hasattr(strat, "last_health") and strat.last_health:
+                        strategy_health[key] = strat.last_health
                     self._result_cache[key] = (data_date, results)
                     return key, results
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"策略 {key} 运行失败：{e!r}")
-                    return key, []
+                    return key, [] 
 
             workers = min(4, len(strategy_keys) or 1)
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -232,6 +235,13 @@ class AnalysisMixin:
             result["strategies_run"] = {
                 k: len(v) for k, v in strategy_results.items()
             }
+            _health = strategy_health.get("multi_factor")
+            if _health:
+                result["factor_health"] = _health.to_summary()
+                result["degraded"] = _health.to_summary().get("is_degraded", False)
+            else:
+                result["factor_health"] = None
+                result["degraded"] = False
             self._decision_cache[cache_key] = ({"data_date": data_date}, result)
         logging.getLogger(__name__).info('决策缓存写入 key=' + cache_key[:40])
         logging.getLogger(__name__).info(

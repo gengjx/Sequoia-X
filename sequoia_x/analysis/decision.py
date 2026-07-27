@@ -90,7 +90,8 @@ def quality_bonus(hit_strategies: list[str]) -> float:
     try:
         from sequoia_x.strategy.registry import STRATEGY_META
         name_to_key = {meta.get("name_cn", k): k for k, meta in STRATEGY_META.items()}
-    except Exception:
+    except Exception as e:
+        logger.warning(f"STRATEGY_META加载失败: {e!r}")
         name_to_key = {}
     return sum(
         _TIER_BONUS.get(quality_tier(STRATEGY_QUALITY.get(name_to_key.get(s, s), 40)), 0)
@@ -501,7 +502,8 @@ class DecisionEngine:
                     f"SELECT symbol, pct_chg FROM stock_daily WHERE date=? AND symbol IN ({placeholders})",
                     [latest] + syms,
                 ).fetchall()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"候选池过滤失败: {e!r}")
             return pool
 
         def _limit_threshold(symbol: str) -> float:
@@ -791,7 +793,8 @@ class DecisionEngine:
                 return 1.0
             cov = float(np.cov(rets[-min_len:], mr[-min_len:])[0, 1])
             return max(-2.0, min(3.0, cov / m_var))
-        except Exception:
+        except Exception as e:
+            logger.debug(f"市场Beta计算失败: {e!r}")
             return 1.0
 
     # ------------------------------------------------------------------
@@ -899,7 +902,8 @@ class DecisionEngine:
                     "ORDER BY run_date DESC, id DESC LIMIT 1"
                 ).fetchone()
             return row[0] if row and row[0] else None
-        except Exception:
+        except Exception as e:
+            logger.debug(f"读取决策日志失败: {e!r}")
             return None
 
     def _apply_regime_hysteresis(

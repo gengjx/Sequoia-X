@@ -372,7 +372,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
                     factors["nb_inflow"] = np.nan
             else:
                 factors["nb_inflow"] = np.nan
-        except Exception:
+        except Exception as e:
             factors["nb_holding_pct"] = np.nan
             factors["nb_inflow"] = np.nan
     else:
@@ -427,7 +427,7 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
             else:
                 factors["beta_300"] = np.nan
                 factors["rel_strength_300"] = np.nan
-        except Exception:
+        except Exception as e:
             factors["beta_300"] = np.nan
             factors["rel_strength_300"] = np.nan
     else:
@@ -474,7 +474,8 @@ def compute_all_factors(
             factors = compute_factors(df, finance)
             factors["symbol"] = sym
             rows.append(factors)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"IC评估因子计算失败 {sym}: {e!r}")
             continue
     if not rows:
         return pd.DataFrame()
@@ -607,8 +608,8 @@ def compute_factor_series(df: pd.DataFrame, factor_names: list[str] | None = Non
                 _beta = (_cov / _mvar.replace(0, np.nan)).clip(-2.0, 3.0)
                 series["beta_300"] = _beta
                 series["rel_strength_300"] = rets.rolling(20, min_periods=10).sum() - _ir.rolling(20, min_periods=10).sum()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"beta_300/rel_strength_300 序列计算失败: {e!r}")
 
     # 质量因子（point-in-time，从finance_series注入）
     if finance_series:
@@ -726,7 +727,8 @@ def _neutralize截面(df截面: pd.DataFrame, factor_cols: list[str],
             result_col[mask] = residual
             df截面[f + "_neutral"] = result_col
             df截面[f] = result_col  # 替换原值
-        except Exception:
+        except Exception as e:
+            logger.warning(f"因子中性化失败 {f}: {e!r}")
             continue
 
     return df截面
@@ -1203,7 +1205,8 @@ def evaluate_factor_ic(
                 row["fwd_return"] = float(fwd_ret)
                 records.setdefault(m, []).append(row)
             processed += 1
-        except Exception:
+        except Exception as e:
+            logger.warning(f"IC评估记录失败: {e!r}")
             continue
 
     logger.info(f"因子IC评估：处理 {processed}/{len(symbols)} 只，{len(records)} 个月份")
@@ -1694,7 +1697,8 @@ def _recent_ml_ic_mean(db_path: str, as_of_date: str | None = None, n: int = 6) 
                     "GROUP BY run_date ORDER BY run_date DESC LIMIT ?",
                     (n,),
                 ).fetchall()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"读取ML IC历史失败: {e!r}")
         return None
     if len(rows) < 3:
         return None
@@ -1758,7 +1762,8 @@ def _cluster_factors(
         condensed = squareform(dist, checks=False)
         Z = linkage(condensed, method="average")
         labels = fcluster(Z, t=1.0 - threshold, criterion="distance")
-    except Exception:
+    except Exception as e:
+        logger.debug(f"scipy聚类不可用，回退贪心分组: {e!r}")
         # 回退：贪心分组
         labels = _greedy_cluster(ic_corr, threshold, factors)
 

@@ -758,10 +758,25 @@ class AuctionScheduler:
                 f"风控状态：{perf.risk_circuit}"
                 f"{sharpe_str}{alpha_str}"
             )
+            fh = decision.get("factor_health")
+            if fh and fh.get("is_degraded"):
+                _wl_parts = []
+                for src_name, info in fh.get("sources", {}).items():
+                    if info.get("coverage", 1.0) < 0.20:
+                        _labels = {
+                            "finance": "财报", "fund_flow": "资金流", "lhb": "龙虎榜",
+                            "north": "北向", "margin": "融资融券", "fund_hold": "基金持仓",
+                            "block": "大宗交易", "holder": "股东户数", "index": "沪深300",
+                        }
+                        _wl_parts.append(
+                            f"{_labels.get(src_name, src_name)}{info['coverage']*100:.0f}%"
+                        )
+                if _wl_parts:
+                    summary += f"\n⚠️ 因子健康度：{' '.join(_wl_parts)} [{len(_wl_parts)}源降级]"
             try:
                 notifier.send_text(summary)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"飞书日报推送失败：{e!r}")
 
             # 记录每日决策快照到 paper_decision_log
             try:

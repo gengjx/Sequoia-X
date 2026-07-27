@@ -343,7 +343,8 @@ def _bs_fetch_batch(tasks: list) -> list:
                     results.append([symbol] + rs.get_row_data())
                 fetched = True
                 break
-            except Exception:
+            except Exception as e:
+                logger.debug(f"baostock查询重试: {e!r}")
                 if attempt < 2:
                     time.sleep(2 * (attempt + 1))
                 continue
@@ -813,7 +814,8 @@ class DataEngine:
                     int(vol * 100), 0.0, None, None, 1, 0
                 ))
                 success += 1
-            except Exception:
+            except Exception as e:
+                logger.debug(f"腾讯fallback拉取失败: {e!r}")
                 continue
 
             if (i + 1) % 500 == 0:
@@ -920,7 +922,8 @@ class DataEngine:
                     sym = item.get("f12", "")
                     if sym and len(sym) == 6 and sym.isdigit():
                         all_spot[sym] = item
-            except Exception:
+            except Exception as e:
+                logger.debug(f"东财fallback快照拉取失败: {e!r}")
                 continue
 
         logger.info(f"东财fallback: 快照获取 {len(all_spot)} 只")
