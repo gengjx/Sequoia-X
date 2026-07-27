@@ -54,6 +54,7 @@ class AuctionScheduler:
         self._load_last_run()
         self._cleanup_zombies()
         self._last_wal_checkpoint = 0.0
+        self._last_attribution: dict | None = None
 
     def _init_task_log_table(self) -> None:
         """创建任务执行记录表。"""
@@ -375,6 +376,44 @@ class AuctionScheduler:
         except Exception as e:
             logger.warning(f"月度ML训练失败（不影响其他任务）：{e!r}")
 
+        # 因子归因分析（采样500只，63个月截面，约15秒）→ 回答"赚的钱来自哪个因子"
+        # 只展示不自动改权重（小样本归因可能误判强因子），飞书通知供人工审阅
+        try:
+            from sequoia_x.analysis.attribution import AttributionAnalyzer
+            from sequoia_x.data.engine import DataEngine
+            attr_engine = DataEngine(self.settings)
+            analyzer = AttributionAnalyzer(attr_engine, self.settings)
+            attr_result = analyzer.analyze(hold_days=20, sample_size=500)
+            self._last_attribution = attr_result
+
+            # 飞书通知归因摘要
+            drivers = attr_result.get("top_drivers", [])
+            drags = attr_result.get("top_drags", [])
+            cat_summary = attr_result.get("category_summary", [])[:3]
+            strat_ret = attr_result.get("strategy_annual_return", 0)
+            bench_ret = attr_result.get("benchmark_annual_return", 0)
+            alpha = attr_result.get("alpha", 0)
+
+            driver_str = " ".join(drivers[:3]) if drivers else "无"
+            drag_str = " ".join(drags[:3]) if drags else "无"
+            cat_str = " ".join(
+                f"{c['category']}({c['total_contribution']:+.2f})"
+                for c in cat_summary
+            ) if cat_summary else "无"
+
+            from sequoia_x.notify.feishu import FeishuNotifier
+            notifier = FeishuNotifier(self.settings)
+            notifier.send(
+                "📊 月度因子归因\n"
+                f"策略年化 {strat_ret}% vs 基准 {bench_ret}% (Alpha {alpha}%)\n"
+                f"🟢 收益驱动: {driver_str}\n"
+                f"🔴 收益拖累: {drag_str}\n"
+                f"📊 大类贡献: {cat_str}"
+            )
+            logger.info(f"月度归因完成：Alpha={alpha}%, 驱动={drivers[:3]}")
+        except Exception as e:
+            logger.warning(f"月度归因失败（不影响其他任务）：{e!r}")
+
     def _daily_report(self) -> str:
         """每日任务执行汇总：统计今天所有定时任务的成功/失败/耗时，发飞书。"""
         from sequoia_x.notify.feishu import FeishuNotifier
@@ -488,6 +527,17 @@ class AuctionScheduler:
                 lines.append(f"东财: {em_status}")
             except Exception:
                 pass
+
+            # 因子归因（月度任务，当日执行过则展示）
+            if self._last_attribution:
+                attr = self._last_attribution
+                drivers = attr.get("top_drivers", [])
+                alpha = attr.get("alpha", 0)
+                driver_str = "/".join(drivers[:3]) if drivers else "无"
+                lines.append(f"---")
+                lines.append(f"因子归因: Alpha {alpha}% | 驱动: {driver_str}")
+            else:
+                lines.append(f"因子归因: 月度任务（每月1号执行）")
 
             content = "\n".join(lines)
             notifier = FeishuNotifier(self.settings)
