@@ -534,13 +534,21 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
-        with sqlite3.connect(self.db_path) as conn:
-            df = pd.read_sql(
-                "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
-                conn,
-                params=(symbol,),
-            )
-        return df
+        for _attempt in range(3):
+            try:
+                with sqlite3.connect(self.db_path, timeout=10) as conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    df = pd.read_sql(
+                        "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
+                        conn,
+                        params=(symbol,),
+                    )
+                return df
+            except sqlite3.OperationalError:
+                if _attempt < 2:
+                    time.sleep(0.1 * (_attempt + 1))
+                else:
+                    raise
 
     def get_all_daily(self) -> pd.DataFrame:
         """一次性加载全市场K线（3M行），内存缓存供多策略共用。

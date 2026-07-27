@@ -171,7 +171,14 @@ class AnalysisMixin:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             # Step1: 并行运行选定策略（data_date 来自上方缓存检查，闭包复用）
-            # 每策略独立读K线+结果缓存；共享DF实测在3M行下groupby慢+内存复制开销，无净收益
+            # 预加载共享K线分组：避免每策略逐只get_ohlcv各开一次sqlite连接，
+            # 3策略×5000股并行=15000并发连接导致"unable to open database file"。
+            # 共享分组dict让所有策略O(1)取片，零并发连接。
+            try:
+                _shared_groups = self.engine.get_daily_groups()
+            except Exception:
+                _shared_groups = None
+
             strategy_results: dict[str, list[str]] = {}
             strategy_health: dict[str, object] = {}
 
@@ -185,6 +192,8 @@ class AnalysisMixin:
                     return key, []
                 try:
                     strat = cls(engine=self.engine, settings=self.settings)
+                    if _shared_groups:
+                        strat.set_shared_daily(_shared_groups)
                     results = strat.run()
                     if hasattr(strat, "last_health") and strat.last_health:
                         strategy_health[key] = strat.last_health
