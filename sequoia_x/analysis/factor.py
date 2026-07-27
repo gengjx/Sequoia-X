@@ -49,6 +49,11 @@ ML_IC_FULL = 0.06            # 近期均 IC ≥ 此值 → 满权重（略低于
 ML_IC_WEAK = 0.015           # 近期均 IC ≤ 此值 → 降到下限（衰退窗口均IC≈0.002~0.02）
 ML_PENALTY_FLOOR = 0.35      # 重度衰退仍保留 35%（与 P6/P2 半保留下限哲学一致）
 
+# P16: 因子正交化——IC 相关性驱动的权重去冗余。
+# 高相关因子簇内，非基准因子的权重按 (1-corr²) 折扣（增量信息系数）。
+ORTH_THRESHOLD = 0.6          # IC 相关性 |r| > 此值的因子归入同簇
+
+
 # 因子分类（key=因子名, category=大类, direction=+1正向/-1反向）
 FACTOR_META: dict[str, dict] = {
     # ── 动量(8) ──
@@ -1246,6 +1251,23 @@ def evaluate_factor_ic(
             f"(衰减阈值 SAFE={CROWDING_SAFE}/MAX={CROWDING_MAX})"
         )
 
+    # ════════ P16: 因子正交化——IC 相关性聚类 + 增量 IC 权重折扣 ════════
+    ic_corr = _build_ic_correlation(ic_series, sorted(factor_set))
+    orth_clusters = _cluster_factors(ic_corr, ORTH_THRESHOLD) if not ic_corr.empty else {}
+    orth_penalties = _orthogonal_penalty(ic_corr, orth_clusters, ic_by_factor) if orth_clusters else {}
+    if orth_clusters:
+        multi_clusters = {cid: m for cid, m in orth_clusters.items() if len(m) > 1}
+        if multi_clusters:
+            parts = []
+            for cid, members in sorted(multi_clusters.items(), key=lambda x: -len(x[1])):
+                base = max(members, key=lambda f: abs(ic_by_factor.get(f, 0)))
+                parts.append(f"[{base}+{len(members)-1}]")
+            discounted = sum(1 for v in orth_penalties.values() if v < 0.99)
+            logger.info(
+                f"因子正交化：{len(multi_clusters)}个高相关簇 "
+                f"({' '.join(parts)})，{discounted}个因子被折扣"
+            )
+
     # ════════ P1: 三态市场状态分组IC（bull/neutral/bear 各一套权重）════════
     # 用全市场等权月度收益判定该月市场状态：
     #   月收益 >3% → bull, <-3% → bear, 中间 → neutral
@@ -1306,7 +1328,9 @@ def evaluate_factor_ic(
                 # P6: 三态权重同样施加拥挤度软衰减（用同一全局 crowding：
                 # 行业集中度是结构性属性，与市场态无关）
                 r["weight"] = round(
-                    (r["ic_mean"] / total_ic) * _crowding_penalty(crowding_scores.get(r["factor_name"], 0.0)), 4)
+                    (r["ic_mean"] / total_ic)
+                    * _crowding_penalty(crowding_scores.get(r["factor_name"], 0.0))
+                    * orth_penalties.get(r["factor_name"], 1.0), 4)
             state_weights[state] = state_reports
 
     # 写入三态权重表
@@ -1434,10 +1458,12 @@ def evaluate_factor_ic(
                 "t_stat": f.get("t_stat", 0),
                 "win_rate": f.get("win_rate", 0),
                 "crowding": crowding_scores.get(f["name"], 0.0),
-                # P6: 权重 = (IC/|ΣIC|) × 拥挤度软衰减；乘子在归一化分母后施加，
-                # 正确穿透 multi_factor 的 Σ|w| 再归一化（只有相对权重生效）。
+                # P6: 权重 = (IC/|ΣIC|) × 拥挤度软衰减 × P16 正交化折扣
+                # 乘子在归一化分母后施加，正确穿透 multi_factor 的 Σ|w| 再归一化。
                 "weight": round(
-                    (f["ic_mean"] / total_ic) * _crowding_penalty(crowding_scores.get(f["name"], 0.0)), 4),
+                    (f["ic_mean"] / total_ic)
+                    * _crowding_penalty(crowding_scores.get(f["name"], 0.0))
+                    * orth_penalties.get(f["name"], 1.0), 4),
             } for f in effective]
             engine.save_factor_weights(weights)
             pos_cnt = sum(1 for w in weights if w["weight"] > 0)
@@ -1469,6 +1495,7 @@ def evaluate_factor_ic(
                                  for s, ws in state_weights.items()},
         "month_states": month_states,
         "crowding": crowding_scores,
+        "ic_corr": ic_corr,
     }
 
 
@@ -1658,3 +1685,131 @@ def _recent_ml_ic_mean(db_path: str, as_of_date: str | None = None, n: int = 6) 
     if len(rows) < 3:
         return None
     return round(sum(r[0] for r in rows) / len(rows), 4)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# P16: 因子正交化——IC 相关性矩阵 + 层次聚类 + 增量 IC 折扣
+# ════════════════════════════════════════════════════════════════════════
+
+def _build_ic_correlation(
+    ic_series: dict[str, list[float]],
+    factor_names: list[str],
+) -> pd.DataFrame:
+    """从逐月 IC 序列构建因子间 IC 相关性矩阵。
+
+    IC 相关性衡量"两个因子是否在同一时段同时有效/失效"——
+    比截面值相关性更能反映信号冗余（同一信号的不同代理）。
+
+    Returns:
+        factor × factor 的 Pearson 相关矩阵。
+    """
+    data = {}
+    for f in factor_names:
+        s = ic_series.get(f, [])
+        data[f] = pd.Series(s, dtype=float).dropna()
+    # 对齐长度（不同因子可能因 NaN 导致长度不同）
+    df = pd.DataFrame(data)
+    if df.empty or len(df) < 3:
+        return pd.DataFrame()
+    return df.corr()
+
+
+def _cluster_factors(
+    ic_corr: pd.DataFrame,
+    threshold: float = ORTH_THRESHOLD,
+) -> dict[int, list[str]]:
+    """层次聚类自动识别高相关因子簇。
+
+    距离 = 1 - |corr|，用 scipy linkage + fcluster 分组。
+    负相关因子（方向相反的独立信号）距离大、不会被错误合并。
+
+    Returns:
+        {cluster_id: [factor_names]}，含单因子簇（独立因子）。
+    """
+    if ic_corr.empty:
+        return {}
+    factors = list(ic_corr.columns)
+    n = len(factors)
+    if n < 2:
+        return {0: factors}
+
+    dist = np.array(1.0 - ic_corr.abs().values, dtype=float)
+    np.fill_diagonal(dist, 0.0)
+    # 对称化 + 归零负值（距离非负）
+    dist = np.clip(dist, 0, 2)
+
+    try:
+        from scipy.cluster.hierarchy import linkage, fcluster
+        from scipy.spatial.distance import squareform
+        condensed = squareform(dist, checks=False)
+        Z = linkage(condensed, method="average")
+        labels = fcluster(Z, t=1.0 - threshold, criterion="distance")
+    except Exception:
+        # 回退：贪心分组
+        labels = _greedy_cluster(ic_corr, threshold, factors)
+
+    clusters: dict[int, list[str]] = {}
+    for i, lbl in enumerate(labels):
+        clusters.setdefault(int(lbl), []).append(factors[i])
+    return clusters
+
+
+def _greedy_cluster(
+    ic_corr: pd.DataFrame,
+    threshold: float,
+    factors: list[str],
+) -> list[int]:
+    """scipy 不可用时的贪心分组回退。"""
+    parent = list(range(len(factors)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(len(factors)):
+        for j in range(i + 1, len(factors)):
+            if abs(ic_corr.iloc[i, j]) > threshold:
+                union(i, j)
+    return [find(i) for i in range(len(factors))]
+
+
+def _orthogonal_penalty(
+    ic_corr: pd.DataFrame,
+    clusters: dict[int, list[str]],
+    ic_means: dict[str, float],
+) -> dict[str, float]:
+    """计算每个因子的正交化权重折扣乘子。
+
+    每簇内选 |IC| 最大的为基准（乘子=1.0）；
+    非基准因子按 (1 - corr²_with_base) 折扣——
+    这是增量信息系数的标准公式（partial IC after removing base）。
+
+    corr=0.9 → 折扣 0.44；corr=0.6 → 折扣 0.80；corr=0.3 → 折扣 0.95。
+
+    Returns:
+        {factor: multiplier [0, 1]}。
+    """
+    penalties: dict[str, float] = {}
+    for cid, members in clusters.items():
+        if len(members) <= 1:
+            for f in members:
+                penalties[f] = 1.0
+            continue
+        # 选 |IC| 最大者为基准
+        base = max(members, key=lambda f: abs(ic_means.get(f, 0)))
+        penalties[base] = 1.0
+        for f in members:
+            if f == base:
+                continue
+            r = 0.0
+            if f in ic_corr.index and base in ic_corr.columns:
+                r = abs(float(ic_corr.loc[f, base]))
+            penalties[f] = round((1.0 - r ** 2) ** 0.5, 4)
+    return penalties
