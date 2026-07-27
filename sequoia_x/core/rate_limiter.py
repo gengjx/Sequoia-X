@@ -126,6 +126,53 @@ class RateLimiter:
             self._baostock_count += count
             self._save_state()
 
+    def baostock_try_consume(self, n: int = 1) -> bool:
+        """原子检查并扣减 baostock 额度（跨进程安全，fcntl 文件锁）。
+
+        多进程 Pool worker 和并发脚本共享同一个文件计数，
+        每次真实 API 调用前扣减，彻底消除多进程计数不共享和事后批量记账的缺陷。
+
+        Args:
+            n: 本次预计消耗的次数
+
+        Returns:
+            True=已扣减成功可调用，False=已达限额应停止
+        """
+        import fcntl
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._baostock_date:
+            self._check_date_rollover()
+
+        try:
+            with open(_STATE_FILE, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    raw = f.read()
+                    state = json.loads(raw) if raw.strip() else {}
+                    if state.get("date") != today:
+                        state["date"] = today
+                        state["baostock_count"] = 0
+                    count = state.get("baostock_count", 0)
+                    if count + n > BAOSTOCK_DAILY_LIMIT:
+                        return False
+                    count += n
+                    state["baostock_count"] = count
+                    f.seek(0)
+                    f.truncate()
+                    f.write(json.dumps(state))
+                    f.flush()
+                    os.fsync(f.fileno())
+                    with self._state_lock:
+                        self._baostock_count = count
+                        self._baostock_date = today
+                    return True
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            return True
+
     def baostock_status(self) -> dict:
         """获取 baostock 当前限额状态。"""
         self._check_date_rollover()

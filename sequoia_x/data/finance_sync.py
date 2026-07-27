@@ -71,8 +71,11 @@ def _fetch_batch(args: tuple) -> list[dict]:
     """worker：独立 login，批量采集一批股票的财报。"""
     import baostock as bs
 
+    from sequoia_x.core.rate_limiter import _rate_limiter
+
     symbols, quarters = args
     bs.login()
+    _rate_limiter.baostock_try_consume(1)  # login 算1次额度
     results: list[dict] = []
     cols = [
         "symbol", "stat_date", "report_date", "roe", "np_margin", "gp_margin",
@@ -81,9 +84,15 @@ def _fetch_batch(args: tuple) -> list[dict]:
         "cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio",
     ]
 
+    quota_exhausted = False
     for symbol in symbols:
+        if quota_exhausted:
+            break
         bs_code = _to_baostock_code(symbol)
         for year, quarter in quarters:
+            if not _rate_limiter.baostock_try_consume(4):  # 每季4类query
+                quota_exhausted = True
+                break
             rec = {"symbol": symbol, "stat_date": None}
             try:
                 rp = bs.query_profit_data(code=bs_code, year=year, quarter=quarter)
@@ -288,9 +297,8 @@ class FinanceSync:
 
         elapsed = time.time() - t0
 
-        # 消耗 baostock 额度计数（实际采集数 × 每只查询次数）
-        from sequoia_x.core.rate_limiter import _rate_limiter as _rl2
-        _rl2.baostock_consume(len(missing) * calls_per_stock)
+        # baostock 额度已在 worker 内逐次实时扣减（baostock_try_consume），
+        # 无需事后批量记账
 
         # 验证
         with sqlite3.connect(self.db_path) as conn:
@@ -481,10 +489,15 @@ def _fetch_cashflow_batch(args: tuple) -> int:
     """worker：仅拉现金流比率，逐行 UPDATE。"""
     import baostock as bs
 
+    from sequoia_x.core.rate_limiter import _rate_limiter
+
     (rows,) = args
     bs.login()
+    _rate_limiter.baostock_try_consume(1)
     updates: list[tuple] = []
     for symbol, stat_date in rows:
+        if not _rate_limiter.baostock_try_consume(1):
+            break
         yq = _stat_date_to_yq(stat_date)
         if not yq:
             continue
@@ -579,7 +592,7 @@ def backfill_cash_flow(settings=None, batch_size: int = 200,
                 f"({speed:.0f} 行/秒，ETA {eta:.0f}s)"
             )
 
-    _rate_limiter.baostock_consume(len(todo))
+    # baostock 额度已在 worker 内逐次实时扣减
     elapsed = time.time() - t0
 
     with sqlite3.connect(syncer.db_path) as conn:
