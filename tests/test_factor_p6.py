@@ -249,3 +249,60 @@ class TestPersistence:
             sqlite3.connect(db).execute("PRAGMA table_info(factor_weights)").fetchall()
         ]
         assert cols.count("crowding") == 1
+
+
+# ===========================================================================
+# P6修正：动态分位数阈值（safe/max_pct 参数）
+# ===========================================================================
+class TestDynamicThresholds:
+    def test_custom_safe_max_params(self):
+        """_crowding_penalty 接受 safe/max_pct 参数，按自定义阈值衰减。"""
+        # safe=0.06, max=0.12: crowding=0.06 → 1.0(边界), 0.12 → FLOOR
+        assert _crowding_penalty(0.06, safe=0.06, max_pct=0.12) == 1.0
+        assert _crowding_penalty(0.12, safe=0.06, max_pct=0.12) == pytest.approx(CROWDING_FLOOR)
+
+    def test_dynamic_threshold_strong_factor_untouched(self):
+        """crowding 低于 safe(=median) 的强因子 penalty=1.0。"""
+        # 模拟实测分布: median≈0.064
+        median_safe = 0.064
+        p90_max = 0.103
+        # turnover crowding=0.0525 < median → 不惩罚
+        assert _crowding_penalty(0.0525, safe=median_safe, max_pct=p90_max) == 1.0
+        # margin_balance crowding=0.0517 < median → 不惩罚
+        assert _crowding_penalty(0.0517, safe=median_safe, max_pct=p90_max) == 1.0
+
+    def test_dynamic_threshold_crowded_factor_heavily_penalized(self):
+        """crowding > p90 的拥挤因子降到 FLOOR。"""
+        median_safe = 0.064
+        p90_max = 0.103
+        # nb_holding_pct crowding=0.143 > p90 → FLOOR
+        assert _crowding_penalty(0.143, safe=median_safe, max_pct=p90_max) == pytest.approx(CROWDING_FLOOR)
+
+    def test_dynamic_threshold_mid_range_linear(self):
+        """crowding 在 [median, p90] 之间线性衰减。"""
+        median_safe = 0.064
+        p90_max = 0.103
+        # short_ratio crowding=0.106 略超 p90 → 接近 FLOOR
+        p = _crowding_penalty(0.106, safe=median_safe, max_pct=p90_max)
+        assert p == pytest.approx(CROWDING_FLOOR)
+        # cfo_yield crowding=0.092 在中间 → 0.3~1.0 之间
+        p2 = _crowding_penalty(0.092, safe=median_safe, max_pct=p90_max)
+        assert CROWDING_FLOOR < p2 < 1.0
+
+    def test_default_params_match_old_behavior(self):
+        """不传 safe/max_pct 时用模块常量默认值（向后兼容）。"""
+        assert _crowding_penalty(0.05) == 1.0
+        assert _crowding_penalty(0.50) == pytest.approx(CROWDING_FLOOR)
+
+    def test_percentile_thresholds_from_known_distribution(self):
+        """构造已知分布验证分位数阈值计算逻辑。"""
+        # 模拟 evaluate_factor_ic 内部的分位数计算
+        vals = sorted([0.03, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30])
+        assert len(vals) >= 10
+        dyn_safe = vals[len(vals) // 2]  # median = vals[5] = 0.12
+        dyn_max = vals[int(len(vals) * 0.9)]  # p90 = vals[9] = 0.30
+        assert dyn_safe == pytest.approx(0.12)
+        assert dyn_max == pytest.approx(0.30)
+        # 用动态阈值验证
+        assert _crowding_penalty(0.12, safe=dyn_safe, max_pct=dyn_max) == 1.0
+        assert _crowding_penalty(0.30, safe=dyn_safe, max_pct=dyn_max) == pytest.approx(CROWDING_FLOOR)

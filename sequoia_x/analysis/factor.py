@@ -1242,13 +1242,22 @@ def evaluate_factor_ic(
     crowding_scores = _compute_crowding(
         records, sorted_months, ic_by_factor, industry_map,
     )
+    # P6修正：拥挤度阈值从绝对值改为分位数自适应——SAFE=median、MAX=p90。
+    # 实测固定值(0.08/0.30)脱离分布：37因子中位数仅0.056、p90=0.103，
+    # 绝对阈值导致惩罚几乎不触发。分位数随分布自适应，牛市拥挤上升自动收紧。
+    dyn_crowd_safe = CROWDING_SAFE
+    dyn_crowd_max = CROWDING_MAX
     if crowding_scores:
         vals = sorted(crowding_scores.values())
         med = vals[len(vals) // 2]
+        # 样本充足(≥10)时用分位数；不足则回退模块常量(安全降级)
+        if len(vals) >= 10:
+            dyn_crowd_safe = med
+            dyn_crowd_max = vals[int(len(vals) * 0.9)]
         logger.info(
             f"因子拥挤度(HHI)：{len(vals)}个因子 "
             f"min={vals[0]:.3f} median={med:.3f} max={vals[-1]:.3f} "
-            f"(衰减阈值 SAFE={CROWDING_SAFE}/MAX={CROWDING_MAX})"
+            f"(衰减阈值 SAFE={dyn_crowd_safe:.3f}/MAX={dyn_crowd_max:.3f})"
         )
 
     # ════════ P16: 因子正交化——IC 相关性聚类 + 增量 IC 权重折扣 ════════
@@ -1329,7 +1338,8 @@ def evaluate_factor_ic(
                 # 行业集中度是结构性属性，与市场态无关）
                 r["weight"] = round(
                     (r["ic_mean"] / total_ic)
-                    * _crowding_penalty(crowding_scores.get(r["factor_name"], 0.0))
+                    * _crowding_penalty(crowding_scores.get(r["factor_name"], 0.0),
+                                          dyn_crowd_safe, dyn_crowd_max)
                     * orth_penalties.get(r["factor_name"], 1.0), 4)
             state_weights[state] = state_reports
 
@@ -1462,7 +1472,8 @@ def evaluate_factor_ic(
                 # 乘子在归一化分母后施加，正确穿透 multi_factor 的 Σ|w| 再归一化。
                 "weight": round(
                     (f["ic_mean"] / total_ic)
-                    * _crowding_penalty(crowding_scores.get(f["name"], 0.0))
+                    * _crowding_penalty(crowding_scores.get(f["name"], 0.0),
+                                          dyn_crowd_safe, dyn_crowd_max)
                     * orth_penalties.get(f["name"], 1.0), 4),
             } for f in effective]
             engine.save_factor_weights(weights)
@@ -1609,24 +1620,27 @@ def _compute_crowding(
     return crowding
 
 
-def _crowding_penalty(crowding: float) -> float:
+def _crowding_penalty(crowding: float, safe: float = CROWDING_SAFE,
+                        max_pct: float = CROWDING_MAX) -> float:
     """拥挤度 → 软连续衰减乘子。
 
-    线性映射：c≤SAFE→1.0（不衰减）、c≥MAX→FLOOR（保留下限）、中间线性递减。
+    线性映射：c≤safe→1.0（不衰减）、c≥max_pct→FLOOR（保留下限）、中间线性递减。
     重度拥挤也不归零，保留分散价值（与 oos_decay 半保留下限哲学一致）。
 
     Args:
         crowding: HHI 拥挤度值（通常 0~1）。
+        safe: 安全线阈值，≤此值不衰减（默认模块常量，生产用动态分位数）。
+        max_pct: 重度拥挤线，≥此值衰减到 FLOOR。
 
     Returns:
         衰减乘子 [CROWDING_FLOOR, 1.0]。
     """
-    if crowding <= CROWDING_SAFE:
+    if crowding <= safe:
         return 1.0
-    if crowding >= CROWDING_MAX:
+    if crowding >= max_pct:
         return CROWDING_FLOOR
-    # 线性：1.0 在 SAFE，CROWDING_FLOOR 在 MAX
-    frac = (crowding - CROWDING_SAFE) / (CROWDING_MAX - CROWDING_SAFE)
+    # 线性：1.0 在 safe，CROWDING_FLOOR 在 max_pct
+    frac = (crowding - safe) / (max_pct - safe) if max_pct > safe else 1.0
     return round(1.0 - (1.0 - CROWDING_FLOOR) * frac, 4)
 
 
