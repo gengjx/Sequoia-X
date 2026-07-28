@@ -977,39 +977,30 @@ class PaperTradeEngine:
         return None
 
     def _fetch_realtime_prices_batch(self, symbols: list[str]) -> dict[str, float]:
-        """批量获取多只股票实时价格（单次 API 调用）。
+        """并发获取多只股票实时价格（绕过东财 0.4s 限流间隔的串行延迟）。
 
-        东财 push2 接口支持逗号分隔的 secid 列表批量查询，
-        一次请求获取全部持仓价格，消除逐只串行的 0.4s×N 限流延迟。
+        东财 stock/get 单只接口返回正确价格（f43/100），但限流间隔 0.4s
+        导致串行 N 只需 N×0.4s。用线程池并发请求，总耗时≈单次请求时间。
         """
-        import requests
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         if not symbols:
             return {}
-        secids = []
-        for sym in symbols:
-            market = "1" if sym.startswith(("6", "9")) else "0"
-            secids.append(f"{market}.{sym}")
-        try:
-            resp = requests.get(
-                "http://push2delay.eastmoney.com/api/qt/ulist.np/get",
-                params={
-                    "secids": ",".join(secids),
-                    "fields": "f12,f43",
-                    "fltt": "2",
-                },
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
-            )
-            data = resp.json().get("data", {}).get("diff", [])
-            prices = {}
-            for item in data:
-                code = item.get("f12", "")
-                price = item.get("f43", 0)
-                if code and price and price > 0:
-                    prices[code] = float(price)
-            return prices
-        except Exception:
-            return {}
+        prices: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+            futures = {
+                pool.submit(self._fetch_realtime_price, sym): sym
+                for sym in symbols
+            }
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    p = fut.result()
+                    if p and p > 0:
+                        prices[sym] = p
+                except Exception:
+                    pass
+        return prices
 
     def _get_close_prices_batch(self, symbols: list[str]) -> dict[str, float]:
         """批量获取多只股票收盘价（DB 优先，滞后时批量东财实时）。
