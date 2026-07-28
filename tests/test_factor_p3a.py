@@ -139,6 +139,6 @@ class TestThresholdConstants:
     def test_industrial_thresholds(self):
         """A 股月频工业标准门槛值。"""
         assert MIN_IC_ABS == 0.03
-        assert MIN_ICIR_ABS == 0.5
+        assert MIN_ICIR_ABS == 0.45
         assert MIN_T_STAT == 2.0
         assert MIN_IC_SAMPLES == 6

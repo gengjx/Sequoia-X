@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 # alpha 泄漏修复：旧门槛 |IC|>0.015 & ICIR>0.3 过低，放噪声因子进权重稀释强信号。
 # 新门槛三者全过才进权重（宁可少不要错），样本不足(n<MIN_IC_SAMPLES)的因子默认不显著。
 MIN_IC_ABS = 0.03       # IC 绝对值下限
-MIN_ICIR_ABS = 0.5      # ICIR 绝对值下限（信息比率）
+MIN_ICIR_ABS = 0.45     # ICIR 绝对值下限（信息比率，降0.45纳入profit_growth等边界因子）
 MIN_T_STAT = 2.0        # t 统计量下限（≈95% 置信），样本不足时可下调到 1.65(90%)
 MIN_IC_SAMPLES = 6      # 最少月度 IC 观测数，否则默认不显著
 
@@ -1276,6 +1276,8 @@ def evaluate_factor_ic(
         {"high_dist", "oversold"},
         {"atr_pct", "vol_20"},
         {"asset_turn", "inv_turn", "nr_turn"},
+        # 机构持仓与流动性高度冗余（IC r=0.616），保留 IC 更强的 turnover
+        {"fund_holding", "turnover"},
     ]
     _deduped_removed: set[str] = set()
     # 同义组中 IC 相同时，优先保留组中定义靠前的因子（canonical 名）
