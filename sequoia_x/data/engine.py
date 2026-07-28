@@ -1,5 +1,6 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
+import time
 import sqlite3
 from pathlib import Path
 
