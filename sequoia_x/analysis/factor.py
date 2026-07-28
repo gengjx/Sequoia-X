@@ -800,8 +800,8 @@ def evaluate_factor_ic(
     # 加载质量因子的月度截面（按财报季度月份匹配）
     # stat_date 格式 YYYY-MM-DD，取 YYYY-MM 作为截面月份
     quality_factors = {"roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
-                       "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
-                       "cfo_yield", "earnings_quality"}
+                    "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
+                    "cfo_yield", "earnings_quality", "debt_ratio", "roe_leverage"}
     valuation_factors = {"pe_ratio", "pb_ratio"}
     # 因子名 → stock_finance 字段名映射（IC评估逐月取截面值用）
     _finance_field_map = {
@@ -810,6 +810,7 @@ def evaluate_factor_ic(
         "yoy_ni": "yoy_ni", "asset_turn": "asset_turn",
         "inv_turn": "inv_turn", "nr_turn": "nr_turn",
         "cfo_yield": "cfo_to_or", "earnings_quality": "cfo_to_np",
+        "debt_ratio": "liability_to_asset", "roe_leverage": "equity_multiplier",
     }
     has_quality = bool(set(factor_set) & quality_factors)
     has_valuation = bool(set(factor_set) & valuation_factors)
@@ -820,16 +821,18 @@ def evaluate_factor_ic(
             with _sq.connect(engine.db_path) as _conn:
                 _rows = _conn.execute(
                     """SELECT symbol, stat_date, roe, np_margin, gp_margin, yoy_eps, yoy_pni,
-                              yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np
-                       FROM stock_finance WHERE stat_date LIKE '%-03-31' OR stat_date LIKE '%-06-30' OR stat_date LIKE '%-09-30' OR stat_date LIKE '%-12-31' ORDER BY symbol, stat_date"""
+                    yoy_ni, asset_turn, inv_turn, nr_turn, cfo_to_or, cfo_to_np
+                    , liability_to_asset, equity_multiplier
+                    FROM stock_finance WHERE stat_date LIKE '%-03-31' OR stat_date LIKE '%-06-30' OR stat_date LIKE '%-09-30' OR stat_date LIKE '%-12-31' ORDER BY symbol, stat_date"""
                 ).fetchall()
-            for r in _rows:
-                finance_map.setdefault(r[0], []).append((r[1], {
-                    "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
-                    "yoy_eps": r[5], "yoy_pni": r[6],
-                    "yoy_ni": r[7], "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
-                    "cfo_to_or": r[11], "cfo_to_np": r[12],
-                }))
+                for r in _rows:
+                    finance_map.setdefault(r[0], []).append((r[1], {
+                        "roe": r[2], "np_margin": r[3], "gp_margin": r[4],
+                        "yoy_eps": r[5], "yoy_pni": r[6],
+                        "yoy_ni": r[7], "asset_turn": r[8], "inv_turn": r[9], "nr_turn": r[10],
+                        "cfo_to_or": r[11], "cfo_to_np": r[12],
+                        "liability_to_asset": r[13], "equity_multiplier": r[14],
+                    }))
             logger.info(f"因子IC评估：加载财报 {len(finance_map)} 只股票")
         except Exception as e:
             logger.warning(f"因子IC评估：财报加载失败：{e!r}")
