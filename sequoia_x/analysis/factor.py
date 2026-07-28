@@ -107,6 +107,8 @@ FACTOR_META: dict[str, dict] = {
     "profit_growth":{"category": "质量", "desc": "利润增速"},
     "cfo_yield":   {"category": "盈利质量", "desc": "经营现金流/营收（现金收益率，高=盈利扎实）"},
     "earnings_quality": {"category": "盈利质量", "desc": "经营现金流/净利润（盈余质量，高=真实盈利）"},
+    "debt_ratio":  {"category": "偿债能力", "desc": "资产负债率（高=熊市暴雷风险）", "reverse": True},
+    "roe_leverage":{"category": "盈利质量", "desc": "杜邦权益乘数（高=ROE来自杠杆而非利润）", "reverse": True},
     # ── 成长(1)（同比增长率，来自stock_finance）──
     "yoy_ni":      {"category": "成长", "desc": "净利润同比增长率"},
     # ── 估值(2) ──
@@ -352,10 +354,13 @@ def compute_factors(df: pd.DataFrame, finance: dict | None = None,
         # 盈利质量（现金流比率，P15）
         factors["cfo_yield"] = _safe_float(finance.get("cfo_to_or"))      # 经营现金流/营收
         factors["earnings_quality"] = _safe_float(finance.get("cfo_to_np"))  # 经营现金流/净利润
+        # 偿债能力 + 杜邦杠杆（P18）
+        factors["debt_ratio"] = _safe_float(finance.get("liability_to_asset"))
+        factors["roe_leverage"] = _safe_float(finance.get("equity_multiplier"))
     else:
         for k in ["roe", "np_margin", "gp_margin", "rev_growth", "profit_growth",
-                  "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
-                  "cfo_yield", "earnings_quality"]:
+                 "yoy_ni", "asset_turn", "inv_turn", "nr_turn",
+                 "cfo_yield", "earnings_quality", "debt_ratio", "roe_leverage"]:
             factors[k] = np.nan
 
     # ════════ 北向资金(2)（沪深港通持股）════════
@@ -1278,6 +1283,8 @@ def evaluate_factor_ic(
         {"asset_turn", "inv_turn", "nr_turn"},
         # 机构持仓与流动性高度冗余（IC r=0.616），保留 IC 更强的 turnover
         {"fund_holding", "turnover"},
+        # 杠杆因子冗余：debt_ratio 与 roe_leverage 数学相关（权益乘数=1/(1-资产负债率)）
+        {"debt_ratio", "roe_leverage"},
     ]
     _deduped_removed: set[str] = set()
     # 同义组中 IC 相同时，优先保留组中定义靠前的因子（canonical 名）

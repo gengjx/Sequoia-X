@@ -63,6 +63,9 @@ _AK_MAP: dict[tuple[str, str], tuple[str, float]] = {
     ("营运能力", "应收账款周转率"): ("nr_turn", 1.0),
     ("收益质量", "经营性现金净流量/营业总收入"): ("cfo_to_or", 1.0),
     ("收益质量", "经营活动净现金/归属母公司的净利润"): ("cfo_to_np", 1.0),
+    # 偿债能力 + 杜邦杠杆（财务风险分类，同一 API 返回，零额外调用）
+    ("常用指标", "资产负债率"): ("liability_to_asset", 100.0),
+   ("财务风险", "权益乘数"): ("equity_multiplier", 1.0),
 }
 
 
@@ -82,6 +85,7 @@ def _fetch_batch(args: tuple) -> list[dict]:
         "net_profit", "eps_ttm", "revenue", "yoy_equity", "yoy_asset", "yoy_ni",
         "yoy_eps", "yoy_pni", "nr_turn", "inv_turn", "asset_turn",
         "cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio",
+        "liability_to_asset", "equity_multiplier",
     ]
 
     quota_exhausted = False
@@ -134,6 +138,12 @@ def _fetch_batch(args: tuple) -> list[dict]:
                     rec["cfo_to_or"] = _sf(c[7])
                     rec["cfo_to_np"] = _sf(c[8])
                     rec["cfo_to_gr"] = _sf(c[9])
+
+                # 资产负债表（query_balance_data）：资产负债率 = 负债总额/资产总额
+                rb = bs.query_balance_data(code=bs_code, year=year, quarter=quarter)
+                while rb.next():
+                    b = rb.get_row_data()
+                    rec["liability_to_asset"] = _sf(b[7])
 
                 results.append(rec)
             except Exception:
@@ -189,6 +199,7 @@ class FinanceSync:
                 "yoy_equity REAL, yoy_asset REAL, yoy_ni REAL, yoy_eps REAL, yoy_pni REAL,"
                 "nr_turn REAL, inv_turn REAL, asset_turn REAL,"
                 "cfo_to_or REAL, cfo_to_np REAL, cfo_to_gr REAL, tangible_ratio REAL,"
+                "liability_to_asset REAL, equity_multiplier REAL,"
                 "PRIMARY KEY (symbol, stat_date))"
             )
             # 幂等迁移：现有表补现金流比率列（P15 盈利质量因子）
@@ -199,6 +210,14 @@ class FinanceSync:
                     )
                 except sqlite3.OperationalError:
                     pass  # 列已存在
+            # 幂等迁移：资产负债率 + 权益乘数（P18 偿债能力+杜邦杠杆因子）
+            for col in ("liability_to_asset", "equity_multiplier"):
+                try:
+                    conn.execute(
+                        f"ALTER TABLE stock_finance ADD COLUMN {col} REAL"
+                    )
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
         # 获取全市场代码
@@ -384,6 +403,7 @@ class FinanceSync:
             "net_profit", "eps_ttm", "revenue", "yoy_equity", "yoy_asset", "yoy_ni",
             "yoy_eps", "yoy_pni", "nr_turn", "inv_turn", "asset_turn",
             "cfo_to_or", "cfo_to_np", "cfo_to_gr", "tangible_ratio",
+            "liability_to_asset", "equity_multiplier",
         ]
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(
