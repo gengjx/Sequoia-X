@@ -237,7 +237,7 @@ class MLFactorEngine:
         sample_date = monthly_dates[months[-1]]
         sample_syms = [r[0] for r in conn.execute(
             "SELECT DISTINCT symbol FROM stock_daily "
-            "WHERE date=? AND volume > 1000000 ORDER BY symbol LIMIT 800",
+            "WHERE date=? AND volume > 1000000 ORDER BY symbol LIMIT 2000",
             (sample_date,),
         ).fetchall()]
 

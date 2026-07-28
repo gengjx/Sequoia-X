@@ -1263,8 +1263,44 @@ def evaluate_factor_ic(
             f"(衰减阈值 SAFE={dyn_crowd_safe:.3f}/MAX={dyn_crowd_max:.3f})"
         )
 
-    # ════════ P16: 因子正交化——IC 相关性聚类 + 增量 IC 权重折扣 ════════
-    ic_corr = _build_ic_correlation(ic_series, sorted(factor_set))
+    # ════════ P4 同义去重（提前到正交化之前）════════
+    # 先做手工同义组去重，避免正交化和去重双重消除同一因子（如 turnover 被
+    # 正交化惩罚到~0、liq_rank 又被去重踢掉，两者都归零）。
+    _SYNONYM_GROUPS = [
+        {"mom_5", "rev_5"},
+        {"mom_10", "rev_10"},
+        {"mom_20", "rev_20"},
+        {"turnover", "liq_rank"},
+        {"turn_surge", "vol_surge"},
+        {"turn_ma5", "turn_ratio"},
+        {"high_dist", "oversold"},
+        {"atr_pct", "vol_20"},
+        {"asset_turn", "inv_turn", "nr_turn"},
+    ]
+    _deduped_removed: set[str] = set()
+    # 同义组中 IC 相同时，优先保留组中定义靠前的因子（canonical 名）
+    _CANONICAL_PRIORITY = {
+        "turnover", "vol_20", "asset_turn", "turn_surge", "turn_ma5",
+        "high_dist", "mom_5", "mom_10", "mom_20",
+    }
+    for group in _SYNONYM_GROUPS:
+        in_set = [f for f in factor_set if f in group]
+        if len(in_set) > 1:
+            best = max(in_set, key=lambda x: (
+                abs(ic_by_factor.get(x, 0)) + (0.001 if x in _CANONICAL_PRIORITY else 0),
+            ))
+            for f in in_set:
+                if f != best:
+                    _deduped_removed.add(f)
+    _factor_set_deduped = sorted(f for f in factor_set if f not in _deduped_removed)
+    if _deduped_removed:
+        logger.info(
+            f"因子去重：剔除{len(_deduped_removed)}个同义因子"
+            f"({', '.join(sorted(_deduped_removed))})"
+        )
+
+    # ════════ P16: 因子正交化——在去重后的因子集上算 IC 相关性 ════════
+    ic_corr = _build_ic_correlation(ic_series, _factor_set_deduped)
     orth_clusters = _cluster_factors(ic_corr, ORTH_THRESHOLD) if not ic_corr.empty else {}
     orth_penalties = _orthogonal_penalty(ic_corr, orth_clusters, ic_by_factor) if orth_clusters else {}
     if orth_clusters:
@@ -1317,6 +1353,8 @@ def evaluate_factor_ic(
     for state in ("bull", "neutral", "bear"):
         state_reports = []
         for f in factor_set:
+            if f in _deduped_removed:
+                continue  # 同义去重：与全局口径一致，跳过被剔除的因子
             ics = [x for x in state_ic_series[state][f] if not np.isnan(x)]
             if len(ics) < 3:
                 continue
@@ -1416,37 +1454,10 @@ def evaluate_factor_ic(
                      if _is_significant(f["ic_mean"], f.get("icir", 0),
                                         f.get("t_stat", 0), f.get("n_samples", 0))]
 
-        # P4: 因子去重——剔除同义因子，只保留每组IC最强的
-        # 定义同义因子组（因子值高度相关，来自截面相关性分析）
-        _SYNONYM_GROUPS = [
-            # 动量/反转互为镜像，只保留IC绝对值最大的一个
-            {"mom_5", "rev_5"},
-            {"mom_10", "rev_10"},
-            {"mom_20", "rev_20"},
-            # 流动性三重计数
-            {"turnover", "liq_rank"},
-            # 换手率重复
-            {"turn_surge", "vol_surge"},
-            {"turn_ma5", "turn_ratio"},
-            # 高位距离/超卖镜像
-            {"high_dist", "oversold"},
-            # 波动率高度相关
-            {"atr_pct", "vol_20"},
-            # 营运效率周转率高度相关
-            {"asset_turn", "inv_turn", "nr_turn"},
-        ]
-        removed = set()
-        for group in _SYNONYM_GROUPS:
-            in_effective = [f for f in effective if f["name"] in group]
-            if len(in_effective) > 1:
-                # 保留 |IC| 最大的
-                best = max(in_effective, key=lambda x: abs(x["ic_mean"]))
-                for f in in_effective:
-                    if f["name"] != best["name"]:
-                        removed.add(f["name"])
-        if removed:
-            effective = [f for f in effective if f["name"] not in removed]
-            logger.info(f"因子去重：剔除{len(removed)}个同义因子({', '.join(sorted(removed))})")
+        # P4 同义去重已在正交化前完成（_deduped_removed），此处仅按显著性过滤后
+        # 剔除已标记的同义因子（它们可能通过了显著性门槛但仍需去重）。
+        if _deduped_removed:
+            effective = [f for f in effective if f["name"] not in _deduped_removed]
 
         total_ic = sum(abs(f["ic_mean"]) for f in effective)
         # 先备份 ML 因子权重（全量清零会抹掉 ml_factor 月度训练写入的 ml_score）
