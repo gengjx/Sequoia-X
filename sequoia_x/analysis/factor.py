@@ -1461,28 +1461,48 @@ def evaluate_factor_ic(
                 _ml_backup = _ml_row
             # 清零所有因子的旧权重（无条件执行，防 total_ic==0 时 stale 权重残留）
             _conn.execute("UPDATE factor_weights SET weight=0")
+        # 构建全量写入列表：有效因子写真实权重，非有效因子写 weight=0
+        # 但保留本次评估的 ic_mean/icir/t_stat（消除陈旧值造成系统级误导）
+        effective_names = {f["name"] for f in effective}
+        all_weights = []
         if total_ic > 0:
-            # 写入新的带符号权重
-            weights = [{
-                "factor_name": f["name"],
-                "category": f.get("category", ""),
-                "ic_mean": f["ic_mean"],
-                "icir": f.get("icir", 0),
-                "t_stat": f.get("t_stat", 0),
-                "win_rate": f.get("win_rate", 0),
-                "crowding": crowding_scores.get(f["name"], 0.0),
-                # P6: 权重 = (IC/|ΣIC|) × 拥挤度软衰减 × P16 正交化折扣
-                # 乘子在归一化分母后施加，正确穿透 multi_factor 的 Σ|w| 再归一化。
-                "weight": round(
-                    (f["ic_mean"] / total_ic)
-                    * _crowding_penalty(crowding_scores.get(f["name"], 0.0),
-                                          dyn_crowd_safe, dyn_crowd_max)
-                    * orth_penalties.get(f["name"], 1.0), 4),
-            } for f in effective]
-            engine.save_factor_weights(weights)
-            pos_cnt = sum(1 for w in weights if w["weight"] > 0)
-            neg_cnt = sum(1 for w in weights if w["weight"] < 0)
-            logger.info(f"因子权重已刷新写入DB：{len(weights)}个有效因子（{pos_cnt}正+{neg_cnt}负）")
+            for f in effective:
+                all_weights.append({
+                    "factor_name": f["name"],
+                    "category": f.get("category", ""),
+                    "ic_mean": f["ic_mean"],
+                    "icir": f.get("icir", 0),
+                    "t_stat": f.get("t_stat", 0),
+                    "win_rate": f.get("win_rate", 0),
+                    "crowding": crowding_scores.get(f["name"], 0.0),
+                    # P6: 权重 = (IC/|ΣIC|) × 拥挤度软衰减 × P16 正交化折扣
+                    "weight": round(
+                        (f["ic_mean"] / total_ic)
+                        * _crowding_penalty(crowding_scores.get(f["name"], 0.0),
+                                              dyn_crowd_safe, dyn_crowd_max)
+                        * orth_penalties.get(f["name"], 1.0), 4),
+                })
+        for f in factor_reports:
+            if f["name"] not in effective_names:
+                all_weights.append({
+                    "factor_name": f["name"],
+                    "category": f.get("category", ""),
+                    "ic_mean": f["ic_mean"],
+                    "icir": f.get("icir", 0),
+                    "t_stat": f.get("t_stat", 0),
+                    "win_rate": f.get("win_rate", 0),
+                    "crowding": crowding_scores.get(f["name"], 0.0),
+                    "weight": 0,
+                })
+        engine.save_factor_weights(all_weights)
+        if total_ic > 0:
+            pos_cnt = sum(1 for w in all_weights if w["weight"] > 0)
+            neg_cnt = sum(1 for w in all_weights if w["weight"] < 0)
+            stale = len(all_weights) - len(effective)
+            logger.info(
+                f"因子权重已刷新写入DB：{len(effective)}个有效因子"
+                f"（{pos_cnt}正+{neg_cnt}负），{stale}个非有效因子ic已更新"
+            )
         else:
             logger.warning("无因子通过显著性过滤(0.03/0.5/2.0)，权重已全量清零，检查数据/窗口")
         # 恢复 ML 因子权重（防止全量清零泄漏 ml_factor 月度训练结果）
@@ -1490,8 +1510,8 @@ def evaluate_factor_ic(
             with _sq3.connect(engine.db_path, isolation_level=None) as _conn:
                 _conn.execute(
                     "INSERT OR REPLACE INTO factor_weights "
-                    "(factor_name, category, ic_mean, icir, win_rate, weight, updated_at) "
-                    "VALUES ('ml_score','ML因子',?,?,?,?,?)",
+                    "(factor_name, category, ic_mean, icir, win_rate, weight, t_stat, updated_at) "
+                    "VALUES ('ml_score','ML因子',?,?,?,?,0,?)",
                     (_ml_backup[1], _ml_backup[2], _ml_backup[3], _ml_backup[0], _ml_backup[4]),
                 )
             logger.info(f"ML因子权重已恢复：weight={_ml_backup[0]:.4f}（不被IC刷新清零）")

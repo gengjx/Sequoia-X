@@ -400,6 +400,8 @@ class DataEngine:
             _fw_cols = {r[1] for r in conn.execute("PRAGMA table_info(factor_weights)")}
             if "crowding" not in _fw_cols:
                 conn.execute("ALTER TABLE factor_weights ADD COLUMN crowding REAL DEFAULT 0")
+            if "t_stat" not in _fw_cols:
+                conn.execute("ALTER TABLE factor_weights ADD COLUMN t_stat REAL DEFAULT 0")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -415,13 +417,13 @@ class DataEngine:
         """批量写入因子IC权重（UPSERT）。
 
         Args:
-            weights: [{factor_name, category, ic_mean, icir, win_rate, weight}, ...]
+            weights: [{factor_name, category, ic_mean, icir, win_rate, weight, t_stat}, ...]
         """
         import time
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         sql = ("INSERT OR REPLACE INTO factor_weights "
-               "(factor_name, category, ic_mean, icir, win_rate, weight, crowding, updated_at) "
-               "VALUES (?,?,?,?,?,?,?,?)")
+               "(factor_name, category, ic_mean, icir, win_rate, weight, crowding, t_stat, updated_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?)")
         conn = sqlite3.connect(self.db_path, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout=5000")
@@ -429,14 +431,14 @@ class DataEngine:
                 conn.execute(sql, (
                     w["factor_name"], w.get("category", ""),
                     w["ic_mean"], w.get("icir", 0), w.get("win_rate", 0),
-                    w["weight"], w.get("crowding", 0), now,
+                    w["weight"], w.get("crowding", 0), w.get("t_stat", 0), now,
                 ))
         finally:
             conn.close()
 
     def load_factor_weights(self) -> dict[str, dict]:
         """读取全部因子权重，返回 {factor_name: {weight, ic_mean, ...}}。"""
-        sql = ("SELECT factor_name, category, ic_mean, icir, win_rate, weight, crowding, updated_at "
+        sql = ("SELECT factor_name, category, ic_mean, icir, win_rate, weight, crowding, t_stat, updated_at "
                "FROM factor_weights")
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(sql).fetchall()
@@ -444,7 +446,7 @@ class DataEngine:
             r[0]: {
                 "category": r[1], "ic_mean": r[2], "icir": r[3],
                 "win_rate": r[4], "weight": r[5], "crowding": r[6],
-                "updated_at": r[7],
+                "t_stat": r[7], "updated_at": r[8],
             }
             for r in rows
         }
