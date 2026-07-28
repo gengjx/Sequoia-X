@@ -49,7 +49,7 @@ STRATEGY_META: dict[str, dict] = {
         "name": "HighTightFlag",
         "name_cn": "高位旗形",
         "description": "40日涨幅>60% + 10日窄幅震荡 + 缩量整理",
-        "role": "active",  # 辅助策略：年化+7.0%
+        "role": "demoted",  # 降权：边际alpha -11.2pp，负超额，退出默认决策池
         "min_bars": 40,
     },
     "shakeout": {
@@ -135,7 +135,7 @@ STRATEGY_META: dict[str, dict] = {
 # supplementary: 信息/事件类，不参与选股 alpha 但有独立推送价值
 # retired:      完整周期亏损，已废弃
 CORE_STRATEGY_KEYS: list[str] = ["multi_factor"]
-ACTIVE_STRATEGY_KEYS: list[str] = ["multi_factor", "bottom", "flag"]
+ACTIVE_STRATEGY_KEYS: list[str] = ["multi_factor", "bottom"]
 ALL_ACTIVE_KEYS: list[str] = [
     k for k, v in STRATEGY_META.items() if v.get("role") in ("core", "active", "demoted")
 ]

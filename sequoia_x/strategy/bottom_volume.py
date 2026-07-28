@@ -18,11 +18,14 @@ class BottomVolumeStrategy(BaseStrategy):
     风险较高，仅作信号提示，需配合严格止损（设在近期低点下方）。
 
     选股条件（全部向量化，严禁 iterrows）：
-    1. 持续下跌：近20日高点至今日跌幅 > 15%（超跌确认）
-    2. 异动放量：当日 volume > 5日均量 × 3（恐慌底放量）
+    1. 持续下跌：近20日高点至今日跌幅 > 12%（超跌确认）
+    2. 异动放量：当日 volume > 5日均量 × 2（恐慌底放量）
     3. 阳线企稳：当日 close > open（收阳，买方承接）
-    4. 下影线支撑：当日下影线长度 > 实体长度 × 2（买方防守有效）
-    5. 流动性：当日 turnover > 100,000,000
+    4. 下影线支撑：当日下影线长度 > 实体长度 × 0.5（买方防守有效）
+    5. 流动性：当日 turnover > 50,000,000（5000万最小可交易底线）
+
+    阈值对齐回测验证版（combo_backtest._compute_signals）：宽松版回测区间出 117 命中、
+    边际alpha +24.5pp（全策略中最强）。此前实盘用更严阈值导致常年 0 命中。
 
     Attributes:
         webhook_key: 路由到 'bottom' 专属飞书机器人。
@@ -51,23 +54,23 @@ class BottomVolumeStrategy(BaseStrategy):
                 if pd.isna(last["vol_ma5"]) or pd.isna(last["high_20"]):
                     continue
 
-                # 条件 1：持续下跌（近20日高点至今跌幅 > 15%）
+                # 条件 1：持续下跌（近20日高点至今跌幅 > 12%）
                 drawdown = (last["high_20"] - last["close"]) / last["high_20"] * 100
-                oversold = drawdown > 15.0
+                oversold = drawdown > 12.0
 
-                # 条件 2：异动放量（当日量 > 5日均量 × 3）
-                volume_surge = last["volume"] > last["vol_ma5"] * 3
+                # 条件 2：异动放量（当日量 > 5日均量 × 2）
+                volume_surge = last["volume"] > last["vol_ma5"] * 2
 
                 # 条件 3：阳线企稳（收阳）
                 is_yang = last["close"] > last["open"]
 
-                # 条件 4：下影线支撑（下影线 > 实体 × 2）
+                # 条件 4：下影线支撑（下影线 > 实体 × 0.5）
                 body = abs(last["close"] - last["open"])
                 lower_shadow = min(last["open"], last["close"]) - last["low"]
-                long_lower_shadow = body > 0 and lower_shadow > body * 2
+                long_lower_shadow = body > 0 and lower_shadow > body * 0.5
 
                 # 条件 5：流动性
-                liquid = last["turnover"] > 100_000_000
+                liquid = last["turnover"] > 50_000_000
 
                 if oversold and volume_surge and is_yang and long_lower_shadow and liquid:
                     selected.append(symbol)

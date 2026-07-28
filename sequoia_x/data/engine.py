@@ -494,10 +494,20 @@ class DataEngine:
         # oos_decay 列迁移（幂等）：样本外衰减率，默认1.0=完全延续
         self._ensure_column("strategy_weights", "oos_decay", "REAL DEFAULT 1.0")
         self._ensure_column("strategy_weights", "marginal_alpha", "REAL DEFAULT 0")
-        sql = ("INSERT OR REPLACE INTO strategy_weights "
-               "(strategy_key, quality_score, sharpe, max_dd, alpha, calmar, "
-               "win_rate, pl_ratio, annual_return, sample_trades, oos_decay, marginal_alpha, updated_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        # 列保留 UPSERT：quality/sharpe/... 等刷新，但 marginal_alpha 仅由
+        # compute_strategy_marginal 专用路径写入，避免此处清零。
+        sql = (
+            "INSERT INTO strategy_weights "
+            "(strategy_key, quality_score, sharpe, max_dd, alpha, calmar, "
+            "win_rate, pl_ratio, annual_return, sample_trades, oos_decay, marginal_alpha, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(strategy_key) DO UPDATE SET "
+            "quality_score=excluded.quality_score, sharpe=excluded.sharpe, "
+            "max_dd=excluded.max_dd, alpha=excluded.alpha, calmar=excluded.calmar, "
+            "win_rate=excluded.win_rate, pl_ratio=excluded.pl_ratio, "
+            "annual_return=excluded.annual_return, sample_trades=excluded.sample_trades, "
+            "oos_decay=excluded.oos_decay, updated_at=excluded.updated_at"
+        )
         with sqlite3.connect(self.db_path) as conn:
             for w in weights:
                 conn.execute(sql, (

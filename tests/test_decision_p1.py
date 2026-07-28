@@ -149,8 +149,8 @@ class TestPositionConcentration:
 class TestEntryQuality:
     def test_active_keys_excludes_demoted(self):
         """默认策略池仅含 core+active，不含 demoted 弱策略。"""
-        demoted = {"ma_volume", "pullback", "volume_extreme"}
-        assert ACTIVE_STRATEGY_KEYS == ["multi_factor", "bottom", "flag"]
+        demoted = {"ma_volume", "pullback", "volume_extreme", "flag"}
+        assert ACTIVE_STRATEGY_KEYS == ["multi_factor", "bottom"]
         assert not (set(ACTIVE_STRATEGY_KEYS) & demoted)
 
     def test_active_keys_excludes_retired(self):
