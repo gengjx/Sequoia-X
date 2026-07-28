@@ -731,10 +731,12 @@ class PaperTradeEngine:
         cash = account.get("cash", 0)
         initial = account.get("initial_capital", 100000)
 
-        # 持仓市值（用最新收盘价）
+        # 持仓市值（批量获取收盘价，避免逐只串行东财请求）
+        sym_list = [h["symbol"] for h in holdings]
+        close_prices = self._get_close_prices_batch(sym_list)
         market_value = 0
         for h in holdings:
-            price = self._get_close_price(h["symbol"])
+            price = close_prices.get(h["symbol"])
             if price:
                 market_value += price * h["shares"]
 
@@ -973,6 +975,85 @@ class PaperTradeEngine:
         except Exception:
             pass
         return None
+
+    def _fetch_realtime_prices_batch(self, symbols: list[str]) -> dict[str, float]:
+        """批量获取多只股票实时价格（单次 API 调用）。
+
+        东财 push2 接口支持逗号分隔的 secid 列表批量查询，
+        一次请求获取全部持仓价格，消除逐只串行的 0.4s×N 限流延迟。
+        """
+        import requests
+        if not symbols:
+            return {}
+        secids = []
+        for sym in symbols:
+            market = "1" if sym.startswith(("6", "9")) else "0"
+            secids.append(f"{market}.{sym}")
+        try:
+            resp = requests.get(
+                "http://push2delay.eastmoney.com/api/qt/ulist.np/get",
+                params={
+                    "secids": ",".join(secids),
+                    "fields": "f12,f43",
+                    "fltt": "2",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8,
+            )
+            data = resp.json().get("data", {}).get("diff", [])
+            prices = {}
+            for item in data:
+                code = item.get("f12", "")
+                price = item.get("f43", 0)
+                if code and price and price > 0:
+                    prices[code] = float(price)
+            return prices
+        except Exception:
+            return {}
+
+    def _get_close_prices_batch(self, symbols: list[str]) -> dict[str, float]:
+        """批量获取多只股票收盘价（DB 优先，滞后时批量东财实时）。
+
+        性能：N 只持仓 = 1 次 DB 查询 + 最多 1 次东财批量请求，
+        替代原来 N 次串行 _get_close_price（每只含独立东财请求）。
+        """
+        from datetime import date as _date
+
+        if not symbols:
+            return {}
+        today = _date.today().strftime("%Y-%m-%d")
+        prices: dict[str, float] = {}
+        stale_syms: list[str] = []
+
+        # 一次 DB 查询取全部持仓的最新日K
+        placeholders = ",".join("?" * len(symbols))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT symbol, date, close FROM stock_daily "
+                f"WHERE symbol IN ({placeholders}) "
+                f"AND date IN (SELECT MAX(date) FROM stock_daily WHERE symbol IN ({placeholders}))",
+                (*symbols, *symbols),
+            ).fetchall()
+
+        for r in rows:
+            sym, d, close = r["symbol"], r["date"], r["close"]
+            if d >= today:
+                prices[sym] = round(close, 3)
+            else:
+                stale_syms.append(sym)
+
+        # 日K滞后的持仓 → 批量东财实时（1次请求）
+        if stale_syms:
+            rt = self._fetch_realtime_prices_batch(stale_syms)
+            for sym in stale_syms:
+                if sym in rt:
+                    prices[sym] = rt[sym]
+                elif sym in dict((r["symbol"], r["close"]) for r in rows if r["symbol"] == sym):
+                    # 东财失败 → fallback DB 最近
+                    db_close = next((r["close"] for r in rows if r["symbol"] == sym), None)
+                    if db_close:
+                        prices[sym] = round(db_close, 3)
+        return prices
 
     def _calc_holding_value(self, holdings: list[dict]) -> float:
         """计算持仓总市值。"""
