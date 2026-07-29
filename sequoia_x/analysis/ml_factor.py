@@ -144,6 +144,19 @@ class MLFactorEngine:
 
         logger.info(f"Walk-forward：生成 {len(target_months)} 个月份的 ML 快照（{target_months[0]}~{target_months[-1]}）")
 
+        # 预计算全部因子快照 ONCE（~17 分钟），后续每月只做切片+训练
+        t_pre = time.time()
+        logger.info("Walk-forward：预计算全部月份因子快照...")
+        all_data = self._precompute_all_factors()
+        logger.info(
+            f"Walk-forward：预计算完成，{len(all_data)}条记录"
+            f"（{time.time() - t_pre:.0f}s）"
+        )
+        data_by_month: dict[str, list[dict]] = {}
+        for rec in all_data:
+            data_by_month.setdefault(rec["month"], []).append(rec)
+        precomputed_months = sorted(data_by_month.keys())
+
         generated = 0
         ic_list = []
         total = len(target_months)
@@ -151,8 +164,15 @@ class MLFactorEngine:
             if progress_callback:
                 progress_callback(i, total, f"walk-forward {month} ({i+1}/{total})")
 
-            # PIT 训练：只用 ≤ month 的数据
-            data = self._collect_training_data(as_of_month=month)
+            # 从预计算数据切片：取 ≤ month 的最近 TRAIN_MONTHS+3 个月
+            usable = [m for m in precomputed_months if m <= month]
+            if len(usable) < self.TRAIN_MONTHS + 2:
+                logger.debug(f"Walk-forward {month}：数据不足，跳过")
+                continue
+            train_months = usable[-(self.TRAIN_MONTHS + 3):]
+            data: list[dict] = []
+            for m in train_months:
+                data.extend(data_by_month.get(m, []))
             if not data or len(data) < 100:
                 logger.debug(f"Walk-forward {month}：数据不足，跳过")
                 continue
@@ -205,6 +225,112 @@ class MLFactorEngine:
                 conn.commit()
         except Exception as e:
             logger.warning(f"Walk-forward 快照写入失败（{run_date}）：{e!r}")
+
+    def _precompute_all_factors(self) -> list[dict]:
+        """预计算全部月份×全部股票的因子截面（一次性，供 walk-forward 复用）。
+
+        与 _collect_training_data 相同的因子计算逻辑，但遍历全部可用月份
+        （非仅最后 TRAIN_MONTHS+3 个月），且数据只加载一次（K 线/财报/资金流/北向）。
+        返回扁平列表 [{month, symbol, features, fwd_return}, ...]。
+        """
+        conn = sqlite3.connect(self.db_path)
+
+        dates = pd.read_sql(
+            "SELECT DISTINCT date FROM stock_daily ORDER BY date", conn
+        )["date"].tolist()
+        monthly_dates: dict[str, str] = {}
+        for d in dates:
+            month = d[:7]
+            monthly_dates[month] = d
+        monthly_dates = dict(sorted(monthly_dates.items()))
+
+        months = list(monthly_dates.keys())
+        if len(months) < self.TRAIN_MONTHS + 2:
+            conn.close()
+            return []
+
+        sample_date = monthly_dates[months[-1]]
+        sample_syms = [r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM stock_daily "
+            "WHERE date=? AND volume > 1000000 ORDER BY symbol LIMIT 2000",
+            (sample_date,),
+        ).fetchall()]
+
+        logger.info(f"ML因子预计算：加载{len(sample_syms)}只股票K线...")
+        stock_data: dict[str, pd.DataFrame] = {}
+        for sym in sample_syms:
+            df = pd.read_sql(
+                "SELECT * FROM stock_daily WHERE symbol=? ORDER BY date",
+                conn, params=(sym,),
+            )
+            if len(df) >= 250:
+                stock_data[sym] = df
+
+        from sequoia_x.analysis.factor import compute_factors
+
+        finance_map = self._load_finance_map(conn)
+        valuation_map = self._load_valuation_map(conn)
+        fund_flow_map = self._load_fund_flow_map(conn)
+        north_map = self._load_north_map(conn)
+
+        data = []
+        for month in months:
+            date_str = monthly_dates[month]
+            month_factors = []
+
+            for sym, df in stock_data.items():
+                df_d = df[df["date"] <= date_str]
+                if len(df_d) < 60:
+                    continue
+
+                finance = finance_map.get(sym)
+                val = valuation_map.get(sym, {})
+                ff = fund_flow_map.get(sym)
+
+                nb_df = None
+                nb_series = north_map.get(sym)
+                if nb_series:
+                    asof = [d for d in nb_series if d <= date_str]
+                    if asof:
+                        nb_df = pd.DataFrame([
+                            {"date": d, "hold_pct": nb_series[d]} for d in asof
+                        ])
+
+                fin_combined = dict(finance) if finance else {}
+                fin_combined["pe_ratio"] = -val.get("pe", 0) if val.get("pe", 0) and val.get("pe", 0) > 0 else 0
+                fin_combined["pb_ratio"] = -val.get("pb", 0) if val.get("pb", 0) and val.get("pb", 0) > 0 else 0
+
+                factors = compute_factors(
+                    df_d,
+                    finance=fin_combined,
+                    fund_flow=ff,
+                    lhb_data=None,
+                    north_hold=nb_df,
+                )
+
+                fwd_idx = len(df_d) - 1
+                fwd_end = fwd_idx + self.HOLD_DAYS
+                if fwd_end >= len(df):
+                    continue
+                fwd_return = df.iloc[fwd_end]["close"] / df.iloc[fwd_idx]["close"] - 1
+
+                feat = {f: factors.get(f, 0) for f in self.FEATURE_FACTORS}
+                month_factors.append({
+                    "symbol": sym,
+                    "month": month,
+                    "features": feat,
+                    "fwd_return": fwd_return,
+                })
+
+            if len(month_factors) >= self.MIN_STOCKS_PER_MONTH:
+                data.extend(month_factors)
+
+        conn.close()
+        logger.info(
+            f"ML因子预计算完成：{len(data)}条记录，"
+            f"{len(set(d['month'] for d in data))}个月"
+        )
+        return data
 
     def _collect_training_data(self, as_of_month: str | None = None) -> list[dict]:
         """收集每月因子截面 + 前向收益标签。
